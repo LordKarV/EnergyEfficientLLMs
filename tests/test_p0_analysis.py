@@ -154,3 +154,14 @@ def test_cli_selects_runs_by_manifest(tmp_path):
     g = json.loads(out.read_text())["P0b"]
     assert all(v["attempts"] == 16 and v["successes"] == 6 for v in g["per_task"].values())  # pilot excluded
     assert g["design_mismatches"] == []
+
+
+def test_p0b_counts_only_unflagged_successes():
+    rows = []
+    for a in range(16):  # 6 resolved, but 3 of them touched test files
+        r = rec("p0", "BF16", a < 6, lst="pool200", runtime="vllm", repo="pandas")
+        r["grading"] = {"test_files_touched": a < 3}
+        rows.append(r)
+    rep = p0b_report(rows, inrepo_size=300)
+    assert rep["per_task"]["p0"]["successes"] == 3 and rep["pool"]["n_ge4"] == 0
+    assert rep["pool"]["flagged_successes_excluded"] == 3

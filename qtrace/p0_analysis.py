@@ -127,14 +127,22 @@ def p0a_factors(rows, quantized="Q4_K_M", base="BF16"):
             "n_tasks_resolved_both": len(both)}
 
 
+def flagged(rec):
+    """The grader's test-file tripwire (04, "Test-file tripwire")."""
+    return bool((rec.get("grading") or {}).get("test_files_touched"))
+
+
 def p0b_report(rows, inrepo_size, pool_total=3887, heldout_total=691, min_candidates=4, design=16):
-    """Pool size, RL-usable share and the three P0b criteria, from the P0b run's BF16 attempts."""
+    """Pool size, RL-usable share and the three P0b criteria, from the P0b run's BF16 attempts.
+
+    Pool successes count unflagged runs only, because flagged runs can never be selection candidates.
+    """
     def successes(lst):
         acc = defaultdict(lambda: [0, 0, None])
         for r in rows:
             if r["list"] == lst and r["profile"] == "BF16":
                 a = acc[r["task_id"]]
-                a[0] += int(bool(r["resolved"]))
+                a[0] += int(bool(r["resolved"]) and not (lst == "pool200" and flagged(r)))
                 a[1] += 1
                 a[2] = r.get("repo")
         return acc
@@ -153,7 +161,9 @@ def p0b_report(rows, inrepo_size, pool_total=3887, heldout_total=691, min_candid
     held_pass1 = float(np.mean([s / k for s, k, _ in held.values()])) if held else None
     short = sorted(t for t, (_, k, _) in {**pool, **held}.items() if k < design)
     return {
-        "pool": {"n_tasks": n, "n_ge1": ge1, "n_ge4": ge4, "by_repo": dict(by_repo)},
+        "pool": {"n_tasks": n, "n_ge1": ge1, "n_ge4": ge4, "by_repo": dict(by_repo),
+                 "flagged_successes_excluded": sum(1 for r in rows if r["list"] == "pool200"
+                                                   and r["profile"] == "BF16" and r["resolved"] and flagged(r))},
         "per_task": {t: {"successes": s, "attempts": k, "repo": repo} for t, (s, k, repo) in sorted(pool.items())},
         "tasks_below_design_attempts": short,
         "criteria": {"share_ge4_among_solvable": share},
