@@ -2,10 +2,13 @@
 
 Does it matter *which* correct solution you fine-tune on, if the model will be quantized afterwards?
 
-Start with the two documents in `docs/`:
+The main study now targets agentic coding (see issue #1). Start with:
 
-- `docs/01_literature_and_gaps.md`: what already exists and what is open.
-- `docs/02_research_plan.md`: decisions made, research questions, go/no-go studies, schedule, risks.
+- `docs/03_agentic_plan.md`: the current plan, in short form.
+- `docs/04_p0_protocol.md`: the protocol for the first go/no-go studies.
+- `docs/01_literature_and_gaps.md` and `docs/02_research_plan.md`: the original GSM8K survey and plan.
+
+The code in `qtrace/` and `scripts/` is still the GSM8K implementation and has not been migrated yet.
 
 ## The pipeline
 
