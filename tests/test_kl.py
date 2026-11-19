@@ -1,0 +1,106 @@
+"""Tests for the chunked teacher-forced KL scorer. Run:  python -m pytest tests/test_kl.py -q"""
+
+import copy
+import os
+import sys
+
+import torch
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from qtrace.kl import compare, decision_mask, hidden_at, logit_index, score_trajectory, summarize
+from qtrace.quantize import quantize_model_rtn
+
+
+def tiny_qwen35(seed=0):
+    from transformers import Qwen3_5ForCausalLM, Qwen3_5TextConfig
+
+    cfg = Qwen3_5TextConfig(
+        vocab_size=300, hidden_size=64, intermediate_size=128, num_hidden_layers=4,
+        layer_types=["linear_attention"] * 3 + ["full_attention"], num_attention_heads=2,
+        num_key_value_heads=1, head_dim=32, linear_num_value_heads=2, linear_num_key_heads=2,
+        linear_key_head_dim=16, linear_value_head_dim=16, max_position_embeddings=4096,
+        tie_word_embeddings=True,
+    )
+    torch.manual_seed(seed)
+    return Qwen3_5ForCausalLM(cfg).eval()
+
+
+def episode(n=80, seed=1):
+    g = torch.Generator().manual_seed(seed)
+    ids = torch.randint(0, 300, (1, n), generator=g)
+    mask = torch.zeros(n, dtype=torch.bool)
+    mask[10:30] = True  # first assistant turn
+    mask[45:70] = True  # second assistant turn; 30-44 is a tool response
+    return ids, mask
+
+
+def reference(model_p, model_q, ids, mask):
+    with torch.no_grad():
+        lp = torch.log_softmax(model_p(ids).logits[0].float(), -1)
+        lq = torch.log_softmax(model_q(ids).logits[0].float(), -1)
+    t = torch.nonzero(mask).squeeze(1)
+    t = t[t >= 1]
+    kl = (lp[t - 1].exp() * (lp[t - 1] - lq[t - 1])).sum(-1)
+    nll = -lp[t - 1].gather(1, ids[0, t].unsqueeze(1)).squeeze(1)
+    return kl, nll
+
+
+def test_logit_index_shifts_by_one_and_skips_position_zero():
+    mask = torch.tensor([True, False, True, True])
+    assert logit_index(mask).tolist() == [1, 2]
+
+
+def test_self_comparison_is_zero():
+    m = tiny_qwen35()
+    ids, mask = episode()
+    s = score_trajectory(m, m, ids, mask, chunk=16)
+    assert s["kl_mean"] == 0.0 and s["flip_rate"] == 0.0
+
+
+def test_chunked_matches_full_logits_for_any_chunk_size():
+    p = tiny_qwen35(0)
+    q = copy.deepcopy(p)
+    quantize_model_rtn(q, bits=3, group_size=32)
+    ids, mask = episode()
+    kl_ref, nll_ref = reference(p, q, ids, mask)
+    idx = logit_index(mask)
+    targets = ids[0, idx + 1]
+    hp, hq = hidden_at(p, ids, idx), hidden_at(q, ids, idx)
+    for chunk in (1, 7, 1000):
+        out = compare(p.lm_head, hp, q.lm_head, hq, targets, chunk=chunk)
+        assert torch.allclose(out["kl"], kl_ref, atol=1e-5)
+        assert torch.allclose(out["nll_p"], nll_ref, atol=1e-5)
+
+
+def test_quantized_copy_disagrees():
+    p = tiny_qwen35(0)
+    q = copy.deepcopy(p)
+    quantize_model_rtn(q, bits=3, group_size=32)
+    ids, mask = episode()
+    s = score_trajectory(p, q, ids, mask, chunk=16)
+    assert s["kl_mean"] > 0
+    assert abs(s["kl_sum"] - s["kl_mean"] * s["n_scored"]) < 1e-4
+
+
+def test_decision_mask_rule():
+    mask = torch.zeros(40, dtype=torch.bool)
+    mask[5:35] = True
+    idx = logit_index(mask)  # scored token positions are idx + 1, here 5..34 (30 positions)
+    entropy = torch.arange(len(idx), dtype=torch.float32) * 0.01  # rising, so the top 3 are 32-34
+    dm = decision_mask(idx, entropy, tool_call_positions=[6], command_starts=[10], command_tokens=8)
+    picked = set((idx[dm] + 1).tolist())
+    assert 6 in picked  # the <tool_call> token
+    assert set(range(10, 18)) <= picked and 18 not in picked  # first 8 command tokens only
+    assert {32, 33, 34} <= picked and 31 not in picked  # top ceil(10% of 30) = 3 by entropy
+    assert all(mask[p] for p in picked)  # never a template position
+    dm_none = decision_mask(idx, entropy, tool_call_positions=[2], command_starts=[38], command_tokens=8)
+    assert not {2, 38, 39} & set((idx[dm_none] + 1).tolist())  # outside model-written spans
+
+
+def test_summarize_reports_decision_and_whole_run():
+    stats = {"kl": torch.tensor([1.0, 2.0, 3.0, 4.0]), "flip": torch.tensor([0.0, 1.0, 0.0, 0.0]),
+             "entropy_p": torch.tensor([0.1, 0.2, 0.3, 0.4]), "nll_p": torch.zeros(4), "nll_q": torch.zeros(4)}
+    s = summarize(stats, torch.tensor([False, True, False, True]))
+    assert s["kl_mean"] == 2.5 and s["kl_decision"] == 3.0 and s["kl_sum"] == 10.0
+    assert s["n_scored"] == 4 and s["n_decision"] == 2 and s["flip_rate"] == 0.25
