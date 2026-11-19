@@ -27,8 +27,8 @@ Hypotheses, each able to fail:
   random successful runs.
 - H2: picking runs by stability under quantization (`qtrace`) shrinks the gap more than fewest-turns
   alone, at equal or fewer turns.
-- H3: the stability score is more than entropy or clean formatting: `stable` beats `low_entropy` and
-  `clean_format`.
+- H3: the stability score is more than length, entropy or clean formatting: `stable` beats
+  `low_entropy` and `clean_format`, and `short_stable` beats `short_unstable` (likewise for long).
 - H4: the differences between arms survive grammar-constrained tool calls, so the gain is not just
   formatting.
 - H5: at 4-bit, the best arm uses the fewest joules per resolved task.
@@ -75,11 +75,16 @@ and reports joules per resolved task on SWE-style agent tasks.
    at decision points only).
 3. **Select:** build one training set per arm by picking one run per task:
    - `random`: any successful run
-   - `fewest_turns`: the shortest successful run
+   - `fewest_turns`: the successful run with the fewest turns (ties: fewest output tokens)
    - `stable`: the run the quantized copy disagrees with least
-   - `qtrace`: a mix of fewest turns and most stable
+   - `qtrace`: a mix of fewest turns and most stable (rank mix weighted by `select.alpha`)
    - `low_entropy`: the run the full-precision model was most certain about (control)
-   - `clean_format`: a run with no malformed tool calls (control)
+   - `clean_format`: the run with the fewest malformed tool calls (control)
+   - 2x2 length controls: `short_stable`, `short_unstable`, `long_stable`, `long_unstable`, split at
+     the task's median turn count. They answer "did `stable` just pick shorter runs?"
+
+   Every arm picks exactly one run per task from the same candidates, so arms differ only in which
+   run. Remaining ties are broken at random with the arm's seed.
 4. **Train:** LoRA fine-tune on each set, same number of steps for every arm, 3 seeds.
 5. **Quantize and evaluate:** merge, quantize with each stock profile, evaluate everything.
 
@@ -103,8 +108,8 @@ and reports joules per resolved task on SWE-style agent tasks.
 
 | Phase | What | Gate |
 |---|---|---|
-| P0 | pilot, pool size, headroom, pool reach, score check (`docs/04_p0_protocol.md`) | four go/no-go gates |
-| P1 | one-seed pilot of all arms on the primary test | direction and effect size |
+| P0 | pilot, pool size (P0b), headroom (P0a), pool reach (P0c), score check (P0d); see `docs/04_p0_protocol.md` | four go/no-go gates |
+| P1 | one-seed pilot of all arms, including the 2x2 length controls, on the primary test | direction and effect size |
 | P2 | full run: all arms, 3 seeds, all profiles, primary test plus within-repo split | pre-registered primary test |
 | P3 | external checks: SWE-bench Verified, Datacurve, Terminal-Bench | none, reported as is |
 | P4 | 9B replication and the optional baselines | budget |
@@ -114,7 +119,7 @@ Post a preprint as soon as P2 has a clean answer. Related papers are appearing m
 ## Kill rules
 
 - Quantization doesn't hurt the base model (P0a): stop the method.
-- The stability score doesn't predict whether the quantized model can follow a run (P2 of P0): drop
+- The stability score doesn't predict whether the quantized model can follow a run (P0d): drop
   the score and keep the fewest-turns and entropy arms.
 - The pool is too small or misses the tasks quantization breaks: use the fallbacks (fewer required
   successes, a DeepSWE-Preview teacher pool, the 9B model), then stop if all fail.
@@ -130,6 +135,9 @@ the ceiling for the rest of P0 from it. Current estimate: P0 is about 11,000 age
 - Owner: the spending ceiling after the pilot; who builds the pilot harness; merges this plan.
 - Owner's agent: the R2E-Gym runtime plugin, the token-level episode store, the parser and repair
   path, the per-tensor quantization tables.
+- Before P1, whoever owns training: migrate `scripts/04_train_lora.py` to multi-turn runs. It was
+  built for single-turn GSM8K: it drops examples over `max_seq_len` (768) and masks only the prompt.
+  Multi-turn needs a loss mask over every span the model didn't write (the scorer's mask).
 - LordKarV's agent: the chunked KL scoring wrapper (PyTorch first, then llama.cpp), the P0 analysis
-  scripts (bootstrap, flip tables, the P2 difference-in-differences), and the related-work tracking.
+  scripts (bootstrap, flip tables, the P0d difference-in-differences), and the related-work tracking.
 - Both: review each other's code in PRs, discuss in issue #1.

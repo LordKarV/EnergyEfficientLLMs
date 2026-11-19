@@ -13,11 +13,11 @@ report from which the owner sets the ceiling for the rest of P0.
 | P0a | Does stock PTQ hurt a 4B coding agent on our tasks? | **stop** the selection method |
 | P0b | Can we build a pool of at least 4 successful trajectories per task, at a usable size? | fallbacks (below) |
 | P0c | Does the pool contain the tasks quantization breaks? | fallbacks, or claim generalization only |
-| P2 | Does a low stability score mean the quantized model can follow that trajectory? | **stop** KL scoring; keep length and entropy arms |
+| P0d | Does a low stability score mean the quantized model can follow that trajectory? | **stop** KL scoring; keep length and entropy arms |
 
 Order: the 20-task pilot first. **Only the pilot is approved.** The owner sets the spending
 ceiling for the rest of P0 from the pilot exit report. Then P0b, with P0a alongside; then P0c and
-P2 on P0b's pool.
+P0d on P0b's pool.
 
 ## Fixed setup for all of P0
 
@@ -108,6 +108,12 @@ via Zeus), sampler parameters, seed, and the token sequence with model-written s
   - malformed-call rate by category
   - container CPU load, and the concurrency chosen
   - projected instance-hours for each P0 step, and the total
+- Proposed, pending owner approval (it widens the pilot's scope): a **training probe**. One LoRA
+  forward and backward pass on the longest successful pilot trajectory, with gradient
+  checkpointing, reporting peak GPU memory and seconds per step. The method depends on LoRA SFT over
+  64K-token thinking-mode runs, which nothing in P0 tests otherwise. If it doesn't fit on 48 GB, P1
+  changes shape (truncated runs, a bigger GPU, or a per-turn loss). A few minutes on the approved
+  box.
 - Main: BF16 on vLLM, 16 attempts on each `pool200` task and each `heldout100` task (held-out
   trajectories are measurement only and never enter a pool).
 - Report: successes out of 16 per task and per repo, tasks with at least 4 successes, and the
@@ -148,7 +154,7 @@ via Zeus), sampler parameters, seed, and the token sequence with model-written s
 - Pass: at least 40% of flipped tasks fall in the 4-plus bins. Otherwise, use the P0b fallbacks or
   state that any effect works through generalization.
 
-## P2: does the score mean what we claim?
+## P0d: does the score mean what we claim?
 
 - Tasks: `pool200` tasks with at least 4 successful BF16 trajectories (target at least 50).
 - Score every successful trajectory two ways: `kl_mean` over model-written tokens, and
@@ -167,7 +173,7 @@ via Zeus), sampler parameters, seed, and the token sequence with model-written s
 ## Kill rules (same as the gates table)
 
 - P0a fails: stop the selection method.
-- P2 fails: stop KL scoring and keep the RQ1-style length and entropy arms.
+- P0d fails: stop KL scoring and keep the RQ1-style length and entropy arms.
 - P0b or P0c fails: apply the fallbacks in order. If all fail, stop.
 - In every case, the constrained-decoding and calibrated-quantizer baselines still run.
 
@@ -198,7 +204,7 @@ counters, so every energy table states "GPU only" and reports container CPU-seco
 
 ## Compute estimate (replace after the pilot)
 
-About 11,000 attempts: P0b 4,800, P0a 3,000 plus the energy sub-run, P0c 2,400, P2 800. At 14-16
+About 11,000 attempts: P0b 4,800, P0a 3,000 plus the energy sub-run, P0c 2,400, P0d 800. At 14-16
 concurrent attempts and a guessed 10 minutes each, roughly 5 days on one machine. The pilot exit
 report replaces this.
 
