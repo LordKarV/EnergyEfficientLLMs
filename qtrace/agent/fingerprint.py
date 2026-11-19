@@ -4,8 +4,8 @@ sha256 over three parts, in a fixed order: `git status --porcelain` (untracked f
 `git diff HEAD --binary` (staged and unstaged, binary-safe), and the sha256 of every untracked file's
 content, so editing an untracked file changes the hash too. An untracked symlink contributes its
 target path, not its content: some images ship dangling links (orange3's `datasets`). Runs in its own `docker exec`, outside
-the model's context. The R2E-Gym virtualenv and test folder are excluded: the harness creates them
-and they never differ between attempts.
+the model's context. The virtualenv's files and the test folder are excluded from the git parts, but the
+list of installed distributions is appended, so a `pip install` mid-episode still changes the hash.
 """
 
 import hashlib
@@ -18,6 +18,8 @@ git -c core.quotepath=off diff HEAD --binary {EXCLUDE}
 printf '\\0--untracked--\\0'
 git ls-files --others --exclude-standard -z {EXCLUDE} | xargs -0 -r sh -c \
   'for f do if [ -L "$f" ]; then printf "link %s -> %s\\n" "$f" "$(readlink "$f")"; else sha256sum "$f"; fi; done' sh
+printf '\\0--packages--\\0'
+ls .venv/lib/python*/site-packages 2>/dev/null | grep -E '[.](dist|egg)-info$' || true
 """
 
 

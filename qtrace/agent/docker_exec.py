@@ -15,14 +15,15 @@ class DockerContainer:
         self.name = name
         self.docker = docker
 
-    def exec(self, script, workdir="/testbed", timeout=300, env_path=R2E_PATH):
+    def exec(self, script, workdir="/testbed", timeout=300, env_path=R2E_PATH, stdin=None):
         """Run a shell script in the container. Returns (stdout + stderr as bytes, exit code).
 
-        Exit code 124 means the in-container `timeout` fired.
+        Exit code 124 means the in-container `timeout` fired. `stdin` (bytes) is piped in.
         """
-        cmd = [self.docker, "exec", "-w", workdir, "-e", f"PATH={env_path}", self.name,
-               "timeout", str(int(timeout)), "/bin/sh", "-c", script]
-        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout + 30)
+        cmd = [self.docker, "exec", *(["-i"] if stdin is not None else []), "-w", workdir, "-e",
+               f"PATH={env_path}", self.name, "timeout", str(int(timeout)), "/bin/sh", "-c", script]
+        proc = subprocess.run(cmd, input=stdin, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                              timeout=timeout + 30)
         return proc.stdout, proc.returncode
 
     @classmethod

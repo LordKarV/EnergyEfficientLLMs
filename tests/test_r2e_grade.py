@@ -13,7 +13,7 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from qtrace.agent.r2e_grade import grading, parse_pytest_log, r2e_resolved
+from qtrace.agent.r2e_grade import TEST_PATH, grading, parse_pytest_log, r2e_resolved, touched_test_files
 
 LOG = """============================= test session starts ==============================
 r2e_tests/test_1.py ..F.
@@ -47,6 +47,15 @@ def test_grading_splits_fail_to_pass_and_pass_to_pass():
     assert (g.fail_to_pass_ok, g.fail_to_pass_total, g.pass_to_pass_ok, g.pass_to_pass_total) == (1, 1, 1, 2)
     assert not g.resolved
     assert grading(expected, expected, baseline).resolved
+    assert not grading(expected, expected, baseline, grading_error="git apply failed").resolved
+
+
+def test_touched_test_files_tripwire():
+    diff = (b"diff --git a/pkg/core.py b/pkg/core.py\n+x\n"
+            b"diff --git a/conftest.py b/conftest.py\nnew file mode 100644\n"
+            b"diff --git a/pkg/tests/test_core.py b/pkg/tests/test_core.py\n")
+    assert touched_test_files(diff) == ["conftest.py", "pkg/tests/test_core.py"]
+    assert touched_test_files(b"diff --git a/pkg/core.py b/pkg/core.py\n") == []
 
 
 docker = pytest.mark.skipif(os.environ.get("R2E_DOCKER_TESTS") != "1", reason="set R2E_DOCKER_TESTS=1")
@@ -76,7 +85,7 @@ def _apply_gold(container, row):
 
     for d in json.loads(row["parsed_commit_content"])["file_diffs"]:
         path = d["header"]["file"]["path"]
-        if d["is_binary_file"] or "/tests/" in f"/{path}" or d.get("new_file_content") is None:
+        if d["is_binary_file"] or TEST_PATH.search(path) or d.get("new_file_content") is None:
             continue
         data = base64.b64encode(d["new_file_content"].encode()).decode()
         _, code = container.exec(f"echo {data} | base64 -d > '{path}'")
@@ -86,37 +95,52 @@ def _apply_gold(container, row):
 @pytest.fixture(params=IMAGES, ids=lambda img: img.split("/")[1].split("_")[0])
 def task(request):
     from qtrace.agent.docker_exec import DockerContainer
-    from qtrace.agent.r2e_grade import hide_tests
+    from qtrace.agent.r2e_grade import prepare_episode
 
     c = DockerContainer.start(request.param, f"qtrace-test-{uuid.uuid4().hex[:8]}")
     c.image = request.param
     try:
-        hide_tests(c)
+        c.base_tree = prepare_episode(c)
         yield c
     finally:
         c.stop()
 
 
 @docker
-def test_no_patch_is_not_resolved_and_gold_patch_is(task):
-    from qtrace.agent.r2e_grade import baseline_statuses, verify
+def test_tests_are_gone_from_the_episode_container(task):
+    out, _ = task.exec("ls /r2e_tests /testbed/run_tests.sh /testbed/r2e_tests 2>&1", workdir="/")
+    assert out.count(b"No such file") == 3
+    found, _ = task.exec("find / \\( -name run_tests.sh -o -name r2e_tests \\) -not -path '/proc/*' 2>/dev/null",
+                         workdir="/")
+    assert found.strip() == b""
+
+
+@docker
+def test_fresh_container_grading(task):
+    from qtrace.agent.r2e_grade import baseline_statuses, final_diff, verify
 
     row = _row(task.image)
-    base = baseline_statuses(task)
+    base = baseline_statuses(task.image)
     assert base, "baseline produced no parsed tests"
-    assert not verify(task, row["expected_output_json"], base).resolved
+    g0 = verify(task, task.image, task.base_tree, row["expected_output_json"], base)
+    assert not g0.resolved and g0.grading_error is None
     _apply_gold(task, row)
-    g = verify(task, row["expected_output_json"], base)
+    task.exec("echo 'new helper' > NEW_FILE_FROM_AGENT.txt")
+    assert b"NEW_FILE_FROM_AGENT.txt" in final_diff(task, task.base_tree)  # untracked files are in the diff
+    g = verify(task, task.image, task.base_tree, row["expected_output_json"], base)
     assert g.resolved and g.fail_to_pass_ok == g.fail_to_pass_total > 0
-    out, _ = task.exec("ls /testbed/r2e_tests 2>&1; ls /testbed/run_tests.sh 2>&1")
-    assert b"No such file" in out  # tests are hidden again after grading
+    assert not g.test_files_touched and not g.tests_timed_out
+    task.exec("echo 'import pytest' > conftest.py")
+    assert verify(task, task.image, task.base_tree, row["expected_output_json"], base).test_files_touched
+    status, _ = task.exec("git status --porcelain --untracked-files=no")
+    assert b"conftest.py" not in status  # grading never staged anything in the agent's repo
 
 
 @docker
 def test_fingerprint_tracks_repo_state(task):
-    from qtrace.agent.fingerprint import fingerprint
-
     import time
+
+    from qtrace.agent.fingerprint import fingerprint
 
     start = time.perf_counter()
     a = fingerprint(task)
