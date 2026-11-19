@@ -80,7 +80,7 @@ def test_quantized_copy_disagrees():
     ids, mask = episode()
     s = score_trajectory(p, q, ids, mask, chunk=16)
     assert s["kl_mean"] > 0
-    assert abs(s["kl_sum"] - s["kl_mean"] * s["n_scored"]) < 1e-4
+    assert abs(s["kl_sum_all"] - s["kl_mean"] * s["n_scored"]) < 1e-4
 
 
 def test_decision_mask_rule():
@@ -88,19 +88,45 @@ def test_decision_mask_rule():
     mask[5:35] = True
     idx = logit_index(mask)  # scored token positions are idx + 1, here 5..34 (30 positions)
     entropy = torch.arange(len(idx), dtype=torch.float32) * 0.01  # rising, so the top 3 are 32-34
-    dm = decision_mask(idx, entropy, tool_call_positions=[6], command_starts=[10], command_tokens=8)
+    dm = decision_mask(idx, entropy, tool_call_positions=[6], command_spans=[(10, 25)], command_tokens=8)
     picked = set((idx[dm] + 1).tolist())
     assert 6 in picked  # the <tool_call> token
     assert set(range(10, 18)) <= picked and 18 not in picked  # first 8 command tokens only
     assert {32, 33, 34} <= picked and 31 not in picked  # top ceil(10% of 30) = 3 by entropy
     assert all(mask[p] for p in picked)  # never a template position
-    dm_none = decision_mask(idx, entropy, tool_call_positions=[2], command_starts=[38], command_tokens=8)
+    dm_none = decision_mask(idx, entropy, tool_call_positions=[2], command_spans=[(38, 40)], command_tokens=8)
     assert not {2, 38, 39} & set((idx[dm_none] + 1).tolist())  # outside model-written spans
+
+
+def test_short_command_window_stops_at_command_end():
+    mask = torch.zeros(40, dtype=torch.bool)
+    mask[5:35] = True
+    idx = logit_index(mask)
+    entropy = torch.zeros(len(idx))
+    entropy[0] = 1.0  # keep the top-k pick away from the command region
+    dm = decision_mask(idx, entropy, tool_call_positions=[], command_spans=[(12, 14)], command_tokens=8,
+                       top_frac=0.0)
+    assert set((idx[dm] + 1).tolist()) == {12, 13}  # a 2-token command; closing tags at 14+ are excluded
+
+
+def test_fixed_entropy_threshold_replaces_top_k():
+    mask = torch.ones(21, dtype=torch.bool)
+    idx = logit_index(mask)  # 20 scored tokens, positions 1..20
+    entropy = torch.tensor([0.1] * 15 + [0.9] * 5)
+    dm = decision_mask(idx, entropy, [], [], entropy_threshold=0.5)
+    assert set((idx[dm] + 1).tolist()) == {16, 17, 18, 19, 20}
+
+
+def test_empty_run_is_not_scored_as_stable():
+    empty = {k: torch.zeros(0) for k in ("kl", "flip", "entropy_p", "nll_p", "nll_q")}
+    s = summarize(empty, torch.zeros(0, dtype=torch.bool))
+    assert s["kl_mean"] is None and s["kl_decision"] is None and s["n_scored"] == 0
 
 
 def test_summarize_reports_decision_and_whole_run():
     stats = {"kl": torch.tensor([1.0, 2.0, 3.0, 4.0]), "flip": torch.tensor([0.0, 1.0, 0.0, 0.0]),
              "entropy_p": torch.tensor([0.1, 0.2, 0.3, 0.4]), "nll_p": torch.zeros(4), "nll_q": torch.zeros(4)}
     s = summarize(stats, torch.tensor([False, True, False, True]))
-    assert s["kl_mean"] == 2.5 and s["kl_decision"] == 3.0 and s["kl_sum"] == 10.0
+    assert s["kl_mean"] == 2.5 and s["kl_decision"] == 3.0
+    assert s["kl_sum_all"] == 10.0 and s["kl_sum_decision"] == 6.0
     assert s["n_scored"] == 4 and s["n_decision"] == 2 and s["flip_rate"] == 0.25
