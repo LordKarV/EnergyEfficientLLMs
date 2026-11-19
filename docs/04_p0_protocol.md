@@ -409,7 +409,8 @@ runs when the tests are collected. The flag records this; these rules neutralize
 - P0 and P1: every resolve rate is reported both overall and excluding flagged attempts, with the
   flagged share per arm and profile next to it. A jump in that share is itself a finding.
 - Pools: a flagged successful run is never a selection candidate. The number excluded is reported
-  per task set.
+  per task set. So P0b's pool criteria (c1, c2, the 4-success count and the projected pool) and
+  P0d's "at least 2 successful BF16 trajectories" count unflagged successes only.
 
 ### `random_fq` baseline (`03`, Baselines)
 
