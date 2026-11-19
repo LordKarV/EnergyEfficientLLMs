@@ -148,10 +148,13 @@ via Zeus), sampler parameters, seed, and the token sequence with model-written s
   at **every turn boundary**, not only per attempt.
 - Per-turn energy model (for the `fewest_joules` arm): fit per-turn joules against the turn's
   output tokens, uncached prefill tokens, cached prefill tokens, uncached prefill tokens x context
-  position (attention cost grows with context in the full-attention layers), and an intercept for
-  fixed per-turn overhead. Fit on llama.cpp `BF16`, the deployment runtime. Report R-squared and
-  residuals. Only relative weights matter for ranking runs within a task. Poor fit: `fewest_joules`
-  falls back to `fewest_turns`, and the report says so. The full run reports
+  position, output tokens x context position (both context terms because the full-attention layers
+  read the whole KV cache; each is kept only if it improves the fit), and an intercept for fixed
+  per-turn overhead. Fit separately for each profile. **Runs are ranked with the `Q4_K_M`
+  coefficients**, the primary deployment profile, since quantization changes the relative cost of
+  decode and prefill. Report R-squared and residuals per profile, and the within-task rank agreement
+  between the `BF16` and `Q4_K_M` coefficient sets. Only relative weights matter for ranking runs
+  within a task. Poor fit: `fewest_joules` falls back to `fewest_turns`, and the report says so. The full run reports
   joules only as run-level totals, since energy can't be split between concurrent attempts.
 - The SteerDistill GPTQ gap (-7.46 points at 4B) is a prior, not a substitute for this test.
 
