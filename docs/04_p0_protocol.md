@@ -10,10 +10,10 @@ report from which the owner sets the ceiling for the rest of P0.
 
 | Gate | Question | If it fails |
 |---|---|---|
-| P0a | Does stock PTQ hurt a 4B coding agent on our tasks? | **stop** the selection method |
+| P0a | Does stock PTQ hurt a 4B coding agent on our tasks? | drop the robustness half (B); energy (A) continues |
 | P0b | Can we build a pool of at least 4 successful trajectories per task, at a usable size? | fallbacks (below) |
 | P0c | Does the pool contain the tasks quantization breaks? | fallbacks, or claim generalization only |
-| P0d | Does a low stability score mean the quantized model can follow that trajectory? | **stop** KL scoring; keep length and entropy arms |
+| P0d | Does a low stability score mean the quantized model can follow that trajectory? | drop KL from selection; beta = 0 in RL |
 
 Order: the 20-task pilot first. **Only the pilot is approved.** The owner sets the spending
 ceiling for the rest of P0 from the pilot exit report. Then P0b, with P0a alongside; then P0c and
@@ -118,6 +118,8 @@ via Zeus), sampler parameters, seed, and the token sequence with model-written s
   trajectories are measurement only and never enter a pool).
 - Report: successes out of 16 per task and per repo, tasks with at least 4 successes, and the
   projected pool size = (share of `pool200` with at least 4 successes) x 3,887.
+- For RL: the share of tasks with 1 to 15 successes out of 16. GRPO learns only from tasks whose
+  rollouts disagree, so this, not the 4-success pool, sizes the RL task set.
 - Also report, once the energy model exists: the within-task rank correlation between turns, output
   tokens and estimated joules among successful runs. Above about 0.9 between `fewest_joules` and
   `fewest_turns`, the two arms are the same in practice and only one is kept.
@@ -185,8 +187,8 @@ via Zeus), sampler parameters, seed, and the token sequence with model-written s
 
 ## Kill rules (same as the gates table)
 
-- P0a fails: stop the selection method.
-- P0d fails: stop KL scoring and keep the RQ1-style length and entropy arms.
+- P0a fails: drop the robustness half (stability arms, KL term). The energy half continues.
+- P0d fails: drop KL from selection, and set beta = 0 in the RL reward.
 - P0b or P0c fails: apply the fallbacks in order. If all fail, stop.
 - In every case, the constrained-decoding and calibrated-quantizer baselines still run.
 

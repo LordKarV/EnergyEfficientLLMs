@@ -15,11 +15,19 @@ on those, then quantize with ordinary stock tools. If it works, a deployer gets 
 accuracy and its energy savings after quantization, without quantization-aware training, a teacher
 loop or any special quantizer.
 
+## The goal (owner decision, 19 Nov 2026): A + B
+
+- **A:** train the agent to use less energy per fixed bug, measured in joules, not just tokens.
+- **B:** keep it efficient after stock quantization.
+
+Energy is the headline. Robustness to stock PTQ is half of the goal, not the whole story. Two stages:
+selection plus SFT (cheap, and the baseline RL must beat), then RL. RL is in scope.
+
 ## The question
 
-Does choosing **which** successful trajectories to fine-tune on make a small coding agent hold up
-better under stock post-training quantization, measured in resolve rate, turns, tokens and joules per
-resolved task?
+Can a small coding agent be trained to use fewer joules per resolved task, and keep that advantage
+under stock post-training quantization? Stage 1 asks whether choosing **which** successful runs to
+fine-tune on gets there; Stage 2 asks whether RL with an energy and stability reward gets further.
 
 Hypotheses, each able to fail:
 
@@ -95,6 +103,29 @@ and reports joules per resolved task on SWE-style agent tasks.
 4. **Train:** LoRA fine-tune on each set, same number of steps for every arm, 3 seeds.
 5. **Quantize and evaluate:** merge, quantize with each stock profile, evaluate everything.
 
+## Stage 2: RL (draft, for discussion)
+
+- **Start from** the best Stage 1 model.
+- **Reward per rollout:** `r = 1[resolved, clean end] x (1 - lambda x E_Q4(y) / E_ref) - beta x KL(y)`
+  - `E_Q4(y)`: the run's estimated joules from the per-turn energy model with `Q4_K_M` coefficients.
+  - `E_ref`: the mean estimated energy of the resolved runs in the same rollout group. The energy
+    penalty is group-relative and applies only to resolved runs, as in HERO's gating, so a short
+    failure never beats a long success.
+  - `KL(y)`: teacher-forced KL between the policy and its quantized copy on model-written tokens. The
+    probe is a merged copy, re-quantized every k steps.
+- **Robustness alternative:** roll out the quantized copy as well and reward its episodes. That
+  matches the goal directly, but it doubles sandbox cost, and updating full-precision weights from
+  quantized rollouts is off-policy. HiFloat4 (2607.26515) reports that rollout-training precision
+  mismatch is the main failure mode in low-precision GRPO. Default: the KL term; the alternative is
+  an ablation if budget allows.
+- **Main RL baseline: HERO (2609.38885)**, the closest competitor: same model family, efficiency RL,
+  but tokens rather than joules and no quantization. Also HERO's reward with our energy term swapped
+  in, to separate "joules vs tokens" from "plus stability".
+- **Compute is the open risk.** One L40S at 16 tasks x 8 rollouts per step is at least 80 minutes of
+  rollouts per step, before the training pass over 128 sequences of up to 64K tokens, whose cost
+  the P0 training probe measures. DeepSWE used 512 rollouts per step for 200 steps on 64 H100s.
+  Stage 2 is sized after P0, and may need a bigger instance.
+
 ## Baselines
 
 - The untouched base model, quantized the same way.
@@ -125,9 +156,10 @@ Post a preprint as soon as P2 has a clean answer. Related papers are appearing m
 
 ## Kill rules
 
-- Quantization doesn't hurt the base model (P0a): stop the method.
+- Quantization doesn't hurt the base model (P0a): drop the robustness half (B, the KL term and the
+  stability arms). The energy half (A) continues.
 - The stability score doesn't predict whether the quantized model can follow a run (P0d): drop
-  the score and keep the fewest-turns and entropy arms.
+  the score from selection and set beta = 0 in the RL reward.
 - The pool is too small or misses the tasks quantization breaks: use the fallbacks (fewer required
   successes, a DeepSWE-Preview teacher pool, the 9B model), then stop if all fail.
 
