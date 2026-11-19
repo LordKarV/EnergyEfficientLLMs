@@ -23,8 +23,10 @@ resolved task?
 
 Hypotheses, each able to fail:
 
-- H1: fine-tuning on the fewest-turn successful runs shrinks the quantization gap compared with
+- H1a: fine-tuning on the fewest-turn successful runs shrinks the quantization gap compared with
   random successful runs.
+- H1b: fine-tuning on the lowest-energy successful runs (`fewest_joules`) lowers joules per resolved
+  task at 4-bit compared with random successful runs.
 - H2: picking runs by stability under quantization (`qtrace`) shrinks the gap more than fewest-turns
   alone, at equal or fewer turns.
 - H3: the stability score is more than length, entropy or clean formatting: `stable` beats
@@ -76,8 +78,13 @@ and reports joules per resolved task on SWE-style agent tasks.
 3. **Select:** build one training set per arm by picking one run per task:
    - `random`: any successful run
    - `fewest_turns`: the successful run with the fewest turns (ties: fewest output tokens)
+   - `fewest_joules`: the successful run with the lowest estimated energy (ties: fewest turns). Energy
+     is estimated from each run's token mix with a per-turn model calibrated on measured joules (see
+     `04`, P0a energy sub-run). If the fit is poor, this arm falls back to `fewest_turns`.
    - `stable`: the run the quantized copy disagrees with least
-   - `qtrace`: a mix of fewest turns and most stable (rank mix weighted by `select.alpha`)
+   - `qtrace`: a mix of fewest turns and most stable (rank mix weighted by `select.alpha`). If
+     `fewest_joules` and `fewest_turns` rank runs differently in P0b, `qtrace` uses estimated joules
+     as its cost rank instead of turns (decided from the P0b data).
    - `low_entropy`: the run the full-precision model was most certain about (control)
    - `clean_format`: the run with the fewest malformed tool calls (control)
    - 2x2 length controls: `short_stable`, `short_unstable`, `long_stable`, `long_unstable`, split at
@@ -109,7 +116,7 @@ and reports joules per resolved task on SWE-style agent tasks.
 | Phase | What | Gate |
 |---|---|---|
 | P0 | pilot, pool size (P0b), headroom (P0a), pool reach (P0c), score check (P0d); see `docs/04_p0_protocol.md` | four go/no-go gates |
-| P1 | one-seed pilot of all arms, including the 2x2 length controls, on the primary test | direction and effect size |
+| P1 | one-seed pilot of all arms, including the 2x2 length controls, on the within-repo split | direction and effect size; picks the headline arm, which is then tested on the held-out repos |
 | P2 | full run: all arms, 3 seeds, all profiles, primary test plus within-repo split | pre-registered primary test |
 | P3 | external checks: SWE-bench Verified, Datacurve, Terminal-Bench | none, reported as is |
 | P4 | 9B replication and the optional baselines | budget |

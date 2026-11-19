@@ -118,6 +118,9 @@ via Zeus), sampler parameters, seed, and the token sequence with model-written s
   trajectories are measurement only and never enter a pool).
 - Report: successes out of 16 per task and per repo, tasks with at least 4 successes, and the
   projected pool size = (share of `pool200` with at least 4 successes) x 3,887.
+- Also report, once the energy model exists: the within-task rank correlation between turns, output
+  tokens and estimated joules among successful runs. Above about 0.9 between `fewest_joules` and
+  `fewest_turns`, the two arms are the same in practice and only one is kept.
 - Pass, all three:
   1. Among `pool200` tasks with at least 1 success, more than half reach 4.
   2. The projected pool is at least 500 tasks (one selected trajectory per task per arm), which
@@ -141,7 +144,14 @@ via Zeus), sampler parameters, seed, and the token sequence with model-written s
   turn index (does damage grow with position in a hybrid model?), with the chunked wrapper at
   model-written positions only.
 - Energy sub-run: 30 tasks per profile at concurrency 1, 45 s settling, idle power measured once
-  per machine, giving per-attempt joules and the Eq. 2-3 decomposition. The full run reports
+  per machine, giving per-attempt joules and the Eq. 2-3 decomposition. The energy counter is read
+  at **every turn boundary**, not only per attempt.
+- Per-turn energy model (for the `fewest_joules` arm): fit per-turn joules against the turn's
+  output tokens, uncached prefill tokens, cached prefill tokens, uncached prefill tokens x context
+  position (attention cost grows with context in the full-attention layers), and an intercept for
+  fixed per-turn overhead. Fit on llama.cpp `BF16`, the deployment runtime. Report R-squared and
+  residuals. Only relative weights matter for ranking runs within a task. Poor fit: `fewest_joules`
+  falls back to `fewest_turns`, and the report says so. The full run reports
   joules only as run-level totals, since energy can't be split between concurrent attempts.
 - The SteerDistill GPTQ gap (-7.46 points at 4B) is a prior, not a substitute for this test.
 
