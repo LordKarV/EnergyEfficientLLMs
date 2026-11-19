@@ -11,6 +11,8 @@ import math
 import time
 
 import torch
+import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 ATTENTION_TARGETS = ["q_proj", "k_proj", "v_proj", "o_proj"]
 MLP_TARGETS = ["gate_proj", "up_proj", "down_proj"]
@@ -38,6 +40,45 @@ def attach_lora(model, include_gates=False, r=16, alpha=32, grad_ckpt=True):
     return get_peft_model(model, config)
 
 
+def supervised_mask(length, frac, period=2048):
+    """Synthetic assistant turns: one contiguous span of round(frac * period) tokens per period.
+
+    Real episodes supervise only model-written tokens (docs/04), so the loss never needs logits
+    elsewhere. Position 0 is never supervised (nothing predicts it).
+    """
+    mask = torch.zeros(length, dtype=torch.bool)
+    for start in range(0, length, period):
+        span = min(period, length - start)
+        n = round(frac * span)
+        if n:
+            mask[start + span - n:start + span] = True
+    mask[0] = False
+    return mask
+
+
+def _ce_sum(hidden, targets, head):
+    return F.cross_entropy(head(hidden).float(), targets, reduction="sum")
+
+
+def chunked_ce_loss(model, input_ids, sup_mask, chunk=2048):
+    """Mean cross-entropy over supervised tokens, with logits built per chunk and recomputed in backward.
+
+    Logit memory is O(chunk x vocab) instead of O(length x vocab): at 64K x 248,320 the full tensor is
+    about 30 GiB in bf16 and twice that once the loss upcasts it. Matches the transformers loss with
+    labels = -100 outside the mask (the logit at i predicts token i + 1).
+    """
+    base = model.get_base_model() if hasattr(model, "get_base_model") else model
+    hidden = base.model(input_ids, use_cache=False).last_hidden_state[0]
+    t = torch.nonzero(sup_mask.to(hidden.device)).squeeze(1)
+    t = t[t >= 1]
+    idx, targets = t - 1, input_ids[0, t].to(hidden.device)
+    total = hidden.new_zeros((), dtype=torch.float32)
+    for s in range(0, len(idx), chunk):
+        total = total + checkpoint(_ce_sum, hidden[idx[s:s + chunk]], targets[s:s + chunk], base.lm_head,
+                                   use_reentrant=False)
+    return total / max(len(idx), 1)
+
+
 def _sync(device):
     if device == "cuda":
         torch.cuda.synchronize()
@@ -45,41 +86,56 @@ def _sync(device):
         torch.mps.synchronize()
 
 
-def _peak_gib(device):
+def _memory(device):
+    """(GiB, kind). CUDA gives a true peak; MPS only the current allocation (smoke tests only)."""
     if device == "cuda":
-        return torch.cuda.max_memory_allocated() / 2**30
+        return torch.cuda.max_memory_allocated() / 2**30, "cuda_peak"
     if device == "mps":
-        return torch.mps.driver_allocated_memory() / 2**30
-    return None
+        return torch.mps.driver_allocated_memory() / 2**30, "mps_current"
+    return None, None
 
 
-def probe_length(model, length, steps, device, vocab_size, seed=0, lr=1e-4):
-    """Run 1 warm-up step plus `steps` timed LoRA steps on one random sequence of `length` tokens."""
+def probe_length(model, length, steps, device, vocab_size, seed=0, lr=1e-4, supervised_frac=0.15,
+                 loss_path="chunked", chunk=2048):
+    """Run 1 warm-up step plus `steps` timed LoRA steps on one random sequence of `length` tokens.
+
+    loss_path "chunked" is the loss SFT will use. "full_logits" is the transformers loss over the full
+    vocabulary at every position, kept only as a comparison point.
+    """
     if device == "cuda":
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
     g = torch.Generator().manual_seed(seed)
     ids = torch.randint(0, vocab_size, (1, length), generator=g).to(device)
+    sup = supervised_mask(length, supervised_frac)
+    labels = torch.where(sup.to(device), ids[0], torch.full_like(ids[0], -100)).unsqueeze(0)
     params = [p for p in model.parameters() if p.requires_grad]
     opt = torch.optim.AdamW(params, lr=lr)
-    record = {"length": length, "steps": steps, "device": device}
+    record = {"length": length, "steps": steps, "device": device, "loss_path": loss_path,
+              "supervised_frac": supervised_frac, "n_supervised": int(sup.sum()), "chunk": chunk}
     try:
         times, loss, grad_norm = [], float("nan"), 0.0
         for step in range(steps + 1):
             _sync(device)
             start = time.perf_counter()
             opt.zero_grad(set_to_none=True)
-            loss = model(input_ids=ids, labels=ids).loss
+            if loss_path == "chunked":
+                loss = chunked_ce_loss(model, ids, sup, chunk=chunk)
+            else:
+                loss = model(input_ids=ids, labels=labels).loss
             loss.backward()
             grad_norm = float(torch.norm(torch.stack([p.grad.float().norm() for p in params if p.grad is not None])))
             opt.step()
             _sync(device)
             if step > 0:  # step 0 is warm-up (kernel compilation, allocator growth)
                 times.append(time.perf_counter() - start)
-        record.update(status="ok", sec_per_step=sorted(times)[len(times) // 2], loss_finite=math.isfinite(float(loss.detach())),
-                      lora_grad_norm=grad_norm, peak_gib=_peak_gib(device))
+        mem, kind = _memory(device)
+        record.update(status="ok", sec_per_step=sorted(times)[len(times) // 2],
+                      loss_finite=math.isfinite(float(loss.detach())), lora_grad_norm=grad_norm,
+                      mem_gib=mem, mem_kind=kind)
     except torch.OutOfMemoryError:
-        record.update(status="oom", peak_gib=_peak_gib(device))
+        mem, kind = _memory(device)
+        record.update(status="oom", mem_gib=mem, mem_kind=kind)
     finally:
         opt.zero_grad(set_to_none=True)
     return record
