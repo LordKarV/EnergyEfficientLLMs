@@ -1,0 +1,54 @@
+# Q-TRACE base configuration.
+# Every script reads this file. Override on the command line with --config.
+
+model:
+  name: Qwen/Qwen3-0.6B        # HF hub id or a local folder
+  enable_thinking: false       # false = reasoning is written in the visible answer (see docs/02, decision D2)
+
+data:
+  train: gsm8k:train           # "gsm8k:<split>" or a path to a .jsonl with {question, answer} rows
+  test: gsm8k:test
+  train_limit: null            # set to e.g. 200 while debugging
+  test_limit: null
+
+pool:                          # script 01: sample many solutions per training problem
+  samples_per_problem: 16
+  problems_per_batch: 8        # 8 problems x 16 samples = 128 sequences per generate() call
+  max_new_tokens: 320
+  temperature: 0.7             # Qwen3 recommended non-thinking sampling settings
+  top_p: 0.8
+  top_k: 20
+  seed: 0
+
+stability:                     # script 02: how sensitive is each solution to quantization?
+  probe_precision: rtn3        # quantized model used as the probe (see qtrace/models.py for names)
+  require_correct: true        # only score solutions whose final answer is right
+
+select:                        # script 03: build one training set per arm
+  min_candidates: 4            # keep only problems with at least this many distinct correct solutions
+  alpha: 0.5                   # qtrace arm: weight on length rank (1 - alpha goes to stability rank)
+  seed: 0
+
+train:                         # script 04: LoRA fine-tuning
+  lora_r: 16
+  lora_alpha: 32
+  lora_dropout: 0.05
+  target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+  learning_rate: 2.0e-4
+  warmup_steps: 50
+  max_steps: 1500              # SAME for every arm, so arms differ only in data
+  batch_size: 16
+  max_seq_len: 768
+  seed: 0
+
+eval:                          # script 05
+  precisions: [bf16, rtn8, rtn4, rtn3]
+  batch_size: 32
+  max_new_tokens: 512
+
+paths:
+  pool: outputs/pool.jsonl
+  scored: outputs/pool_scored.jsonl
+  arms_dir: outputs/arms
+  runs_dir: outputs/runs
+  eval_dir: outputs/eval

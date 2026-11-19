@@ -1,0 +1,6 @@
+outputs/
+outputs_smoke*/
+tests/tiny_model/
+__pycache__/
+.pytest_cache/
+*.pyc

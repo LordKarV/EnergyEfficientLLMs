@@ -1,0 +1,54 @@
+# Offline smoke test: tiny random model, six toy problems, a few seconds on a laptop CPU.
+# Build the model first with:  python tests/make_tiny_model.py
+
+model:
+  name: tests/tiny_model
+  enable_thinking: false
+
+data:
+  train: tests/toy_problems.jsonl
+  test: tests/toy_problems.jsonl
+  train_limit: null
+  test_limit: null
+
+pool:
+  samples_per_problem: 4
+  problems_per_batch: 3
+  max_new_tokens: 24
+  temperature: 0.7
+  top_p: 0.8
+  top_k: 20
+  seed: 0
+
+stability:
+  probe_precision: rtn3
+  require_correct: false       # the random model is never right; score everything so later steps have data
+
+select:
+  min_candidates: 4
+  alpha: 0.5
+  seed: 0
+
+train:
+  lora_r: 4
+  lora_alpha: 8
+  lora_dropout: 0.0
+  target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+  learning_rate: 1.0e-3
+  warmup_steps: 1
+  max_steps: 4
+  batch_size: 2
+  max_seq_len: 512
+  seed: 0
+
+eval:
+  precisions: [bf16, rtn4]
+  batch_size: 3
+  max_new_tokens: 24
+
+paths:
+  pool: outputs_smoke/pool.jsonl
+  scored: outputs_smoke/pool_scored.jsonl
+  arms_dir: outputs_smoke/arms
+  runs_dir: outputs_smoke/runs
+  eval_dir: outputs_smoke/eval
