@@ -5,7 +5,9 @@
 
 The extras JSON holds what attempt records can't: {"rates": {runtime: {"decode_tok_s", "prefill_tok_s"}},
 "peak_gpu_gib": {runtime: GiB}, "energy_counter": {"readable", "monotonic", "update_period_s",
-"idle_w": {...}}, "replay_match_rate": float}. Missing keys are listed in the report.
+"idle_w": {...}}, "replay_match_rate": float, "sampler_echo_ok": {runtime: bool},
+"per_turn_energy_ok": bool, "concurrency": {"containers", "vcpus_per_container"}}.
+Missing keys are listed in the report.
 """
 
 import argparse

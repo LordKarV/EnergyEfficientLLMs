@@ -56,3 +56,5 @@ def test_markdown_lists_every_required_section():
     for heading in ("Attempts per hour", "Limits hit", "Malformed calls", "Tokens and prefix cache",
                     "Training probe", "Not yet provided"):
         assert heading in md
+    for key in ("sampler_echo_ok", "per_turn_energy_ok", "concurrency"):
+        assert f"`{key}`" in md  # listed as missing until the harness writes it

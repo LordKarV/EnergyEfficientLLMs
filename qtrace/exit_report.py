@@ -12,6 +12,9 @@ MALFORMED = ["misnested_tag", "wrong_name", "text_after_call", "truncated_call",
 # Attempts per P0 step and the runtime each runs on (docs/04, Compute estimate and the gate sections).
 P0_STEPS = {"P0b": ("vllm", 4800), "P0a": ("llama.cpp", 3000), "P0c": ("llama.cpp", 2400), "P0d": ("llama.cpp", 800)}
 HERO_PREFIX_HIT = 0.92
+# Keys of the extras JSON, agreed with the harness in issue #1 / PR #7.
+EXTRAS = ["rates", "peak_gpu_gib", "energy_counter", "replay_match_rate", "sampler_echo_ok",
+          "per_turn_energy_ok", "concurrency"]
 
 
 def attempt_stats(rows):
@@ -126,10 +129,10 @@ def render_markdown(stats, probe, extras, projections):
             if step != "total_hours":
                 lines.append(f"| {step} | {v['runtime']} | {v['attempts']} | {v['hours']:.1f} |")
         lines.append(f"| total | | | {projections['total_hours']:.1f} |")
-    missing = [k for k in ("rates", "peak_gpu_gib", "energy_counter", "replay_match_rate") if k not in extras]
+    missing = [k for k in EXTRAS if k not in extras]
     lines += ["", "## Not yet provided", ""]
     lines += [f"- `{k}`" for k in missing] or ["Nothing: every section is filled."]
-    for k in ("peak_gpu_gib", "energy_counter", "replay_match_rate"):
+    for k in EXTRAS[1:]:
         if k in extras:
             lines += ["", f"`{k}`: `{extras[k]}`"]
     return "\n".join(lines) + "\n"
