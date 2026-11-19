@@ -9,13 +9,14 @@ from qtrace.exit_report import attempt_stats, project_hours, render_markdown
 
 
 def rec(runtime, end_reason, t0, t1, out=1000, unc=3000, cached=20000, server_cached=20000, malformed=None,
-        tool_s=60.0, cpu_s=30.0):
+        tool_s=60.0, cpu_s=30.0, gen_s=120.0):
     return {"runtime": runtime, "end_reason": end_reason, "resolved": end_reason == "submitted",
             "tokens": {"output": out, "input_uncached": unc, "input_cached": cached,
                        "server_reported_cached": server_cached},
             "malformed": malformed or {"misnested_tag": 0, "wrong_name": 0, "text_after_call": 0,
                                        "truncated_call": 0, "no_call_no_answer": 0},
             "energy": {"t_start": t0, "t_end": t1}, "tool_seconds": tool_s, "container_cpu_seconds": cpu_s,
+            "gen_seconds": gen_s,
             "turns": 10, "tool_calls": 10, "profile": "BF16", "concurrency": 14}
 
 
@@ -30,15 +31,16 @@ def test_attempt_stats_rates_and_shares():
     assert abs(s["attempts_per_hour"] - 4.0) < 1e-9  # 4 attempts in a 3,600 s span
     assert s["end_reason_share"]["context_limit"] == 0.25
     assert s["context_limit_check"] == {"share": 0.25, "over_10pct": True}
-    assert s["malformed_per_call"]["misnested_tag"] == 2 / 40
+    assert s["malformed_per_turn"]["misnested_tag"] == 2 / 40
     assert s["prefix_cache_hit_rate_ideal"] == 20000 / 23000
     assert s["server_vs_ideal_cached"] == 1.0
+    assert s["realized_uncached_per_attempt"] == 3000.0
     assert s["tokens_per_attempt"]["output"] == 1000
 
 
 def test_project_hours_uses_token_rates_not_wave_time():
     stats = {"tokens_per_attempt": {"output": 1000, "input_uncached": 3000, "input_cached": 20000},
-             "tool_seconds_per_attempt": 60.0}
+             "tool_seconds_per_attempt": 60.0, "realized_uncached_per_attempt": None}
     rates = {"decode_tok_s": 500.0, "prefill_tok_s": 5000.0}
     h = project_hours(stats, rates, n_attempts=1000, concurrency=14)
     # per attempt: 1000/500 + 3000/5000 = 2.6 s of server time; tool time overlaps across 14 slots
@@ -58,3 +60,27 @@ def test_markdown_lists_every_required_section():
         assert heading in md
     for key in ("sampler_echo_ok", "per_turn_energy_ok", "concurrency"):
         assert f"`{key}`" in md  # listed as missing until the harness writes it
+
+
+def test_realized_cache_misses_raise_the_projection():
+    stats = {"tokens_per_attempt": {"output": 1000, "input_uncached": 3000, "input_cached": 20000},
+             "tool_seconds_per_attempt": 0.0, "realized_uncached_per_attempt": 13000.0}
+    rates = {"decode_tok_s": 500.0, "prefill_tok_s": 5000.0}
+    real = project_hours(stats, rates, 100, 14)["hours"]
+    ideal = project_hours(stats, rates, 100, 14, realized=False)["hours"]
+    assert real > ideal and abs(real - 100 * (2 + 13000 / 5000) / 3600) < 1e-9
+
+
+def test_projections_by_profile_with_fallback_and_sub_run():
+    from qtrace.exit_report import projections
+
+    rows = [rec("llama.cpp", "submitted", 0, 600), rec("vllm", "submitted", 0, 600)]
+    stats = attempt_stats(rows)
+    extras = {"rates": {"llama.cpp": {"BF16": {"decode_tok_s": 400, "prefill_tok_s": 4000},
+                                      "Q4_K_M": {"decode_tok_s": 600, "prefill_tok_s": 5000}}}}
+    p = projections(stats, extras)
+    assert p["P0a"]["profiles"]["Q3_K_M"]["rate_from"] == "Q4_K_M"
+    assert p["P0a"]["profiles"]["Q8_0"]["rate_from"] == "BF16"
+    assert p["P0a"]["upper_hours"] > p["P0a"]["point_hours"]  # the 600-attempt top-up
+    assert "P0b" not in p and any("vllm BF16" in x for x in p["not_included"])
+    assert p["energy_sub_run"]["serial"] and abs(p["energy_sub_run"]["point_hours"] - 150 * (120 + 60 + 45) / 3600) < 1e-9

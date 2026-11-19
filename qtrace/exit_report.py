@@ -9,8 +9,20 @@ idle watts, the replay match rate) come from an optional extras JSON; anything m
 from collections import Counter, defaultdict
 
 MALFORMED = ["misnested_tag", "wrong_name", "text_after_call", "truncated_call", "no_call_no_answer"]
-# Attempts per P0 step and the runtime each runs on (docs/04, Compute estimate and the gate sections).
-P0_STEPS = {"P0b": ("vllm", 4800), "P0a": ("llama.cpp", 3000), "P0c": ("llama.cpp", 2400), "P0d": ("llama.cpp", 800)}
+# Concurrent P0 blocks (docs/04): runtime, attempts per profile at the point and the upper count.
+# P0a has a 600-attempt top-up (BF16 and Q4_K_M) if inconclusive; P0d can grow to about 1,600.
+P0_STEPS = {
+    "P0b": ("vllm", {"BF16": (4800, 4800)}),
+    "P0a": ("llama.cpp", {"BF16": (600, 900), "Q8_0": (600, 600), "Q4_K_M": (600, 900), "Q3_K_M": (600, 600),
+                          "Q4_K_M_gate8": (600, 600)}),
+    "P0c": ("llama.cpp", {"BF16": (800, 800), "Q4_K_M": (800, 800), "Q3_K_M": (800, 800)}),
+    "P0d": ("llama.cpp", {"BF16": (400, 800), "Q3_K_M": (400, 800)}),
+}
+# Profiles without their own measured rate borrow one: conservative for Q3_K_M (no faster than Q4_K_M).
+RATE_FALLBACK = {"Q8_0": "BF16", "Q3_K_M": "Q4_K_M", "Q4_K_M_gate8": "Q4_K_M"}
+SUB_RUN = {"attempts": 150, "settle_s": 45}  # energy sub-run: 5 profiles x 15 tasks x 2, concurrency 1
+NOT_INCLUDED = ["KL scoring of the P0b pool (BF16 and Q3_K_M forward passes, on its own machine)",
+                "per-block overhead: server restarts, GGUF loads and image pulls between serial blocks"]
 HERO_PREFIX_HIT = 0.92
 # Keys of the extras JSON, agreed with the harness in issue #1 / PR #7.
 EXTRAS = ["rates", "peak_gpu_gib", "energy_counter", "replay_match_rate", "sampler_echo_ok",
@@ -29,7 +41,9 @@ def _stats(rows):
     span = max(r["energy"]["t_end"] for r in rows) - min(r["energy"]["t_start"] for r in rows)
     ends = Counter(r["end_reason"] for r in rows)
     calls = sum(r["tool_calls"] for r in rows)
+    turns = sum(r["turns"] for r in rows)
     tok = {k: sum(r["tokens"][k] for r in rows) for k in ("output", "input_uncached", "input_cached")}
+    has_server = all("server_reported_cached" in r["tokens"] for r in rows)
     server_cached = sum(r["tokens"].get("server_reported_cached", 0) for r in rows)
     ctx_share = ends.get("context_limit", 0) / n
     wall_share = ends.get("infra_timeout", 0) / n
@@ -42,8 +56,13 @@ def _stats(rows):
         "end_reason_share": {k: v / n for k, v in sorted(ends.items())},
         "context_limit_check": {"share": ctx_share, "over_10pct": ctx_share > 0.10},
         "wall_clock_check": {"share": wall_share, "over_2pct": wall_share > 0.02},
-        "malformed_per_call": {k: sum(r["malformed"][k] for r in rows) / calls if calls else 0.0 for k in MALFORMED},
+        # Per turn: a malformed turn executes no call, so a per-call rate can exceed 1.
+        "malformed_per_turn": {k: sum(r["malformed"][k] for r in rows) / turns if turns else 0.0 for k in MALFORMED},
         "tokens_per_attempt": {k: v / n for k, v in tok.items()},
+        # Prefill the server actually did: all input minus what it reported as cached.
+        "realized_uncached_per_attempt": ((tok["input_cached"] + tok["input_uncached"] - server_cached) / n
+                                          if has_server else None),
+        "gen_seconds_per_attempt": sum(r.get("gen_seconds", 0.0) for r in rows) / n,
         "prefix_cache_hit_rate_ideal": hit,
         "prefix_cache_flag": hit < HERO_PREFIX_HIT - 0.12,
         "server_vs_ideal_cached": server_cached / tok["input_cached"] if tok["input_cached"] else None,
@@ -53,8 +72,11 @@ def _stats(rows):
     }
 
 
-def project_hours(stats, rates, n_attempts, concurrency):
+def project_hours(stats, rates, n_attempts, concurrency, realized=True):
     """Instance-hours for n attempts from aggregate token rates (not from one wave's wall clock).
+
+    realized=True charges prefill for what the server actually recomputed (when it reported its cache
+    counts); realized=False uses the ideal split under full prefix reuse, a lower bound.
 
     rates are aggregate tokens per second with all slots busy, so server time is already shared
     across slots; tool time runs in parallel across `concurrency` containers. Following docs/04
@@ -62,21 +84,58 @@ def project_hours(stats, rates, n_attempts, concurrency):
     conservative: in practice they partly overlap.
     """
     t = stats["tokens_per_attempt"]
-    per_attempt = t["output"] / rates["decode_tok_s"] + t["input_uncached"] / rates["prefill_tok_s"]
+    uncached = stats["realized_uncached_per_attempt"] if realized and stats["realized_uncached_per_attempt"] \
+        is not None else t["input_uncached"]
+    per_attempt = t["output"] / rates["decode_tok_s"] + uncached / rates["prefill_tok_s"]
     server_h = n_attempts * per_attempt / 3600
     tool_h = n_attempts * stats["tool_seconds_per_attempt"] / concurrency / 3600
     return {"server_hours": server_h, "tool_hours": tool_h, "hours": server_h + tool_h}
 
 
+def _rate(extras, runtime, profile):
+    rates = extras.get("rates", {}).get(runtime, {})
+    return rates.get(profile) or rates.get(RATE_FALLBACK.get(profile, profile))
+
+
 def projections(stats, extras):
-    out = {}
-    for step, (runtime, n) in P0_STEPS.items():
-        rate = extras.get("rates", {}).get(runtime)
-        if rate and runtime in stats:
-            out[step] = {"runtime": runtime, "attempts": n,
-                         **project_hours(stats[runtime], rate, n, stats[runtime]["concurrency"])}
+    """Projected instance-hours per P0 step at the point and upper attempt counts, plus the energy sub-run.
+
+    Rates are keyed by (runtime, profile): extras["rates"][runtime][profile] = {decode_tok_s, prefill_tok_s}.
+    A step is projected only when every profile in it has a rate (its own or the fallback in RATE_FALLBACK).
+    """
+    out, missing = {}, []
+    for step, (runtime, profiles) in P0_STEPS.items():
+        if runtime not in stats:
+            missing.append(f"{step}: no {runtime} attempts in the pilot")
+            continue
+        s = stats[runtime]
+        rows = {}
+        for profile, (point, upper) in profiles.items():
+            rate = _rate(extras, runtime, profile)
+            if rate is None:
+                missing.append(f"{step}: no rate for {runtime} {profile}")
+                break
+            rows[profile] = {
+                "rate_from": profile if extras["rates"][runtime].get(profile) else RATE_FALLBACK[profile],
+                "point_hours": project_hours(s, rate, point, s["concurrency"])["hours"],
+                "upper_hours": project_hours(s, rate, upper, s["concurrency"])["hours"],
+                "ideal_cache_hours": project_hours(s, rate, point, s["concurrency"], realized=False)["hours"],
+            }
+        else:
+            out[step] = {"runtime": runtime, "profiles": rows,
+                         "point_hours": sum(v["point_hours"] for v in rows.values()),
+                         "upper_hours": sum(v["upper_hours"] for v in rows.values()),
+                         "ideal_cache_hours": sum(v["ideal_cache_hours"] for v in rows.values())}
+    if "llama.cpp" in stats:
+        s = stats["llama.cpp"]
+        per = s["gen_seconds_per_attempt"] + s["tool_seconds_per_attempt"] + SUB_RUN["settle_s"]
+        out["energy_sub_run"] = {"runtime": "llama.cpp", "serial": True, "attempts": SUB_RUN["attempts"],
+                                 "point_hours": SUB_RUN["attempts"] * per / 3600,
+                                 "upper_hours": SUB_RUN["attempts"] * per / 3600,
+                                 "ideal_cache_hours": SUB_RUN["attempts"] * per / 3600}
     if out:
-        out["total_hours"] = sum(v["hours"] for v in out.values())
+        out["total"] = {k: sum(v[k] for v in out.values()) for k in ("point_hours", "upper_hours", "ideal_cache_hours")}
+    out["not_included"] = NOT_INCLUDED + missing
     return out
 
 
@@ -98,12 +157,13 @@ def render_markdown(stats, probe, extras, projections):
         ctx, wall = s["context_limit_check"], s["wall_clock_check"]
         lines.append(f"| {rt} | {ends} | {_pct(ctx['share'])}{' **over**' if ctx['over_10pct'] else ''} "
                      f"| {_pct(wall['share'])}{' **over**' if wall['over_2pct'] else ''} |")
-    lines += ["", "## Malformed calls", "", "Per tool call, by category.", "",
+    lines += ["", "## Malformed calls", "", "Per turn, by category (a malformed turn executes no call).", "",
               "| runtime | " + " | ".join(MALFORMED) + " |", "|---" * (len(MALFORMED) + 1) + "|"]
     for rt, s in stats.items():
-        lines.append(f"| {rt} | " + " | ".join(_pct(s["malformed_per_call"][k]) for k in MALFORMED) + " |")
+        lines.append(f"| {rt} | " + " | ".join(_pct(s["malformed_per_turn"][k]) for k in MALFORMED) + " |")
     lines += ["", "## Tokens and prefix cache", "",
-              "| runtime | output | uncached input | cached input | ideal hit rate | server / ideal cached "
+              "| runtime | output | uncached input | cached input | ideal hit rate (flag below 80%) "
+              "| server / ideal cached "
               "| tool s | vCPUs busy |", "|---|---|---|---|---|---|---|---|"]
     for rt, s in stats.items():
         t = s["tokens_per_attempt"]
@@ -124,11 +184,19 @@ def render_markdown(stats, probe, extras, projections):
     else:
         lines.append("No probe results.")
     if projections:
-        lines += ["", "## Projected instance-hours", "", "| step | runtime | attempts | hours |", "|---|---|---|---|"]
+        lines += ["", "## Projected instance-hours", "",
+                  "Point and upper attempt counts from 04, prefill at the realized cache split; the ideal-cache "
+                  "column is a lower bound.", "",
+                  "| step | runtime | point h | upper h | ideal-cache h |", "|---|---|---|---|---|"]
         for step, v in projections.items():
-            if step != "total_hours":
-                lines.append(f"| {step} | {v['runtime']} | {v['attempts']} | {v['hours']:.1f} |")
-        lines.append(f"| total | | | {projections['total_hours']:.1f} |")
+            if step in ("total", "not_included"):
+                continue
+            lines.append(f"| {step} | {v['runtime']} | {v['point_hours']:.1f} | {v['upper_hours']:.1f} "
+                         f"| {v['ideal_cache_hours']:.1f} |")
+        if "total" in projections:
+            t = projections["total"]
+            lines.append(f"| total | | {t['point_hours']:.1f} | {t['upper_hours']:.1f} | {t['ideal_cache_hours']:.1f} |")
+        lines += ["", "Not included in the total:", ""] + [f"- {x}" for x in projections["not_included"]]
     missing = [k for k in EXTRAS if k not in extras]
     lines += ["", "## Not yet provided", ""]
     lines += [f"- `{k}`" for k in missing] or ["Nothing: every section is filled."]
