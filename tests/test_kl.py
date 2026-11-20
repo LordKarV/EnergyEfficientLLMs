@@ -8,7 +8,7 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from qtrace.kl import compare, decision_mask, hidden_at, logit_index, score_trajectory, summarize
+from qtrace.kl import compare, decision_mask, hidden_at, logit_index, score_trajectory, span_mask, summarize
 from qtrace.quantize import quantize_model_rtn
 
 
@@ -130,3 +130,45 @@ def test_summarize_reports_decision_and_whole_run():
     assert s["kl_mean"] == 2.5 and s["kl_decision"] == 3.0
     assert s["kl_sum_all"] == 10.0 and s["kl_sum_decision"] == 6.0
     assert s["n_scored"] == 4 and s["n_decision"] == 2 and s["flip_rate"] == 0.25
+
+
+def test_span_mask_selects_scored_tokens_inside_spans():
+    mask = torch.zeros(40, dtype=torch.bool)
+    mask[5:35] = True
+    idx = logit_index(mask)
+    m = span_mask(idx, [(8, 11), (30, 50)])
+    assert set((idx[m] + 1).tolist()) == {8, 9, 10, 30, 31, 32, 33, 34}  # end exclusive, unscored 35+ skipped
+
+
+def test_summarize_reports_action_kl_and_turn_halves():
+    stats = {"kl": torch.tensor([1.0, 2.0, 3.0, 4.0, 5.0, 6.0]), "flip": torch.zeros(6),
+             "entropy_p": torch.zeros(6), "nll_p": torch.zeros(6), "nll_q": torch.zeros(6)}
+    decision = torch.tensor([True, False, False, True, False, True])
+    action = torch.tensor([False, True, True, False, False, True])
+    even = torch.tensor([True, True, True, False, False, False])
+    s = summarize(stats, decision, action=action, halves={"even": even, "odd": ~even})
+    assert abs(s["kl_action"] - 11.0 / 3) < 1e-6 and s["n_action"] == 3  # float32 mean
+    assert s["halves"]["even"] == {"n_scored": 3, "kl_mean": 2.0, "kl_decision": 1.0, "kl_action": 2.5}
+    assert s["halves"]["odd"] == {"n_scored": 3, "kl_mean": 5.0, "kl_decision": 5.0, "kl_action": 6.0}
+
+
+def test_no_action_spans_means_no_action_score():
+    stats = {k: torch.ones(3) for k in ("kl", "flip", "entropy_p", "nll_p", "nll_q")}
+    s = summarize(stats, torch.zeros(3, dtype=torch.bool))
+    assert s["kl_action"] is None and s["n_action"] == 0 and "halves" not in s
+
+
+def test_score_trajectory_action_and_halves_match_reference():
+    model_p = tiny_qwen35()
+    model_q = copy.deepcopy(model_p)
+    quantize_model_rtn(model_q, bits=3, group_size=32)
+    ids, mask = episode()
+    kl_ref, _ = reference(model_p, model_q, ids, mask)
+    pos = logit_index(mask) + 1
+    s = score_trajectory(model_p, model_q, ids, mask, action_spans=[(20, 30), (60, 70)],
+                         turn_spans=[(10, 30), (45, 70)])
+    in_action = ((pos >= 20) & (pos < 30)) | ((pos >= 60) & (pos < 70))
+    assert abs(s["kl_action"] - float(kl_ref[in_action].mean())) < 1e-4
+    assert abs(s["halves"]["even"]["kl_mean"] - float(kl_ref[pos < 30].mean())) < 1e-4
+    assert abs(s["halves"]["odd"]["kl_mean"] - float(kl_ref[pos >= 45].mean())) < 1e-4
+    assert s["halves"]["even"]["n_scored"] + s["halves"]["odd"]["n_scored"] == s["n_scored"]

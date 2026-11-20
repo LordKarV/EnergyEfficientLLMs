@@ -83,12 +83,27 @@ def decision_mask(idx, entropy, tool_call_positions, command_spans, command_toke
     return mask
 
 
-def summarize(stats, decision):
+def span_mask(idx, spans):
+    """Scored tokens (positions idx + 1) inside any (start, end) span, end exclusive."""
+    pos = idx + 1
+    mask = torch.zeros(len(pos), dtype=torch.bool)
+    for start, end in spans:
+        mask |= (pos >= start) & (pos < end)
+    return mask
+
+
+def summarize(stats, decision, action=None, halves=None):
     """Whole-run and decision-point scores.
 
     kl_sum_decision is the Stage 2 RL term when the mask uses a fixed entropy threshold. kl_sum_all is
     a diagnostic only: it grows with every written token and would duplicate the energy term.
     Means are None when nothing is scored, so an empty run can never rank as most stable.
+
+    kl_action is the mean over tool-call tokens, the second candidate in docs/04's ordered score
+    rule; it is None without action spans. halves maps a name to a mask of scored tokens (turn
+    parity in P0b) and gets the three candidate scores per half for split-half reliability. The
+    decision mask is computed over the whole run first, so each half scores the same positions
+    the full-run score uses.
     """
     kl = stats["kl"]
     n = len(kl)
@@ -96,11 +111,14 @@ def summarize(stats, decision):
     def mean(x):
         return float(x.mean()) if len(x) else None
 
-    return {
+    action = torch.zeros(n, dtype=torch.bool) if action is None else action
+    out = {
         "n_scored": n,
         "n_decision": int(decision.sum()),
+        "n_action": int(action.sum()),
         "kl_mean": mean(kl),
         "kl_decision": mean(kl[decision]),
+        "kl_action": mean(kl[action]),
         "kl_sum_decision": float(kl[decision].sum()),
         "kl_sum_all": float(kl.sum()),
         "flip_rate": mean(stats["flip"]),
@@ -108,15 +126,28 @@ def summarize(stats, decision):
         "nll_p_mean": mean(stats["nll_p"]),
         "nll_q_mean": mean(stats["nll_q"]),
     }
+    if halves:
+        out["halves"] = {name: {"n_scored": int(m.sum()), "kl_mean": mean(kl[m]),
+                                "kl_decision": mean(kl[decision & m]), "kl_action": mean(kl[action & m])}
+                         for name, m in halves.items()}
+    return out
 
 
 def score_trajectory(model_p, model_q, input_ids, model_mask, tool_call_positions=(), command_spans=(),
-                     chunk=384, entropy_threshold=None):
-    """Score one stored episode. model_p is full precision, model_q the quantized copy."""
+                     chunk=384, entropy_threshold=None, action_spans=(), turn_spans=()):
+    """Score one stored episode. model_p is full precision, model_q the quantized copy.
+
+    action_spans are the tool-call blocks; turn_spans are the assistant turns in order, split into
+    even and odd halves for split-half reliability (both (start, end), end exclusive).
+    """
     idx = logit_index(model_mask)
     targets = input_ids[0, (idx + 1).to(input_ids.device)]
     stats = compare(model_p.lm_head, hidden_at(model_p, input_ids, idx),
                     model_q.lm_head, hidden_at(model_q, input_ids, idx), targets, chunk=chunk)
     dm = decision_mask(idx, stats["entropy_p"], tool_call_positions, command_spans,
                        entropy_threshold=entropy_threshold)
-    return summarize(stats, dm)
+    halves = None
+    if turn_spans:
+        halves = {"even": span_mask(idx, turn_spans[0::2]), "odd": span_mask(idx, turn_spans[1::2])}
+    action = span_mask(idx, action_spans) if action_spans else None
+    return summarize(stats, dm, action=action, halves=halves)
