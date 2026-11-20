@@ -140,35 +140,35 @@ def test_span_mask_selects_scored_tokens_inside_spans():
     assert set((idx[m] + 1).tolist()) == {8, 9, 10, 30, 31, 32, 33, 34}  # end exclusive, unscored 35+ skipped
 
 
-def test_summarize_reports_action_kl_and_turn_halves():
+def test_summarize_reports_command_kl_and_turn_halves():
     stats = {"kl": torch.tensor([1.0, 2.0, 3.0, 4.0, 5.0, 6.0]), "flip": torch.zeros(6),
              "entropy_p": torch.zeros(6), "nll_p": torch.zeros(6), "nll_q": torch.zeros(6)}
     decision = torch.tensor([True, False, False, True, False, True])
-    action = torch.tensor([False, True, True, False, False, True])
+    command = torch.tensor([False, True, True, False, False, True])
     even = torch.tensor([True, True, True, False, False, False])
-    s = summarize(stats, decision, action=action, halves={"even": even, "odd": ~even})
-    assert abs(s["kl_action"] - 11.0 / 3) < 1e-6 and s["n_action"] == 3  # float32 mean
-    assert s["halves"]["even"] == {"n_scored": 3, "kl_mean": 2.0, "kl_decision": 1.0, "kl_action": 2.5}
-    assert s["halves"]["odd"] == {"n_scored": 3, "kl_mean": 5.0, "kl_decision": 5.0, "kl_action": 6.0}
+    s = summarize(stats, decision, command=command, halves={"even": even, "odd": ~even})
+    assert abs(s["kl_command"] - 11.0 / 3) < 1e-6 and s["n_command"] == 3  # float32 mean
+    assert s["halves"]["even"] == {"n_scored": 3, "kl_mean": 2.0, "kl_decision": 1.0, "kl_command": 2.5}
+    assert s["halves"]["odd"] == {"n_scored": 3, "kl_mean": 5.0, "kl_decision": 5.0, "kl_command": 6.0}
 
 
-def test_no_action_spans_means_no_action_score():
+def test_no_command_spans_means_no_command_score():
     stats = {k: torch.ones(3) for k in ("kl", "flip", "entropy_p", "nll_p", "nll_q")}
     s = summarize(stats, torch.zeros(3, dtype=torch.bool))
-    assert s["kl_action"] is None and s["n_action"] == 0 and "halves" not in s
+    assert s["kl_command"] is None and s["n_command"] == 0 and "halves" not in s
 
 
-def test_score_trajectory_action_and_halves_match_reference():
+def test_score_trajectory_command_and_halves_match_reference():
     model_p = tiny_qwen35()
     model_q = copy.deepcopy(model_p)
     quantize_model_rtn(model_q, bits=3, group_size=32)
     ids, mask = episode()
     kl_ref, _ = reference(model_p, model_q, ids, mask)
     pos = logit_index(mask) + 1
-    s = score_trajectory(model_p, model_q, ids, mask, action_spans=[(20, 30), (60, 70)],
+    s = score_trajectory(model_p, model_q, ids, mask, command_spans=[(20, 30), (60, 70)],
                          turn_spans=[(10, 30), (45, 70)])
-    in_action = ((pos >= 20) & (pos < 30)) | ((pos >= 60) & (pos < 70))
-    assert abs(s["kl_action"] - float(kl_ref[in_action].mean())) < 1e-4
+    in_command = ((pos >= 20) & (pos < 30)) | ((pos >= 60) & (pos < 70))
+    assert abs(s["kl_command"] - float(kl_ref[in_command].mean())) < 1e-4
     assert abs(s["halves"]["even"]["kl_mean"] - float(kl_ref[pos < 30].mean())) < 1e-4
     assert abs(s["halves"]["odd"]["kl_mean"] - float(kl_ref[pos >= 45].mean())) < 1e-4
     assert s["halves"]["even"]["n_scored"] + s["halves"]["odd"]["n_scored"] == s["n_scored"]

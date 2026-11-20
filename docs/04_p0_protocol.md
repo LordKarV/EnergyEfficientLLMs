@@ -276,11 +276,12 @@ attempt start and end, plus run totals, marked `not_attributable`.
   tokens is secondary, reported on the same replays. `stable`, `qtrace` and the 2x2 arms use the
   score chosen by the rule below, which is the primary score unless it fails.
 - **Candidate scores, frozen at three (2026-11-20, before any P0 data):** (1) `kl_decision`, the
-  primary score above; (2) `kl_action`, the mean KL over the model-written tokens of the tool-call
-  blocks, `<tool_call>` through `</tool_call>`; (3) `kl_mean`. All use the `Q3_K_M` probe and come
-  from one scoring pass (`qtrace/kl.py`). No other variant is added after seeing data. The reason
+  primary score above; (2) `kl_command`, the mean KL over the model-written tokens of each
+  `command` value (`command_spans`; whole tool-call blocks are not used, because their
+  near-deterministic wrapper tokens would make many short commands score low); (3) `kl_mean`.
+  All use the `Q3_K_M` probe and come from one scoring pass (`qtrace/kl.py`). No other variant is added after seeing data. The reason
   for the ordering: on T1 proxy trajectories (issue #1, 4B and 9B, MLX), within-task rank agreement
-  across probes rises from about 0.35-0.43 for `kl_decision` to 0.62-0.67 for `kl_action` and
+  across probes rises from about 0.35-0.43 for `kl_decision` to 0.62-0.67 for `kl_command` and
   0.68-0.76 for `kl_mean`, while the within-task Spearman against BF16 entropy rises from about
   0.0-0.2 to 0.4-0.5 and 0.6.
 - Before any continuation runs, report for each candidate on the P0b pool: the within-task Spearman
@@ -483,7 +484,7 @@ A draft, like `03` Stage 2, and fixed before S2 starts rather than before P1.
 
 - `KL(y)` decision positions, by a fixed rule: the `<tool_call>` token, the first 8 tokens of each
   `command` value, and positions above a fixed BF16-entropy threshold set from the P0b pool.
-  If P0d chose `kl_action`, `KL(y)` sums over the tool-call tokens instead; if it chose `kl_mean`,
+  If P0d chose `kl_command`, `KL(y)` sums over the command-value tokens instead; if it chose `kl_mean`,
   over all model-written tokens, which overlaps the energy term most.
 - `KL(y)` is a sum over those positions, never a per-token or per-decision mean, which can be
   lowered by adding predictable tokens or easy actions. The P0d selection score can be a mean

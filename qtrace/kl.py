@@ -92,18 +92,19 @@ def span_mask(idx, spans):
     return mask
 
 
-def summarize(stats, decision, action=None, halves=None):
+def summarize(stats, decision, command=None, halves=None):
     """Whole-run and decision-point scores.
 
     kl_sum_decision is the Stage 2 RL term when the mask uses a fixed entropy threshold. kl_sum_all is
     a diagnostic only: it grows with every written token and would duplicate the energy term.
     Means are None when nothing is scored, so an empty run can never rank as most stable.
 
-    kl_action is the mean over tool-call tokens, the second candidate in docs/04's ordered score
-    rule; it is None without action spans. halves maps a name to a mask of scored tokens (turn
-    parity in P0b) and gets the three candidate scores per half for split-half reliability. The
-    decision mask is computed over the whole run first, so each half scores the same positions
-    the full-run score uses.
+    kl_command is the mean over the command-value tokens, the second candidate in docs/04's ordered
+    score rule; it is None without command spans. Whole tool-call blocks would be diluted by about a
+    dozen near-deterministic wrapper tokens per call, so many short commands would score low. halves
+    maps a name to a mask of scored tokens (turn parity in P0b) and gets the three candidate scores
+    per half for split-half reliability. The decision mask is computed over the whole run first, so
+    each half scores the same positions the full-run score uses.
     """
     kl = stats["kl"]
     n = len(kl)
@@ -111,14 +112,14 @@ def summarize(stats, decision, action=None, halves=None):
     def mean(x):
         return float(x.mean()) if len(x) else None
 
-    action = torch.zeros(n, dtype=torch.bool) if action is None else action
+    command = torch.zeros(n, dtype=torch.bool) if command is None else command
     out = {
         "n_scored": n,
         "n_decision": int(decision.sum()),
-        "n_action": int(action.sum()),
+        "n_command": int(command.sum()),
         "kl_mean": mean(kl),
         "kl_decision": mean(kl[decision]),
-        "kl_action": mean(kl[action]),
+        "kl_command": mean(kl[command]),
         "kl_sum_decision": float(kl[decision].sum()),
         "kl_sum_all": float(kl.sum()),
         "flip_rate": mean(stats["flip"]),
@@ -128,17 +129,18 @@ def summarize(stats, decision, action=None, halves=None):
     }
     if halves:
         out["halves"] = {name: {"n_scored": int(m.sum()), "kl_mean": mean(kl[m]),
-                                "kl_decision": mean(kl[decision & m]), "kl_action": mean(kl[action & m])}
+                                "kl_decision": mean(kl[decision & m]), "kl_command": mean(kl[command & m])}
                          for name, m in halves.items()}
     return out
 
 
 def score_trajectory(model_p, model_q, input_ids, model_mask, tool_call_positions=(), command_spans=(),
-                     chunk=384, entropy_threshold=None, action_spans=(), turn_spans=()):
+                     chunk=384, entropy_threshold=None, turn_spans=()):
     """Score one stored episode. model_p is full precision, model_q the quantized copy.
 
-    action_spans are the tool-call blocks; turn_spans are the assistant turns in order, split into
-    even and odd halves for split-half reliability (both (start, end), end exclusive).
+    command_spans are the command values (also used for kl_command); turn_spans are the assistant
+    turns in order, split into even and odd halves for split-half reliability. Spans are
+    (start, end), end exclusive.
     """
     idx = logit_index(model_mask)
     targets = input_ids[0, (idx + 1).to(input_ids.device)]
@@ -149,5 +151,5 @@ def score_trajectory(model_p, model_q, input_ids, model_mask, tool_call_position
     halves = None
     if turn_spans:
         halves = {"even": span_mask(idx, turn_spans[0::2]), "odd": span_mask(idx, turn_spans[1::2])}
-    action = span_mask(idx, action_spans) if action_spans else None
-    return summarize(stats, dm, action=action, halves=halves)
+    command = span_mask(idx, command_spans) if command_spans else None
+    return summarize(stats, dm, command=command, halves=halves)

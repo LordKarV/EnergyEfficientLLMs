@@ -98,7 +98,7 @@ uses an energy-calibrated cost in the reward or evaluates the trained agent afte
 2. **Score:** for each successful run, measure how much a quantized copy (`Q3_K_M`) disagrees with
    the full-precision model on the tokens the model wrote (teacher-forced KL). The primary score is
    decision-point KL. If it fails `04` P0d's reliability or confound checks, the pre-registered
-   fallbacks are KL over the tool-call tokens (`kl_action`), then the whole-run average (`kl_mean`);
+   fallbacks are KL over the command-value tokens (`kl_command`), then the whole-run average (`kl_mean`);
    if all three fail, the stability arms are dropped.
 3. **Select:** build one training set per arm by picking one run per task:
    - `random`: any successful run
