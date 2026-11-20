@@ -146,6 +146,11 @@ def score_trajectory(model_p, model_q, input_ids, model_mask, tool_call_position
     targets = input_ids[0, (idx + 1).to(input_ids.device)]
     stats = compare(model_p.lm_head, hidden_at(model_p, input_ids, idx),
                     model_q.lm_head, hidden_at(model_q, input_ids, idx), targets, chunk=chunk)
+    return score_stats(stats, idx, tool_call_positions, command_spans, entropy_threshold, turn_spans)
+
+
+def score_stats(stats, idx, tool_call_positions=(), command_spans=(), entropy_threshold=None, turn_spans=()):
+    """Scores for one episode from its per-position stats, from compare() or qtrace/kl_gguf.py."""
     dm = decision_mask(idx, stats["entropy_p"], tool_call_positions, command_spans,
                        entropy_threshold=entropy_threshold)
     halves = None
