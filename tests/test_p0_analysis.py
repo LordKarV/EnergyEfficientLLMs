@@ -214,15 +214,18 @@ def test_flagged_share_and_heldout_excluding_flagged():
     assert rep["heldout_mean_pass1"] == 0.5 and rep["heldout_mean_pass1_excluding_flagged"] == 4 / 12
 
 
-def _cli(tmp_path, rows, manifest, *extra):
+def _run(tmp_path, rows, manifest, *extra):
     path = tmp_path / "a.jsonl"
     path.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
     (tmp_path / "m.json").write_text(json.dumps(manifest))
-    out = tmp_path / "g.json"
-    subprocess.run([sys.executable, os.path.join(ROOT, "scripts", "p0_analyze.py"), str(path), "--manifest",
-                    str(tmp_path / "m.json"), "--inrepo-size", "300", "--n-boot", "50", "--out", str(out), *extra],
-                   check=True, capture_output=True)
-    return json.loads(out.read_text())
+    return subprocess.run([sys.executable, os.path.join(ROOT, "scripts", "p0_analyze.py"), str(path), "--manifest",
+                           str(tmp_path / "m.json"), "--inrepo-size", "300", "--n-boot", "50",
+                           "--out", str(tmp_path / "g.json"), *extra], capture_output=True, text=True, check=False)
+
+
+def _cli(tmp_path, rows, manifest, *extra):
+    _run(tmp_path, rows, manifest, *extra).check_returncode()
+    return json.loads((tmp_path / "g.json").read_text())
 
 
 def test_cli_min_candidates_reaches_p0b(tmp_path):
@@ -362,3 +365,69 @@ def test_cli_p0a_reports_secondary_and_flagged_factors(tmp_path):
     assert set(g["secondary"]) == {"heldout100", "verified100"} and "Q8_0" in g["secondary"]["verified100"]["vs_BF16"]
     assert g["secondary"]["heldout100"]["vs_BF16"]["Q8_0"]["permutation"]["n_perm"] == 50
     assert "factors_excluding_flagged" in g and g["design_mismatches"] == [["v0", "Q8_0", 4]]
+
+
+def _p0a_first_look(inflate=1.2, seed=0):
+    """BF16 and Q4_K_M on heldout100 (3 attempts each) plus Q3_K_M, as run "p0a"."""
+    rows = [{**r, "run_id": "p0a"} for r in varied(n_tasks=20, inflate=inflate, seed=seed)]
+    return rows + [{**r, "profile": "Q3_K_M", "attempt_id": r["attempt_id"] + "q3"} for r in rows
+                   if r["profile"] == "BF16"]
+
+
+def _topup(rows, q4_scale=1.0, run_id="p0a-topup"):
+    """Three fresh attempts per task at BF16 and Q4_K_M, Q4_K_M tokens scaled by q4_scale."""
+    return [{**r, "run_id": run_id, "attempt_id": r["attempt_id"] + run_id,
+             "tokens": {k: v * (q4_scale if r["profile"] == "Q4_K_M" else 1) for k, v in r["tokens"].items()}}
+            for r in rows if r["profile"] in ("BF16", "Q4_K_M")]
+
+
+def test_cli_p0a_inconclusive_needs_the_retest(tmp_path):
+    # Audit item "Add the P0a inconclusive re-test path" (04, P0a Inconclusive).
+    g = _cli(tmp_path, _p0a_first_look(), {"P0a": ["p0a"]}, "--seed", "0")["P0a"]
+    assert g["primary"]["verdict"] == "inconclusive" and g["retest"] is None
+    assert g["final_verdict"] is None and "P0a_topup" in g["final"]["note"] and g["final"]["look"] == 1
+
+
+def test_cli_p0a_decisive_first_look_is_final(tmp_path):
+    g = _cli(tmp_path, _p0a_first_look(inflate=2.0), {"P0a": ["p0a"]}, "--seed", "0")["P0a"]
+    assert g["primary"]["verdict"] == "pass" and g["final_verdict"] == "pass" and g["retest"] is None
+    assert g["final"] == {"look": 1, "b_continues": True, "stress_profile": None, "note": "B continues"}
+
+
+def test_cli_p0a_retest_pools_six_attempts_and_is_final(tmp_path):
+    first = _p0a_first_look()
+    rows = first + _topup(first, q4_scale=3.0)
+    proc = _run(tmp_path, rows, {"P0a": ["p0a"], "P0a_topup": ["p0a-topup"]}, "--seed", "0")
+    proc.check_returncode()
+    g = json.loads((tmp_path / "g.json").read_text())["P0a"]
+    assert g["primary"]["verdict"] == "inconclusive"  # the first look is kept as it was
+    assert g["design_mismatches"] == [] and g["retest"]["design_mismatches"] == []  # 3 per profile, then 6
+    assert g["retest"]["primary"]["verdict"] == "pass" and g["final_verdict"] == "pass"
+    assert g["final"]["look"] == 2 and '"final": "pass"' in proc.stdout
+    assert set(g["retest"]["flagged_share"]) == {"BF16", "Q4_K_M"}
+    short = _cli(tmp_path, rows[:-1], {"P0a": ["p0a"], "P0a_topup": ["p0a-topup"]}, "--seed", "0")["P0a"]
+    assert short["retest"]["design_mismatches"] == [[rows[-1]["task_id"], rows[-1]["profile"], 5]]
+
+
+def test_cli_p0a_still_inconclusive_keeps_b_with_q3_stress(tmp_path):
+    first = _p0a_first_look()
+    g = _cli(tmp_path, first + _topup(first), {"P0a": ["p0a"], "P0a_topup": ["p0a-topup"]}, "--seed", "0")["P0a"]
+    assert g["retest"]["primary"]["verdict"] == "inconclusive" and g["final_verdict"] == "inconclusive"
+    assert g["final"]["b_continues"] is True and g["final"]["stress_profile"] == "Q3_K_M" and g["final"]["look"] == 2
+
+
+def test_cli_p0a_refuses_a_topup_outside_the_protocol(tmp_path):
+    first = _p0a_first_look()
+    m = {"P0a": ["p0a"], "P0a_topup": ["p0a-topup"]}
+    decisive = _p0a_first_look(inflate=2.0)
+    cases = [
+        (decisive + _topup(decisive), m, "only an inconclusive"),
+        (first + _topup(first) + _topup(first, run_id="p0a-topup2"), {**m, "P0a_topup": ["p0a-topup", "p0a-topup2"]},
+         "third look"),
+        (first + _topup(first) + [{**first[0], "run_id": "p0a-topup", "profile": "Q8_0", "attempt_id": "x"}], m,
+         "BF16 and Q4_K_M on heldout100 only"),
+        (first + _topup(first), {**m, "P0a_topup": ["p0a-topup", "p0a"]}, "both P0a and P0a_topup"),
+    ]
+    for rows, manifest, msg in cases:
+        proc = _run(tmp_path, rows, manifest, "--seed", "0")
+        assert proc.returncode != 0 and msg in proc.stderr, (msg, proc.stderr)

@@ -4,7 +4,10 @@
 
 The manifest maps each gate to the run ids that belong to it, so a gate never mixes in another
 run's attempts (the pilot, the energy sub-run, P0d continuations):
-    {"P0b": ["run-..."], "P0a": ["run-..."], "P0c": ["run-..."]}
+    {"P0b": ["run-..."], "P0a": ["run-..."], "P0c": ["run-..."], "P0a_topup": ["run-..."]}
+P0a_topup is listed only after an inconclusive first look: 04 then adds 3 attempts per task at BF16
+and Q4_K_M on heldout100 and re-tests once on all 6. P0a.final_verdict is the verdict P1 reads (the
+re-test's when it ran); it stays null while a required re-test has not run.
 Records with end_reason "error" are dropped (04 reruns them as fresh attempts) and duplicate
 attempt ids are dropped; both are counted per gate. Attempt counts per task and profile are
 checked against the design (P0b 16, P0a 3 on heldout100 and verified100, P0c 4). Every gate also
@@ -34,6 +37,9 @@ from qtrace.p0_analysis import (
 )
 
 DESIGN = {"P0b": 16, "P0a": 3, "P0c": 4}
+TOPUP_PROFILES = ("BF16", "Q4_K_M")
+OUTCOME = {"pass": "B continues", "fail": "drop B (03 kill rule)",
+           "inconclusive": "B continues; Q3_K_M is reported as the stress profile and P1 measures B directly"}
 
 
 def gate_rows(rows, run_ids, lst):
@@ -47,6 +53,53 @@ def unflagged(rows):
 
 def no_timeouts(rows):
     return [r for r in rows if r["end_reason"] != "infra_timeout"]
+
+
+def p0a_look(sel, args):
+    """The primary test on heldout100 rows, with its flagged, factor and infra_timeout variants."""
+    kw = {"n_boot": args.n_boot, "seed": args.seed}
+    return {"primary": p0a_primary(sel, **kw),
+            "primary_excluding_flagged": p0a_primary(unflagged(sel), **kw),
+            "flagged_share": flagged_share(sel),
+            "factors": p0a_factors(sel),
+            "factors_excluding_flagged": p0a_factors(unflagged(sel)),
+            "sensitivity_excluding_infra_timeout": p0a_primary(no_timeouts(sel), **kw)}
+
+
+def p0a_retest(rows, manifest, first, args):
+    """04's single re-test after an inconclusive first look. The second look is the last one.
+
+    Refuses a top-up after a decisive first look, a top-up holding anything but BF16 and Q4_K_M on
+    heldout100, and more than 3 top-up attempts per task and profile (a third look).
+    """
+    if "P0a_topup" not in manifest:
+        if first == "inconclusive":
+            return {"retest": None, "final_verdict": None,
+                    "final": {"look": 1, "b_continues": None, "stress_profile": None,
+                              "note": "re-test required: add 3 attempts per task at BF16 and Q4_K_M on heldout100 "
+                                      "and list their run ids under P0a_topup"}}
+        return {"retest": None, "final_verdict": first,
+                "final": {"look": 1, "b_continues": first == "pass", "stress_profile": None, "note": OUTCOME[first]}}
+    if first != "inconclusive":
+        raise SystemExit(f"P0a_topup is listed but the first look is {first!r}; 04 re-tests only an inconclusive one")
+    if set(manifest["P0a"]) & set(manifest["P0a_topup"]):
+        raise SystemExit("a run id is in both P0a and P0a_topup")
+    topup, _ = gate_rows(rows, manifest["P0a_topup"], None)
+    off = sorted({(r["list"], r["profile"]) for r in topup} - {("heldout100", p) for p in TOPUP_PROFILES})
+    if off:
+        raise SystemExit(f"P0a_topup holds {off}; the top-up is BF16 and Q4_K_M on heldout100 only")
+    over = [m for m in design_mismatches(topup, DESIGN["P0a"]) if m[2] > DESIGN["P0a"]]
+    if over:
+        raise SystemExit(f"more than {DESIGN['P0a']} top-up attempts for {over}: 04 allows one re-test, "
+                         "not a third look")
+    sel, dropped = gate_rows(rows, manifest["P0a"] + manifest["P0a_topup"], "heldout100")
+    sel = [r for r in sel if r["profile"] in TOPUP_PROFILES]
+    look = p0a_look(sel, args)
+    v = look["primary"]["verdict"]
+    return {"retest": {**look, "dropped": dropped, "design_mismatches": design_mismatches(sel, 2 * DESIGN["P0a"])},
+            "final_verdict": v,
+            "final": {"look": 2, "b_continues": v != "fail",
+                      "stress_profile": "Q3_K_M" if v == "inconclusive" else None, "note": OUTCOME[v]}}
 
 
 def main():
@@ -79,15 +132,10 @@ def main():
     if "P0a" in manifest:
         both, dropped = gate_rows(rows, manifest["P0a"], None)
         sel = [r for r in both if r["list"] == "heldout100"]
-        gates["P0a"] = {"primary": p0a_primary(sel, n_boot=args.n_boot, seed=args.seed),
-                        "primary_excluding_flagged": p0a_primary(unflagged(sel), n_boot=args.n_boot, seed=args.seed),
-                        "flagged_share": flagged_share(sel),
-                        "factors": p0a_factors(sel),
-                        "factors_excluding_flagged": p0a_factors(unflagged(sel)),
-                        "sensitivity_excluding_infra_timeout": p0a_primary(no_timeouts(sel), n_boot=args.n_boot,
-                                                                           seed=args.seed),
+        gates["P0a"] = {**p0a_look(sel, args),
                         "secondary": p0a_secondary(both, n_boot=args.n_boot, seed=args.seed),
                         "dropped": dropped, "design_mismatches": design_mismatches(both, DESIGN["P0a"])}
+        gates["P0a"].update(p0a_retest(rows, manifest, gates["P0a"]["primary"]["verdict"], args))
     if "P0c" in manifest:
         if "P0b" not in gates:
             raise SystemExit("P0c bins tasks by P0b's success counts; add P0b's run ids to the manifest")
@@ -106,8 +154,10 @@ def main():
     with open(args.out, "w") as f:
         json.dump(gates, f, indent=1, allow_nan=False)
     for name, g in gates.items():
-        verdicts = g.get("pass") or g.get("primary", {}).get("verdict") or \
-            {k: v["verdict"] for k, v in g.items() if isinstance(v, dict) and "verdict" in v}
+        if name == "P0a":
+            verdicts = {"first_look": g["primary"]["verdict"], "final": g["final_verdict"]}
+        else:
+            verdicts = g.get("pass") or {k: v["verdict"] for k, v in g.items() if isinstance(v, dict) and "verdict" in v}
         print(name, json.dumps(verdicts))
     print("wrote", args.out)
 
