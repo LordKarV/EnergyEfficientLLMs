@@ -199,6 +199,15 @@ def test_fitted_report_orders_well_separated_pairs():
     assert rep["pairs"]["n_pairs"] == 15 and rep["pairs"]["share_correct"] >= 0.9
 
 
+def test_pairs_with_unmeasured_turns_are_listed_but_not_scored():
+    recs = subrun(PLANT, noise=0.01)
+    recs[0]["per_turn"][1]["gen_energy_j"] = None  # its measured sum is partial
+    pairs = fitted(recs, n_boot=0)["pairs"]
+    assert (pairs["n_pairs"], pairs["n_pairs_unmeasured"]) == (14, 1)
+    flagged = [p for p in pairs["pairs"] if p["correct"] is None]
+    assert [(p["attempts"][0], p["n_unmeasured"]) for p in flagged] == [(recs[0]["attempt_id"], [1, 0])]
+
+
 def chosen_fit(attempts, cols, target="raw"):
     return nnls(np.vstack([a["X"][:, cols] for a in attempts]), np.concatenate([a[target] for a in attempts]))
 

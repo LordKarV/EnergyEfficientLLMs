@@ -181,8 +181,13 @@ def _terms(mask):
     return [t for j, t in enumerate(TERMS) if mask >> j & 1]
 
 
-def pair_ordering(task_ids, attempt_ids, measured, predicted):
-    """Share of measured within-task pairs whose predicted joules are ordered like the measured ones."""
+def pair_ordering(task_ids, attempt_ids, measured, predicted, n_unmeasured=None):
+    """Share of measured within-task pairs whose predicted joules are ordered like the measured ones.
+
+    A pair where either attempt has unmeasured turns (n_unmeasured, per attempt) compares partial sums:
+    it is listed with "correct": None and counted in n_pairs_unmeasured, not in n_pairs.
+    """
+    unm = [0] * len(task_ids) if n_unmeasured is None else list(n_unmeasured)
     by_task = defaultdict(list)
     for i, t in enumerate(task_ids):
         by_task[t].append(i)
@@ -192,10 +197,13 @@ def pair_ordering(task_ids, attempt_ids, measured, predicted):
             pairs.append({"task_id": t, "attempts": [attempt_ids[i], attempt_ids[j]],
                           "measured_j": [float(measured[i]), float(measured[j])],
                           "predicted_j": [float(predicted[i]), float(predicted[j])],
-                          "correct": bool((predicted[i] - predicted[j]) * (measured[i] - measured[j]) > 0)})
-    n_ok = sum(p["correct"] for p in pairs)
-    return {"n_pairs": len(pairs), "n_correct": n_ok, "share_correct": n_ok / len(pairs) if pairs else None,
-            "pairs": pairs}
+                          "n_unmeasured": [unm[i], unm[j]],
+                          "correct": None if unm[i] or unm[j] else
+                          bool((predicted[i] - predicted[j]) * (measured[i] - measured[j]) > 0)})
+    scored = [p["correct"] for p in pairs if p["correct"] is not None]
+    n_ok = sum(scored)
+    return {"n_pairs": len(scored), "n_correct": n_ok, "share_correct": n_ok / len(scored) if scored else None,
+            "n_pairs_unmeasured": len(pairs) - len(scored), "pairs": pairs}
 
 
 def _residuals(attempts, target, coef, rel_loao):
@@ -266,7 +274,8 @@ def fit_profile(attempts, target="raw", n_boot=2000, seed=0):
             "cv": {"loao": float(cv[m]), "nested_loao": nested},
             "fallback": nested > FALLBACK_MAX_REL_ERR,
             "residuals": _residuals(attempts, target, coef, (P[:, m] - Y) / Y),
-            "pairs": pair_ordering([a["task_id"] for a in attempts], [a["attempt_id"] for a in attempts], Y, P[:, m]),
+            "pairs": pair_ordering([a["task_id"] for a in attempts], [a["attempt_id"] for a in attempts], Y, P[:, m],
+                                   [a["n_unmeasured"] for a in attempts]),
             "n_attempts": n, "n_turns": int(sum(len(y) for y in ys)), "n_boot": n_boot, "seed": seed}
 
 
