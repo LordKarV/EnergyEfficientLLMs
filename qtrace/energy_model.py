@@ -71,7 +71,8 @@ def attempt_arrays(rec):
     """Feature matrix and both targets over the turns of `rec` with a measured gen_energy_j.
 
     Returns {attempt_id, task_id, profile, X [n, 6], raw [n], idle_subtracted [n] or None, idle_error,
-    n_unmeasured, server_cached_differs (None when the server count is null)}. The raw target needs
+    n_unmeasured, server_cached_differs (attempt totals; None when the server count is null),
+    turn_cached_differs (one bool per turn with a non-null per-turn server_reported_cached)}. The raw target needs
     only gen_energy_j; a missing or invalid energy.idle_w_ref or gen_s sets idle_subtracted to None and
     idle_error to the reason, so only the idle-subtracted fit fails. Idle-subtracted turn joules may be
     negative on tiny turns; only attempt sums must be positive (checked in fit_profile).
@@ -99,7 +100,11 @@ def attempt_arrays(rec):
     return {"attempt_id": aid, "task_id": _get(rec, "task_id", where), "profile": _get(rec, "profile", where),
             "X": np.array(X, dtype=float).reshape(-1, len(TERMS)), "raw": np.array(raw),
             "idle_subtracted": idle, "idle_error": idle_error, "n_unmeasured": len(turns) - len(raw),
-            "server_cached_differs": None if server is None else server != _get(tokens, "input_cached", where)}
+            "server_cached_differs": None if server is None else server != _get(tokens, "input_cached", where),
+            "turn_cached_differs": [_num(t["server_reported_cached"], f"{where} turn {i}: server_reported_cached")
+                                    != t["input_cached"] for i, t in enumerate(turns)
+                                    if t.get("server_reported_cached") is not None],
+            "n_turns": len(turns)}
 
 
 def fit_attempts(records):
@@ -307,14 +312,19 @@ def profile_report(attempts, n_boot=2000, seed=0):
     rng_of = {t: [float(X[:, TERMS.index(t)].min()), float(X[:, TERMS.index(t)].max())]
               for t in ("output", "uncached", "context")}
     n_turns = [len(a["raw"]) for a in attempts]
+    per_turn = [f for a in attempts for f in a["turn_cached_differs"]]
     return {"n_attempts": len(attempts), "n_turns": len(X),
             "n_turns_unmeasured": sum(a["n_unmeasured"] for a in attempts),
             "calibration_range": {**rng_of, "turns_per_attempt": [min(n_turns), max(n_turns)]},
-            # 04: how often llama.cpp's cached-prompt counts differ from the ideal split (attempt totals;
-            # per-turn server counts are not in the record).
+            # 04: how often llama.cpp's per-request cached-prompt counts differ from the ideal split. The
+            # attempt-total comparison stays for records without per-turn server counts.
             "server_cache_mismatch": {"n_attempts": len(flags), "n_differ": sum(known),
                                       "n_missing": len(flags) - len(known),
-                                      "share_differ": sum(known) / len(known) if known else None},
+                                      "share_differ": sum(known) / len(known) if known else None,
+                                      "per_request": {"n_requests": len(per_turn), "n_differ": sum(per_turn),
+                                                      "share_differ": sum(per_turn) / len(per_turn) if per_turn
+                                                      else None,
+                                                      "n_missing": sum(a["n_turns"] for a in attempts) - len(per_turn)}},
             **{t: _fit_or_error(attempts, t, n_boot, seed) for t in TARGETS}}
 
 

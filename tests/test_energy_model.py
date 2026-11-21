@@ -449,6 +449,21 @@ def test_a_broken_target_or_profile_is_reported_and_the_rest_still_fit():
     assert small["n_attempts"] == 2 and all("at least 3" in small[t]["error"] for t in ("raw", "idle_subtracted"))
 
 
+def test_cache_check_compares_per_request_counts_where_present():
+    # docs/04 asks how often per-request cached-prompt counts differ; attempt totals can hide it.
+    recs = subrun(PLANT, n_tasks=3)
+    for r in recs[:2]:
+        for t in r["per_turn"]:
+            t["server_reported_cached"] = t["input_cached"]
+    recs[0]["per_turn"][1]["server_reported_cached"] += 100
+    recs[0]["per_turn"][2]["server_reported_cached"] -= 100  # the attempt total still matches
+    rep = profile_report(fit_attempts(recs)[0]["Q4_K_M"], n_boot=0)["server_cache_mismatch"]
+    assert rep["n_differ"] == 0
+    n = len(recs[0]["per_turn"]) + len(recs[1]["per_turn"])
+    assert rep["per_request"] == {"n_requests": n, "n_differ": 2, "share_differ": pytest.approx(2 / n),
+                                  "n_missing": sum(len(r["per_turn"]) for r in recs[2:])}
+
+
 def test_pool_records_drop_and_count_infrastructure_errors():
     kept, n_error = pool_records([pool_rec("a", "t", 1, 1), pool_rec("b", "t", 1, 1, end_reason="error")])
     assert [r["attempt_id"] for r in kept] == ["a"] and n_error == 1
@@ -489,8 +504,10 @@ def test_cli_writes_model_and_estimates(tmp_path):
     assert em["excluded_subrun_attempts"] == {"concurrency_not_1": 1}
     assert em["profiles"]["Q4_K_M"]["idle_subtracted"]["coef"]["output"] == pytest.approx(2.0, rel=0.05)
     assert em["profiles"]["BF16"]["idle_subtracted"]["coef"]["output"] == pytest.approx(3.0, rel=0.05)
-    assert em["profiles"]["Q4_K_M"]["server_cache_mismatch"] == {"n_attempts": 30, "n_differ": 1, "n_missing": 0,
-                                                                 "share_differ": pytest.approx(1 / 30)}
+    cache = em["profiles"]["Q4_K_M"]["server_cache_mismatch"]
+    assert {k: cache[k] for k in ("n_attempts", "n_differ", "n_missing", "share_differ")} == {
+        "n_attempts": 30, "n_differ": 1, "n_missing": 0, "share_differ": pytest.approx(1 / 30)}
+    assert cache["per_request"]["n_requests"] == 0 and cache["per_request"]["share_differ"] is None
     assert em["pool"] == {"n_attempts": 79, "n_dropped_error": 1}
     # p0 keeps 2 candidates (one failure, one error), below min_candidates 4.
     assert em["bf16_vs_q4"]["n_tasks"] == 19 and em["bf16_vs_q4"]["min_candidates"] == 4
