@@ -12,8 +12,10 @@ fit: the P2 endpoint, the estimator check and the energy upper bound all compare
 GPU joules, which include the idle draw, and at concurrency 1 the device is held for the whole
 generation window. Idle subtraction also adds the error of a separately measured idle reference.
 
-Terms are chosen by leave-one-attempt-out (LOAO) CV error: the median absolute relative error on
-attempt joules (an attempt's summed predicted turn joules against its summed measured ones). The
+The intercept (the fixed per-turn overhead docs/04 names) is always in the model. The token terms
+are the subset of the five, the empty one included, with the lowest leave-one-attempt-out (LOAO) CV
+error: the median absolute relative error on attempt joules (an attempt's summed predicted turn
+joules against its summed measured ones). Ties go to fewer terms, then the lower bitmask. The
 pre-registered fewest_joules fallback reads the nested LOAO error, where the term choice is redone
 inside each outer fold, because the plain LOAO error of a chosen term set is optimistic.
 
@@ -29,12 +31,12 @@ from collections import Counter, defaultdict
 import numpy as np
 
 TERMS = ("output", "uncached", "context", "uncached_x_context", "output_x_context", "intercept")
+CANDIDATES = range(1 << TERMS.index("intercept"), 2 ** len(TERMS))  # term-set bitmasks holding the intercept
 TARGETS = ("raw", "idle_subtracted")
 RANK_PROFILE, RANK_TARGET = "Q4_K_M", "raw"
 FALLBACK_MAX_REL_ERR = 0.10  # 04: fewest_joules falls back to fewest_turns above this
 AGREEMENT_MIN = 0.85  # 04: batched vs concurrency-1 picks below this name their regime
 MIN_CANDIDATES = 4  # 03 Method step 1: pool tasks have at least 4 successful BF16 runs; the P0b fallback is 2
-SE_BOOT_DRAWS = 2000  # bootstrap draws for the one-SE band of the term choice
 HELDOUT_LISTS = ("heldout100", "verified100", "inrepo_test")
 HELDOUT_REPOS = ("scrapy", "pyramid", "datalad", "coveragepy")
 CONTEXT_BINS = (16384, 32768, 49152)  # residual summary bins over the 64K context
@@ -163,21 +165,16 @@ def _loao_preds(G, g, yy, S, members):
     return np.array([_nnls_all(tG - G[i], tg - g[i], tyy - yy[i]) @ S[i] for i in members])
 
 
-def _choose(err, seed=0):
-    """Term set from held-out errors [n, 2^k]: the fewest terms within one standard error of the best median.
+def _choose(err):
+    """Term set from held-out errors [n, 2^k]: the CANDIDATES set with the lowest median error.
 
-    The standard error is a seeded bootstrap (over attempts) of the best set's median, so the band
-    matches the criterion. The SE of the mean is not robust: one attempt far off its token mix (docs/04
-    expects some, a cache miss re-prefills the context) inflated it about 10x. Ties go to the lower
-    median, then the lower bitmask.
+    Ties go to fewer terms, then the lower bitmask. The lowest error, not the fewest terms within one
+    bootstrap SE of it: in the owner's planted-model probe (15 x 2 attempts, 5% per-turn and 3%
+    per-attempt noise, 40 repeats) the one-SE rule found the planted set 0/40 times and its fresh-data
+    error was 1.7x this rule's, because it dropped real terms.
     """
     cv = np.median(err, axis=0)
-    cv[0] = np.inf  # the empty model is never a candidate
-    best = int(np.argmin(cv))
-    draws = np.random.default_rng(seed).integers(0, len(err), (SE_BOOT_DRAWS, len(err)))
-    se = float(np.median(err[draws, best], axis=1).std(ddof=1))
-    ok = np.flatnonzero(cv <= cv[best] + se)
-    return int(min(ok, key=lambda m: (int(m).bit_count(), cv[m], m))), cv, best, se
+    return min(CANDIDATES, key=lambda m: (cv[m], m.bit_count(), m)), cv
 
 
 def _terms(mask):
@@ -221,7 +218,7 @@ def fit_profile(attempts, target="raw", n_boot=2000, seed=0):
 
     attempts: one profile's attempt_arrays (from fit_attempts). Returns {terms, coef (J per unit of
     each chosen term), coef_ci95 (percentile bootstrap over attempts, terms held fixed, seeded),
-    cv {loao, nested_loao, loao_min, loao_min_terms, one_se (bootstrap SE of the best set's median, seeded)},
+    cv {loao, nested_loao},
     fallback (nested_loao above FALLBACK_MAX_REL_ERR), residuals, pairs (LOAO predictions), n_attempts,
     n_turns}. Raises if there are fewer than 3 attempts (nested LOAO needs them) or an attempt's measured
     sum is <= 0.
@@ -246,12 +243,12 @@ def fit_profile(attempts, target="raw", n_boot=2000, seed=0):
 
     everyone = np.arange(n)
     P = _loao_preds(G, g, yy, S, everyone)
-    m, cv, best, se = _choose(np.abs(P - Y[:, None]) / Y[:, None], seed)
+    m, cv = _choose(np.abs(P - Y[:, None]) / Y[:, None])
 
     nested = []
     for i in everyone:
         rest = everyone[everyone != i]
-        mi = _choose(np.abs(_loao_preds(G, g, yy, S, rest) - Y[rest, None]) / Y[rest, None], seed)[0]
+        mi = _choose(np.abs(_loao_preds(G, g, yy, S, rest) - Y[rest, None]) / Y[rest, None])[0]
         pred = _nnls_all(G[rest].sum(0), g[rest].sum(0), yy[rest].sum())[mi] @ S[i]
         nested.append(abs(pred - Y[i]) / Y[i])
     nested = float(np.median(nested))
@@ -266,8 +263,7 @@ def fit_profile(attempts, target="raw", n_boot=2000, seed=0):
     terms = _terms(m)
     return {"terms": terms, "coef": {t: float(coef[TERMS.index(t)]) for t in terms},
             "coef_ci95": {t: [float(lo[TERMS.index(t)]), float(hi[TERMS.index(t)])] for t in terms},
-            "cv": {"loao": float(cv[m]), "nested_loao": nested, "loao_min": float(cv[best]),
-                   "loao_min_terms": _terms(best), "one_se": se},
+            "cv": {"loao": float(cv[m]), "nested_loao": nested},
             "fallback": nested > FALLBACK_MAX_REL_ERR,
             "residuals": _residuals(attempts, target, coef, (P[:, m] - Y) / Y),
             "pairs": pair_ordering([a["task_id"] for a in attempts], [a["attempt_id"] for a in attempts], Y, P[:, m]),

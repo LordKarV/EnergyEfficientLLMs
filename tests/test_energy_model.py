@@ -140,15 +140,21 @@ def test_fallback_is_nested_error_strictly_above_ten_percent(monkeypatch):
         assert fit_profile(attempts, n_boot=0)["fallback"] is fallback
 
 
-def test_one_outlier_attempt_does_not_widen_the_term_choice_band():
-    # One attempt reads 2x its token mix (docs/04: a per-request cache miss re-prefills the context). The
-    # SE of the mean error grew to 0.016 here and the rule kept `output` alone (median 0.048 vs 0.033 best).
-    recs = subrun(PLANT, seed=1, noise=0.05)
-    for t in recs[0]["per_turn"]:
-        t["gen_energy_j"] *= 2
-    rep = fitted(recs, target="raw", n_boot=0)
-    assert rep["cv"]["one_se"] < 0.01
-    assert rep["terms"] == rep["cv"]["loao_min_terms"]
+def test_term_choice_keeps_the_intercept_and_takes_the_lowest_cv_error():
+    # docs/04 P0a: the intercept is always in; the token terms are the subset with the lowest LOAO error,
+    # ties to fewer terms. Columns are bitmasks over TERMS; the intercept is bit 5 (32).
+    err = np.ones((5, 2 ** len(TERMS)))
+    err[:, 1] = 0.005  # output alone, no intercept: lowest overall, never a candidate
+    err[:, 32 | 1] = 0.02  # output + intercept
+    err[:, 32 | 1 | 2] = 0.01  # output + uncached + intercept: the lowest candidate
+    assert energy_model._choose(err)[0] == 32 | 1 | 2
+    err[:, 32 | 1] = 0.01  # a tie goes to fewer terms
+    assert energy_model._choose(err)[0] == 32 | 1
+
+    # The owner's probe (5% per-turn, 3% per-attempt noise): the old one-SE rule dropped the intercept.
+    for seed in range(1000, 1005):
+        rep = fitted(subrun(PLANT, seed=seed, noise=0.05, attempt_noise=0.03), target="raw", n_boot=0)
+        assert "intercept" in rep["terms"], seed
 
 
 def test_nested_cv_is_no_lower_than_plain_cv_with_spurious_terms():

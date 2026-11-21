@@ -231,8 +231,11 @@ attempt start and end, plus run totals, marked `not_attributable`.
   separately per profile, with these terms: output tokens, uncached prefill tokens, context position
   at turn start (the cached prefill under full prefix reuse, replacing a separate cached-token
   term), uncached prefill x context position, output x context position, and an intercept for fixed
-  per-turn overhead. Coefficients are non-negative. Terms are chosen by leave-one-attempt-out CV
-  error, and CIs come from a bootstrap over attempts. Cached and uncached counts come from the
+  per-turn overhead. Coefficients are non-negative. The intercept is always in the model. The token
+  terms are the subset of the five (the empty subset included) with the lowest leave-one-attempt-out
+  CV error, the median over attempts of the absolute relative error of an attempt's summed predicted
+  turn joules; ties go to fewer terms. CIs come from a bootstrap over attempts with the chosen terms
+  fixed. Cached and uncached counts come from the
   stored token sequence under full prefix reuse, not from server counts. The sub-run reports how
   often llama.cpp's per-request cached-prompt counts differ from that ideal split; if misses occur,
   each attempt is pinned to one slot (`id_slot`) and re-checked. **Runs are ranked with the `Q4_K_M`
@@ -240,7 +243,8 @@ attempt start and end, plus run totals, marked `not_attributable`.
   the model orders each measured within-task pair correctly, and the within-task agreement between
   the `BF16` and `Q4_K_M` coefficient sets. **Pre-registered fallback:** `fewest_joules` falls back
   to `fewest_turns` if the held-out median absolute error on attempt joules exceeds 10%, and the
-  report says so. A forced-decode replay check is optional, only if the CV error is borderline.
+  report says so. That error is nested leave-one-attempt-out: the term choice is redone inside each
+  outer fold. A forced-decode replay check is optional, only if the CV error is borderline.
 - Batched coefficients: each profile's main llama.cpp block runs llama-server with `--metrics`,
   logging the energy counter and the server's cumulative prompt and predicted token counters
   every 1 s. Regress each window's joules on its prefill and decode tokens, and report how often pool
