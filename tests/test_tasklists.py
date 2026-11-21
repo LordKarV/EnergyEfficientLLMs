@@ -57,7 +57,7 @@ def test_build_lists_rejects_duplicate_task_ids():
 
 def test_heldout691_is_every_heldout_task():
     rows = fake_rows()
-    lists = build_lists(rows, ["v-1"], seed=7, inrepo_size=1, pool_size=1, heldout_size=10, verified_size=1,
+    lists = build_lists(rows, ["v-1"], seed=7, inrepo_size=1, pool_size=2, heldout_size=10, verified_size=1,
                         pilot_size=1, pilot_verified_size=1, subrun_size=1)
     every = lists["heldout691"]
     assert every["ids"] == sorted(tid for tid, repo in rows if repo in HELDOUT_REPOS)
@@ -79,12 +79,13 @@ def test_frozen_heldout691_matches_04_and_contains_heldout100():
 def test_pilot_and_subrun_lists_are_seeded_subsets():
     verified = [f"repo__x-{i}" for i in range(500)]
     kw = {"inrepo_size": 30, "pool_size": 60, "heldout_size": 40, "verified_size": 20,
-          "pilot_size": 12, "pilot_verified_size": 3, "subrun_size": 8}
+          "pilot_size": 12, "pilot_verified_size": 3, "subrun_size": 12}
     lists = build_lists(fake_rows(), verified, seed=7, **kw)
-    pairs = {"pilot20": "pool200", "pilot_verified3": "verified100", "energy_subrun15": "heldout100"}
+    pairs = {"pilot20": "pool200", "pilot_verified3": "verified100", "energy_subrun15": "pool200"}
     for sub, parent in pairs.items():
         assert set(lists[sub]["ids"]) <= set(lists[parent]["ids"])
-    assert [lists[k]["size"] for k in pairs] == [12, 3, 8]
+    assert [lists[k]["size"] for k in pairs] == [12, 3, 12]
+    assert not set(lists["energy_subrun15"]["ids"]) & set(lists["pilot20"]["ids"])
     # Stratified by repo: 60 pool tasks over 6 equal repos give 10 each, so 12 picks give 2 each.
     assert set(lists["pilot20"]["by_repo"].values()) == {2}
     assert set(lists["energy_subrun15"]["by_repo"].values()) == {2}
@@ -97,8 +98,9 @@ def test_frozen_pilot_and_subrun_lists():
         with open(os.path.join(LISTS, f"{name}.json")) as f:
             return json.load(f)
     for sub, parent, size in [("pilot20", "pool200", 20), ("pilot_verified3", "verified100", 3),
-                              ("energy_subrun15", "heldout100", 15)]:
+                              ("energy_subrun15", "pool200", 15)]:
         child, par = load(sub), load(parent)
         assert child["size"] == len(child["ids"]) == len(set(child["ids"])) == size
         assert set(child["ids"]) <= set(par["ids"])
         assert child["seed"] == par["seed"] and child["sources"] == par["sources"]
+    assert not set(load("energy_subrun15")["ids"]) & set(load("pilot20")["ids"])

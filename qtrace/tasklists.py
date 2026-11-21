@@ -66,9 +66,9 @@ def build_lists(rows, verified_ids, seed, inrepo_size=300, pool_size=200, heldou
     rows: (task_id, repo_name) pairs for R2E-Gym. inrepo_test is drawn first from the pool repos
     and excluded from pool200, as 04 requires. heldout100 comes only from the held-out repos.
     heldout691 is every held-out-repo task (P2 runs on all of them), so it is not sampled.
-    pilot20 and energy_subrun15 are stratified by repo from pool200 and heldout100; pilot_verified3
-    is a plain draw from verified100. Each has its own seed string, so adding them leaves the
-    other lists unchanged.
+    pilot20 is stratified by repo from pool200 and energy_subrun15 from pool200 minus pilot20;
+    pilot_verified3 is a plain draw from verified100. Each has its own seed string, so adding them
+    leaves the other lists unchanged.
     """
     ids = [task_id for task_id, _ in rows]
     if len(ids) != len(set(ids)):
@@ -83,8 +83,8 @@ def build_lists(rows, verified_ids, seed, inrepo_size=300, pool_size=200, heldou
     pool_rows = [row for row in rows if row[0] in set(pool)]
     pilot = stratified_sample(_by_repo(pool_rows, POOL_REPOS), pilot_size, f"{seed}:pilot20")
     pilot_verified = sorted(random.Random(f"{seed}:pilot_verified3").sample(verified, pilot_verified_size))
-    held_rows = [row for row in rows if row[0] in set(held)]
-    subrun = stratified_sample(_by_repo(held_rows, HELDOUT_REPOS), subrun_size, f"{seed}:energy_subrun15")
+    subrun = stratified_sample(_by_repo(pool_rows, POOL_REPOS, exclude=set(pilot)), subrun_size,
+                               f"{seed}:energy_subrun15")
     return {
         "inrepo_test": _summary("inrepo_test", inrepo, rows, seed,
                                 "working default 300; the owner sets the final size (04, Owner decisions)"),
@@ -97,6 +97,7 @@ def build_lists(rows, verified_ids, seed, inrepo_size=300, pool_size=200, heldou
         "pilot_verified3": _summary("pilot_verified3", pilot_verified, rows, seed,
                                     "fixed by 04 (P0b pilot extra, owner-approved), drawn from verified100"),
         "energy_subrun15": _summary("energy_subrun15", subrun, rows, seed,
-                                    "fixed by 04 (P0a energy sub-run); 04 names no source list, "
-                                    "heldout100 is the working default"),
+                                    "fixed by 04 (P0a energy sub-run), drawn from pool200 minus pilot20: the "
+                                    "Q4_K_M coefficients first rank pool200 runs for fewest_joules, and their "
+                                    "held-out use gets its own estimator check (heldout691 minus heldout100)"),
     }
