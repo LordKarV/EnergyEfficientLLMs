@@ -46,6 +46,25 @@ def test_guard_se_matches_closed_form():
     assert se["margin_se"] == se["se_rr_diff"] and se["margin_se_from"] == "se_rr_diff"
 
 
+def test_rates_scaled_by_the_q4_resolve_ratio():
+    # Owner's agent on PR #17 (answer 2): a variant scales P0b's BF16 rates by P0a's pooled Q4_K_M/BF16 resolve
+    # ratio rho. p' = rho s / k, and v' = rho s / k - rho^2 s (s - 1) / (k (k - 1)) is unbiased for p' (1 - p').
+    se = guard_se(held(4), seeds=3, rate_scale=0.5)
+    n = sum(HELDOUT691_BY_REPO.values())
+    v = 0.5 * 0.25 - 0.25 * (4 * 3) / (16 * 15)
+    assert se["rate_scale"] == 0.5 and se["mean_binomial_variance"] == pytest.approx(v)
+    assert se["se_rr_diff"] == pytest.approx(math.sqrt(2 * v / (3 * n)))
+    out = mde(held(4), pool([1.0], [1.0]), ratios=(0.5,), n_sim=2, n_boot=100, rate_scale=0.5)
+    assert out["mean_pass1"] == 0.125 and out["rate_scale"] == 0.5
+    assert out["attempts_per_task"] == {"min": 16, "max": 16}
+    # Above 1 the rate is capped at 1, and its variance at 0.
+    assert guard_se(held(12), rate_scale=2.0)["mean_binomial_variance"] == 0.0
+    assert mde(held(12), pool([1.0], [1.0]), ratios=(0.5,), n_sim=1, n_boot=100, rate_scale=2.0)["mean_pass1"] == 1
+    for bad in (0.0, -1.0, float("inf")):
+        with pytest.raises(ValueError, match="rate_scale"):
+            guard_se(held(4), rate_scale=bad)
+
+
 def test_power_known_answer():
     # Every attempt resolves, so T is the log ratio of mean costs; costs 1 or 3 (CV^2 = 1/4) per attempt.
     # Normal approximation: sd(T) = sqrt(2 CV^2 / (S n)); power = Phi(-log r / sd - z_.95), size alpha at r = 1.
@@ -220,6 +239,34 @@ def test_cli_matches_costs_by_pool_task_with_an_independent_sensitivity(tmp_path
     sens = out["sensitivity_independent_costs"]
     assert sens["cost"]["draw"] == "independent" and [p["ratio"] for p in sens["power"]] == [0.9, 1.0]
     assert "independent costs (sensitivity): MDE at 80% power" in proc.stdout
+
+
+def test_cli_variant_scaled_by_the_p0a_resolve_ratio(tmp_path):
+    # Owner's agent on PR #17 (answer 2): the primary reads P0b's heldout100 BF16 rates; a variant scales them by
+    # P0a's pooled Q4_K_M/BF16 resolve ratio, from gates.json (the re-test's factors when one ran) or a flag.
+    rows = cli_rows()
+    proc, out = run_cli(tmp_path, rows, name="none")
+    assert proc.returncode == 0, proc.stderr
+    assert out["variant_q4_resolve_scaled"] is None and out["mean_pass1"] == 0.5
+    first = {"factors": {"resolve_rate": {"Q4_K_M": 0.3, "BF16": 0.4}}}
+    gates = tmp_path / "gates.json"
+    for p0a, ratio, src in ((dict(first, retest=None), 0.75, "P0a.factors.resolve_rate"),
+                            (dict(first, retest={"factors": {"resolve_rate": {"Q4_K_M": 0.2, "BF16": 0.4}}}), 0.5,
+                             "P0a.retest.factors.resolve_rate")):
+        gates.write_text(json.dumps({"P0a": p0a}))
+        proc, out = run_cli(tmp_path, rows, "--gates", str(gates), name="gates")
+        assert proc.returncode == 0, proc.stderr
+        v = out["variant_q4_resolve_scaled"]
+        assert v["resolve_ratio"] == pytest.approx(ratio) and v["rate_scale"] == pytest.approx(ratio)
+        assert v["resolve_ratio_source"] == f"{gates} {src}" and v["mean_pass1"] == pytest.approx(0.5 * ratio)
+        assert out["mean_pass1"] == 0.5  # the primary stays unscaled
+    proc, out = run_cli(tmp_path, rows, "--q4-resolve-ratio", "0.9", name="flag")
+    assert proc.returncode == 0, proc.stderr
+    assert out["variant_q4_resolve_scaled"]["resolve_ratio_source"] == "--q4-resolve-ratio"
+    assert "Q4_K_M-scaled variant (resolve ratio 0.900" in proc.stdout
+    gates.write_text(json.dumps({"P0a": {"factors": {"resolve_rate": {"Q4_K_M": 0.3, "BF16": 0.0}}, "retest": None}}))
+    proc, _ = run_cli(tmp_path, rows, "--gates", str(gates), name="zero")
+    assert proc.returncode != 0 and "resolve ratio" in proc.stderr
 
 
 def test_cli_fails_on_a_pool_attempt_without_est_joules(tmp_path):

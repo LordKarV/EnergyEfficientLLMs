@@ -634,21 +634,29 @@ MDE_RATIOS = tuple(round(0.5 + 0.025 * i, 3) for i in range(21))
 MDE_POWER = 0.8
 
 
-def _pass_rates(tasks, n_by_repo):
-    """Per held-out repo, the tasks' pass rates s / k and unbiased binomial variances s (k - s) / (k (k - 1))."""
+def _pass_rates(tasks, n_by_repo, rate_scale=1.0):
+    """Per held-out repo, the tasks' pass rates p = rho s / k and unbiased binomial variances
+    rho s / k - rho^2 s (s - 1) / (k (k - 1)) for rho = rate_scale (s (k - s) / (k (k - 1)) at rho = 1). Above 1 a
+    scaled rate is capped at 1 and its variance at 0."""
+    if not (isinstance(rate_scale, (int, float)) and math.isfinite(rate_scale) and rate_scale > 0):
+        raise ValueError(f"rate_scale must be a positive finite number, got {rate_scale!r}")
     by_repo = {}
     for t in tasks:
         s, k = t["successes"], t["attempts"]
         if any(isinstance(x, bool) or not isinstance(x, int) for x in (s, k)) or k < 2 or not 0 <= s <= k:
             raise ValueError(f"task {t!r}: successes and attempts must be integers with 0 <= s <= k and k >= 2")
-        by_repo.setdefault(t["repo"], []).append((s / k, s * (k - s) / (k * (k - 1))))
+        if rate_scale == 1:
+            by_repo.setdefault(t["repo"], []).append((s / k, s * (k - s) / (k * (k - 1))))
+            continue
+        v = rate_scale * s / k - rate_scale ** 2 * s * (s - 1) / (k * (k - 1))
+        by_repo.setdefault(t["repo"], []).append((min(rate_scale * s / k, 1.0), max(v, 0.0)))
     missing = sorted(set(n_by_repo) - set(by_repo))
     if missing:
         raise ValueError(f"no measured task in held-out repos {missing}; each repo's tasks are resampled from its own")
     return {r: np.array(by_repo[r]) for r in sorted(n_by_repo)}
 
 
-def guard_se(tasks, n_by_repo=HELDOUT691_BY_REPO, seeds=3):
+def guard_se(tasks, n_by_repo=HELDOUT691_BY_REPO, seeds=3, rate_scale=1.0):
     """Standard errors of P2's Q4_K_M resolve rates, from measured per-task pass counts (P0b heldout100).
 
     tasks: [{"repo", "successes", "attempts"}] with attempts >= 2. v_t = s_t (k_t - s_t) / (k_t (k_t - 1)) is
@@ -660,11 +668,12 @@ def guard_se(tasks, n_by_repo=HELDOUT691_BY_REPO, seeds=3):
     The guard's one-sided 95% lower bound sits about 1.645 se_rr_diff below the observed difference, so a margin
     of m se_rr_diff passes an arm with no true difference with probability about Phi(m - 1.645). margin_se is
     se_rr_diff, the SE the margin is set from (owner's agent on PR #17, answer 1); the multiple m is the owner's.
+    rate_scale scales every p_t (see _pass_rates), for the variant at P0a's pooled Q4_K_M/BF16 resolve ratio.
     """
-    pools = _pass_rates(tasks, n_by_repo)
+    pools = _pass_rates(tasks, n_by_repo, rate_scale)
     n = sum(n_by_repo.values())
     v = sum(n_by_repo[r] * pools[r][:, 1].mean() for r in pools) / n
-    return {"n_tasks": n, "seeds": seeds, "mean_binomial_variance": float(v),
+    return {"n_tasks": n, "seeds": seeds, "rate_scale": rate_scale, "mean_binomial_variance": float(v),
             "se_rr": math.sqrt(v / (seeds * n)), "se_rr_diff": math.sqrt(2 * v / (seeds * n)),
             "margin_se": math.sqrt(2 * v / (seeds * n)), "margin_se_from": "se_rr_diff",
             "formula": "se_rr = sqrt(v / (S n)), se_rr_diff = sqrt(2 v / (S n)), v = repo-weighted mean of "
@@ -707,15 +716,16 @@ def _draw_costs(table, u, R, rng):
 
 
 def mde(tasks, cost_tasks, ratios=MDE_RATIOS, n_by_repo=HELDOUT691_BY_REPO, seeds=3, n_sim=500, n_boot=1000,
-        alpha=0.05, seed=0, guard_margin=None, matched=True):
+        alpha=0.05, seed=0, guard_margin=None, matched=True, rate_scale=1.0):
     """Simulated power of the frozen primary test at each true JPR ratio, and the minimum detectable effect.
 
     The test is contrast()'s: _test on strat_weights draws (tasks resampled within repo, shared by both arms),
     each task averaged over the seed models, p < alpha on T = log(JPR_arm / JPR_random). Each simulated study
     draws n_by_repo[repo] tasks per held-out repo with replacement from that repo's measured tasks (tasks as in
     guard_se: P0b heldout100 BF16 at k = 16) and gives each arm seeds x 1 attempt per task, resolving with the
-    task's s / k, the same rate for both arms. cost_tasks is one {"resolved": [...], "failed": [...]} per pool
-    task (per attempt estimated joules or processed tokens, by outcome). With matched (the primary, owner's agent
+    task's s / k (times rate_scale, see _pass_rates), the same rate for both arms. cost_tasks is one
+    {"resolved": [...], "failed": [...]} per pool task (per attempt estimated joules or processed tokens, by
+    outcome). With matched (the primary, owner's agent
     on PR #17, answer 3), each simulated task is paired with one pool task drawn at random, and both arms' attempts
     on it draw their costs from that pool task's own attempts of the same outcome, so the test's pairing by task
     carries the task-level cost spread as the real design does. matched=False draws every cost from all pool
@@ -738,7 +748,7 @@ def mde(tasks, cost_tasks, ratios=MDE_RATIOS, n_by_repo=HELDOUT691_BY_REPO, seed
                          f"{n_boot}, {alpha}")
     if not ratios or any(not 0 < r for r in ratios):
         raise ValueError(f"ratios are true JPR ratios arm / random, each > 0; got {ratios}")
-    pools = _pass_rates(tasks, n_by_repo)
+    pools = _pass_rates(tasks, n_by_repo, rate_scale)
     table, cost = _cost_table(cost_tasks, matched)
     n_pool = len(table[True][1])
     repos = np.repeat(list(pools), [n_by_repo[r] for r in pools])
@@ -768,9 +778,11 @@ def mde(tasks, cost_tasks, ratios=MDE_RATIOS, n_by_repo=HELDOUT691_BY_REPO, seed
         won80 = [x["ratio"] for x in power if x["power_with_guard"] >= MDE_POWER]
         guarded = {"mde_ratio_80_with_guard": max(won80) if won80 else None, "guard_pass_rate": guard_ok / n_sim}
     resolves = sum(n_by_repo[r] * pools[r][:, 0].mean() for r in pools)
-    se = guard_se(tasks, n_by_repo, seeds)
+    se = guard_se(tasks, n_by_repo, seeds, rate_scale)
     se["simulated_sd_rr_diff"] = float(np.std(rr_diffs, ddof=1)) if n_sim > 1 else None
+    k = [t["attempts"] for t in tasks]
     return {"n_tasks": n, "n_by_repo": dict(n_by_repo), "seeds": seeds, "n_measured_tasks": len(tasks),
+            "attempts_per_task": {"min": min(k), "max": max(k)}, "rate_scale": rate_scale,
             "mean_pass1": float(resolves / n), "expected_resolves_per_arm_seed": float(resolves),
             "cost": cost,
             "alpha": alpha, "n_sim": n_sim, "n_boot": n_boot, "seed": seed, "guard_margin": guard_margin,

@@ -2,17 +2,21 @@
 
     python scripts/p2_mde.py outputs/attempts/<P0b run>.jsonl ... [--est-joules outputs/p0a/est_joules.jsonl] \
         [--profile BF16] [--ratios 0.8 0.9 ...] [--n-sim 500] [--n-boot 1000] [--seed 0] [--guard-margin M] \
-        [--out outputs/p0b/mde.json]
+        [--gates outputs/p0/gates.json | --q4-resolve-ratio R] [--out outputs/p0b/mde.json]
 
-Per-task pass rates come from the heldout100 rows at --profile (P0b's BF16 by default; Q4_K_M for P0a's runs,
-whose file is then passed too). Those rows must all come from one runtime: P0a also runs BF16 on heldout100, on
+Per-task pass rates come from the heldout100 rows at --profile: P0b's BF16 rates at k = 16 by default, as docs/04
+criterion 3 is worded (owner's agent on PR #17, answer 2). Since P2's primary runs at Q4_K_M, a variant scales
+them by P0a's pooled Q4_K_M/BF16 resolve ratio, read from --gates (outputs/p0/gates.json: the re-test's
+P0a.retest.factors.resolve_rate when one ran, else P0a.factors.resolve_rate) or given as --q4-resolve-ratio; it
+is written under variant_q4_resolve_scaled, null when neither is given. --profile Q4_K_M with P0a's file reads
+P0a's k = 3 rates instead. Those rows must all come from one runtime: P0a also runs BF16 on heldout100, on
 llama.cpp, so passing P0a's file with --profile BF16 fails rather than pooling its attempts into P0b's vLLM
 counts (docs/04 P0b criterion 3 reads P0b's 16 attempts per task). Costs come from the pool200 rows at
 --pool-profile, per pool task and split by outcome: each attempt's est_joules_q4 from est_joules.jsonl when
 --est-joules is given, else its processed tokens (output plus every input token), which the output names. The
 primary draws each simulated task's costs from one pool task's own attempts (matched to tasks);
-sensitivity_independent_costs draws them from all pool attempts regardless of the task. An attempt is resolved when resolved is true and end_reason is
-"submitted", as P2 counts it; end_reason "error" rows are left out.
+sensitivity_independent_costs draws them from all pool attempts regardless of the task. An attempt is resolved
+when resolved is true and end_reason is "submitted", as P2 counts it; end_reason "error" rows are left out.
 """
 
 import argparse
@@ -66,6 +70,19 @@ def pool_costs(rows, profile, est_joules=None):
     return [by_task[t] for t in sorted(by_task)]
 
 
+def q4_resolve_ratio(path):
+    """(P0a's pooled Q4_K_M/BF16 resolve rate ratio, where in gates.json it came from)."""
+    with open(path) as f:
+        p0a = json.load(f)["P0a"]
+    look = p0a.get("retest") or p0a  # retest is null unless the inconclusive first look was re-tested
+    where = "P0a.retest.factors.resolve_rate" if look is not p0a else "P0a.factors.resolve_rate"
+    rr = look["factors"]["resolve_rate"]
+    q4, bf16 = rr["Q4_K_M"], rr["BF16"]
+    if not all(isinstance(x, (int, float)) and not isinstance(x, bool) and x > 0 for x in (q4, bf16)):
+        raise ValueError(f"{path} {where}: need positive Q4_K_M and BF16 rates for the resolve ratio, got {rr!r}")
+    return q4 / bf16, f"{path} {where}"
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("attempts", nargs="+")
@@ -79,6 +96,9 @@ def main(argv=None):
     ap.add_argument("--alpha", type=float, default=0.05)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--guard-margin", type=float)
+    scale = ap.add_mutually_exclusive_group()
+    scale.add_argument("--gates", help="gates.json from scripts/p0_analyze.py, for P0a's pooled resolve ratio")
+    scale.add_argument("--q4-resolve-ratio", type=float, help="P0a's pooled Q4_K_M/BF16 resolve rate ratio")
     ap.add_argument("--out", default="outputs/p0b/mde.json")
     args = ap.parse_args(argv)
 
@@ -91,9 +111,15 @@ def main(argv=None):
               "alpha": args.alpha, "seed": args.seed, "guard_margin": args.guard_margin}
         out = mde(tasks, costs, **kw)
         out["sensitivity_independent_costs"] = mde(tasks, costs, matched=False, **kw)
-    except (ValueError, KeyError) as e:
+        ratio, src = (q4_resolve_ratio(args.gates) if args.gates else
+                      (args.q4_resolve_ratio, "--q4-resolve-ratio") if args.q4_resolve_ratio is not None else
+                      (None, None))
+        out["variant_q4_resolve_scaled"] = None if ratio is None else {
+            "resolve_ratio": ratio, "resolve_ratio_source": src, **mde(tasks, costs, rate_scale=ratio, **kw)}
+    except (ValueError, KeyError, TypeError) as e:
         raise SystemExit(f"p2_mde: {e!r}") from e
-    for o in (out, out["sensitivity_independent_costs"]):
+    variant = out["variant_q4_resolve_scaled"]
+    for o in (out, out["sensitivity_independent_costs"], variant or {"cost": {}}):
         o["cost"]["source"] = "est_joules_q4" if est is not None else "processed_tokens"
     out["inputs"] = {"attempts": args.attempts, "est_joules": args.est_joules, "profile": args.profile,
                      "pool_profile": args.pool_profile}
@@ -119,6 +145,10 @@ def main(argv=None):
         if out["guard_pass_rate"] < MDE_POWER:
             print(f"  the guard alone passes in {out['guard_pass_rate']:.3f} of simulated studies, so power with the "
                   "guard stays below 0.8 at every ratio")
+    if variant is not None:
+        print(f"Q4_K_M-scaled variant (resolve ratio {variant['resolve_ratio']:.3f}, {variant['resolve_ratio_source']})"
+              f": mean pass@1 {variant['mean_pass1']:.3f}, MDE at 80% power ratio {variant['mde_ratio_80']}, "
+              f"se_rr_diff {variant['guard_se']['se_rr_diff']:.4f}")
     print("wrote", args.out)
 
 
