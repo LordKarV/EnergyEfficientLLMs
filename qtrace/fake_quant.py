@@ -139,8 +139,13 @@ def tensor_types(base, table):
 
 
 def merged_weight(mod, adapter):
-    """W + scaling * B @ A in W's dtype, computed as peft's merge_and_unload does, so it is the saved weight."""
-    return (mod.base_layer.weight + mod.get_delta_weight(adapter)).to(mod.base_layer.weight.dtype)
+    """W + scaling * B @ A in float32, bit for bit the weight sft.save_merged writes and llama-quantize reads.
+
+    Not in W's dtype: with a bf16 base a bf16 W + BA drops the part of the update below half a bf16 step
+    (issue #1), which the F32 merge keeps, so fake quant would round a different weight than the deployed one.
+    """
+    a, b = mod.lora_A[adapter].weight.float(), mod.lora_B[adapter].weight.float()
+    return mod.base_layer.weight.float() + (b @ a) * mod.scaling[adapter]
 
 
 def _lora_forward(mod):
@@ -158,7 +163,7 @@ def _lora_forward(mod):
         # W changes every optimizer step, so quantize on the fly; under gradient checkpointing this reruns
         # in the recompute with the same W, A and B, so the saved tensors match.
         with torch.no_grad():
-            wq = fake_quant(merged_weight(mod, adapter))
+            wq = fake_quant(merged_weight(mod, adapter)).to(mod.base_layer.weight.dtype)
         y = F.linear(x, wq, bias)
         # Straight-through estimator: d out / d W_eff is taken as d out / d wq. z - z.detach() is exactly 0,
         # so the value is x @ wq^T, while A and B get the gradient of x @ (scaling * B @ A)^T, which is

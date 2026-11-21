@@ -12,8 +12,9 @@ sys.path.insert(0, os.path.join(ROOT, "tests"))
 import numpy as np
 import pytest
 import torch
+import torch.nn.functional as F
 import yaml
-from test_probe import tiny_qwen35
+from test_probe import plant_update, tiny_qwen35
 from test_sft import TRAIN, as_example, load_script, make_episode, perturbed_lora_model, write_arm, write_setup
 
 from qtrace import fake_quant as fq
@@ -150,7 +151,7 @@ def test_saved_merged_weights_are_w_plus_scaled_ba_exactly_not_fake_quantized(tm
             a, b = mod.lora_A["default"].weight, mod.lora_B["default"].weight
             assert torch.equal(mod.base_layer.weight, original[f"{name}.base_layer.weight"])  # W never changed
             expected[f"{name}.weight"] = (mod.base_layer.weight + (b @ a) * mod.scaling["default"]).detach()
-    model.merge_and_unload().save_pretrained(tmp_path / "merged")
+    sft.save_merged(model, tmp_path / "merged")  # the trainer's save path, with fake quant still applied
     reloaded = AutoModelForCausalLM.from_pretrained(tmp_path / "merged")
     saved = {k: v.clone() for k, v in reloaded.state_dict().items()}
     assert len(expected) == 3 * 6 + 7  # every LoRA target in 3 DeltaNet layers and 1 attention layer
@@ -167,16 +168,24 @@ def test_saved_merged_weights_are_w_plus_scaled_ba_exactly_not_fake_quantized(tm
     assert torch.allclose(trained, logits(reloaded, ids), atol=1e-5)
 
 
-def test_merged_weight_matches_merge_and_unload_bit_for_bit_in_bf16():
-    model = sft.attach(tiny_qwen35().to(torch.bfloat16), TRAIN, 0)
-    for name, p in model.named_parameters():
-        if "lora_B" in name:
-            p.data.normal_(0, 0.05)
+def test_bf16_forward_quantizes_the_f32_merge_that_save_merged_writes(tmp_path):
+    from safetensors.torch import load_file
+
+    model = sft.attach(tiny_qwen35().to(torch.bfloat16), TRAIN, 0)  # bf16 base, as trained on the GPU
+    plant_update(model, 1e-3)  # small: about half of it is lost if W + BA is rounded to bf16 first
+    fq.apply(model, tiny_table())
     base = model.get_base_model()
     ours = {n: fq.merged_weight(m, "default") for n, m in base.named_modules() if hasattr(m, "lora_A")}
-    assert next(iter(ours.values())).dtype == torch.bfloat16
-    merged = model.merge_and_unload()
-    assert all(torch.equal(merged.get_submodule(n).weight, w) for n, w in ours.items())
+    assert {w.dtype for w in ours.values()} == {torch.float32}
+    up = base.get_submodule("model.layers.0.mlp.up_proj")
+    x = torch.randn(3, 64, dtype=torch.bfloat16)
+    with torch.no_grad():
+        assert torch.equal(up(x), F.linear(x, fq.fake_quant(ours["model.layers.0.mlp.up_proj"]).bfloat16()))
+        bf16_eff = (up.base_layer.weight + up.get_delta_weight("default")).bfloat16()
+        assert not torch.equal(up(x), F.linear(x, fq.fake_quant(bf16_eff)))
+    sft.save_merged(model, tmp_path / "merged")  # the deployed weights llama-quantize will see
+    saved = load_file(tmp_path / "merged" / "model.safetensors")
+    assert all(torch.equal(saved[f"{n}.weight"], w) for n, w in ours.items())
 
 
 def test_gradient_checkpointing_gives_the_same_gradients():
@@ -277,8 +286,12 @@ def test_script_trains_random_fq_and_saves_plain_merged_weights(tmp_path):
     meta = json.loads((run / "train_meta.json").read_text())
     assert meta["arm"] == "random" and meta["fake_quant"]["table"] == str(tmp_path / "table.json")
     assert "model.layers.0.linear_attn.in_proj_a" in meta["fake_quant"]["quantized"]
+    # the same F32 save and update-size record as every other arm (issue #1)
+    assert meta["merged_dtype"] == "float32" and set(meta["update_size"]["by_type"]) == set(TRAIN["targets"])
+    assert 0 < meta["update_size"]["carried_bf16"] <= 1.05
     base = AutoModelForCausalLM.from_pretrained(ckpt).state_dict()
     merged = AutoModelForCausalLM.from_pretrained(run / "merged").state_dict()
+    assert json.loads((run / "merged" / "config.json").read_text())["dtype"] == "float32"
     gate = "model.layers.0.linear_attn.in_proj_a.weight"  # frozen, 4-bit in the table, saved unquantized
     assert torch.equal(base[gate], merged[gate])
     up = "model.layers.0.mlp.up_proj.weight"
