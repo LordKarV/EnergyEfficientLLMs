@@ -55,7 +55,6 @@ def _stats(rows):
     by_profile = defaultdict(list)
     for r in scored:
         by_profile[r["profile"]].append(r["grading"]["test_files_touched"])  # required bool: missing raises
-    calls = sum(r["tool_calls"] for r in rows)
     turns = sum(r["turns"] for r in rows)
     tok = {k: sum(r["tokens"][k] for r in rows) for k in ("output", "input_uncached", "input_cached")}
     # A missing or null count means the server did not report it (as in #13); the realized split then needs all.
@@ -177,8 +176,8 @@ def render_markdown(stats, probe, extras, projections):
               "| runtime | profile | flagged |", "|---|---|---|"]
     for rt, s in stats.items():
         lines += [f"| {rt} | {p} | {_pct(v)} |" for p, v in s["flagged_share_by_profile"].items()]
-    lines += ["", "## Limits hit", "", "| runtime | end reasons | 64K context (owner check at 10%) "
-              "| wall clock (cap check at 2%) |", "|---|---|---|---|"]
+    lines += ["", "## Limits hit", "", ("| runtime | end reasons | 64K context (owner check at 10%) "
+              "| wall clock (cap check at 2%) |"), "|---|---|---|---|"]
     for rt, s in stats.items():
         ends = ", ".join(f"{k} {_pct(v)}" for k, v in s["end_reason_share"].items())
         ctx, wall = s["context_limit_check"], s["wall_clock_check"]
@@ -189,9 +188,9 @@ def render_markdown(stats, probe, extras, projections):
     for rt, s in stats.items():
         lines.append(f"| {rt} | " + " | ".join(_pct(s["malformed_per_turn"][k]) for k in MALFORMED) + " |")
     lines += ["", "## Tokens and prefix cache", "",
-              "| runtime | output | uncached input | cached input | ideal hit rate (flag below 80%) "
+              ("| runtime | output | uncached input | cached input | ideal hit rate (flag below 80%) "
               "| server / ideal cached | server count missing "
-              "| tool s | vCPUs busy |", "|---|---|---|---|---|---|---|---|---|"]
+              "| tool s | vCPUs busy |"), "|---|---|---|---|---|---|---|---|---|"]
     for rt, s in stats.items():
         t = s["tokens_per_attempt"]
         flag = " **below HERO's ~92%**" if s["prefix_cache_flag"] else ""
@@ -212,8 +211,8 @@ def render_markdown(stats, probe, extras, projections):
         lines.append("No probe results.")
     if projections:
         lines += ["", "## Projected instance-hours", "",
-                  "Point and upper attempt counts from 04, prefill at the realized cache split; the ideal-cache "
-                  "column is a lower bound.", "",
+                  ("Point and upper attempt counts from 04, prefill at the realized cache split; the ideal-cache "
+                  "column is a lower bound."), "",
                   "| step | runtime | point h | upper h | ideal-cache h |", "|---|---|---|---|---|"]
         for step, v in projections.items():
             if step in ("total", "not_included"):

@@ -31,7 +31,10 @@ def main():
 
     rows = [r for path in args.attempts for r in read_jsonl(path)]
     probe = read_jsonl(args.probe) if args.probe and os.path.exists(args.probe) else []
-    extras = json.load(open(args.extras)) if args.extras and os.path.exists(args.extras) else {}
+    extras = {}
+    if args.extras and os.path.exists(args.extras):
+        with open(args.extras) as f:
+            extras = json.load(f)
     stats = attempt_stats(rows)
     proj = projections(stats, extras)
     os.makedirs(args.out_dir, exist_ok=True)
