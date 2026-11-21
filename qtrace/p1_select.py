@@ -396,6 +396,24 @@ def overlap_rule(by_task, seeds, arms, energy):
     return {"by_seed": by_seed, "merged": note.startswith("merged"), "note": note}
 
 
+def check_cost(decision, energy, arms, cost):
+    """Refuse a select.cost that contradicts P0b's verdict (docs/03 Method step 3, docs/04 Selection).
+
+    qtrace and the 2x2 split rank by joules when the overlap rule keeps fewest_joules and fewest_turns
+    separate in every seed, and by turns when it merges them in any seed. Not checked when the rule was not
+    computed, under the energy fallback (energy_info already refuses cost joules there), or when no built arm
+    ranks by cost.
+    """
+    if decision["by_seed"] is None or energy["fallback"] or not any(a in STABILITY_ARMS - {"stable"} for a in arms):
+        return
+    merges = any(r["merge_fewest_joules"] for r in decision["by_seed"].values())
+    want = "turns" if merges else "joules"
+    if cost != want:
+        verdict = "merges fewest_joules into fewest_turns" if merges else "keeps fewest_joules and fewest_turns separate"
+        raise ValueError(f"select.cost is {cost!r}, but P0b's overlap rule {verdict}, so qtrace and the 2x2 split "
+                         f"rank by {want} (docs/03 Method step 3); set select.cost: {want}")
+
+
 def h3_note(score):
     """What the summary says about H3 when score_choice.json chose null; None otherwise."""
     if not score["file_present"] or score["file_chosen"] is not None:
@@ -423,7 +441,8 @@ def select(attempts, scores=None, score_choice=None, energy_model=None, est_joul
     is recorded; an undecided null is an error, see score_info); with no joule estimates, or with
     fewest_joules_fallback set, fewest_joules picks exactly as fewest_turns (same rule and same RNG stream).
     cost "joules" is an error in both energy cases. Otherwise docs/04 P0b's overlap rule can drop
-    fewest_joules for every seed (overlap_rule); summary["arm_overlap_rule"] says why.
+    fewest_joules for every seed (overlap_rule); summary["arm_overlap_rule"] says why. select.cost must
+    match that verdict (check_cost).
     """
     check_config(pool_lists, min_candidates, alpha, cost, score_override, seeds, arms)
     score = score_info(score_choice, score_override, arms)
@@ -436,7 +455,11 @@ def select(attempts, scores=None, score_choice=None, energy_model=None, est_joul
     built = [a for a in ARMS if a in arms and (score["used"] is not None or a not in STABILITY_ARMS)]
     check_joins(by_task, built, cost, energy["fallback"])
     decision = overlap_rule(by_task, seeds, built, energy)
+    check_cost(decision, energy, built, cost)
     built = [a for a in built if not (decision["merged"] and a == "fewest_joules")]
+    if decision["merged"]:
+        energy = {**energy, "picks_as": "fewest_turns",
+                  "reason": "not built: P0b's overlap rule merged it into fewest_turns (see arm_overlap_rule)"}
 
     picks = {}
     for arm in built:

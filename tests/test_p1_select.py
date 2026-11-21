@@ -320,7 +320,7 @@ def test_adding_a_task_leaves_every_other_pick_unchanged():
 # Joins, fallbacks and missing data.
 
 def test_fewest_joules_ranks_joules_when_the_energy_model_passes():
-    picks, summary = go([{"task": "t", "turns": 3, "j": 900.0}, {"task": "t", "turns": 8, "j": 100.0}])
+    picks, summary = go([{"task": "t", "turns": 3, "j": 900.0}, {"task": "t", "turns": 8, "j": 100.0}], cost="joules")
     assert picks["fewest_joules"][0][0]["turns"] == 8 and picks["fewest_turns"][0][0]["turns"] == 3
     assert summary["fewest_joules"]["picks_as"] == "fewest_joules"
 
@@ -435,7 +435,8 @@ def test_cost_joules_splits_the_2x2_and_mixes_qtrace_on_joules():
 
     assert turns_of(go(runs, cost="joules")[0]) == {"qtrace": 2, "short_stable": 2, "short_unstable": 3,
                                                     "long_stable": 1, "long_unstable": 4}
-    assert turns_of(go(runs)[0]) == {"qtrace": 1, "short_stable": 1, "short_unstable": 2, "long_stable": 4,
+    # cost turns is only allowed when P0b's rule merges the arms or the energy model fails (check_cost).
+    assert turns_of(go(runs, fallback=True)[0]) == {"qtrace": 1, "short_stable": 1, "short_unstable": 2, "long_stable": 4,
                                      "long_unstable": 3}
 
 
@@ -514,7 +515,7 @@ def test_arm_overlap_rule_ranks_turns_tokens_joules_and_both_hero_costs():
             {"task": "t1", "turns": 6, "out": 50, "unc": 3000, "cac": 9000, "j": 200.0},
             {"task": "t2", "turns": 1, "out": 10, "unc": 10, "cac": 10, "j": 50.0},
             {"task": "t2", "turns": 9, "out": 90, "unc": 90, "cac": 90, "j": 90.0}]
-    picks, summary = go(runs)
+    picks, summary = go(runs, cost="joules")
     rule = summary["arm_overlap_rule"]
     s0 = rule["by_seed"]["0"]
     assert s0["median_joule_regret"] == {"turns": 1.0, "output_tokens": 0.5, "joules": 0.0, "hero_total_tokens": 0.0,
@@ -541,9 +542,52 @@ def test_arm_overlap_rule_merges_fewest_joules_on_low_regret_for_every_seed():
     assert rule["merged"] is True and "not built for any seed" in rule["note"]
     assert "fewest_joules" not in picks and "fewest_joules" not in summary["arms_built"]
     assert "fewest_turns" in picks
+    assert summary["fewest_joules"]["picks_as"] == "fewest_turns" and summary["fewest_joules"]["fallback"] is False
+    assert "not built" in summary["fewest_joules"]["reason"] and "arm_overlap_rule" in summary["fewest_joules"]["reason"]
     # At 6% the arms stay separate.
-    picks, summary = go([{**r, "j": 106.0} if r["j"] == 103.0 else r for r in runs])
+    picks, summary = go([{**r, "j": 106.0} if r["j"] == 103.0 else r for r in runs], cost="joules")
     assert summary["arm_overlap_rule"]["merged"] is False and "fewest_joules" in picks
+    assert summary["fewest_joules"] == {"fallback": False, "picks_as": "fewest_joules", "reason": None}
+
+
+def test_one_merging_seed_drops_fewest_joules_for_every_seed():
+    # Equal turns and output tokens: fewest_turns is a seeded draw between the 100 J and the 200 J run, so
+    # seed 0 picks the cheap run (merge) and seed 1 the dear one (regret 100%, share 0%).
+    picks, summary = go([{"task": "t", "j": 100.0}, {"task": "t", "j": 200.0}], seeds=(0, 1))
+    by_seed = summary["arm_overlap_rule"]["by_seed"]
+    assert by_seed["0"]["merge_fewest_joules"] is True and by_seed["1"]["merge_fewest_joules"] is False
+    assert summary["arm_overlap_rule"]["merged"] is True and "fewest_joules" not in picks
+
+
+def test_calibrated_token_mix_at_exactly_85_percent_agreement():
+    # API price is 19 x output tokens here. Joules follow it in 17 of 20 tasks and invert it in 3.
+    runs = [r for i in range(20) for r in ({"task": f"t{i:02d}", "out": 100, "j": 100.0 if i < 17 else 200.0},
+                                           {"task": f"t{i:02d}", "out": 200, "j": 200.0 if i < 17 else 100.0})]
+    s0 = go(runs)[1]["arm_overlap_rule"]["by_seed"]["0"]
+    assert {tuple(p["arms"]): p["share_same"] for p in s0["pairs"]}[("joules", "hero_api_price")] == 0.85
+    assert s0["calibrated_token_mix"] is True
+    more = [{"task": "t20", "out": 100, "j": 200.0}, {"task": "t20", "out": 200, "j": 100.0}]
+    assert go(runs + more)[1]["arm_overlap_rule"]["by_seed"]["0"]["calibrated_token_mix"] is False  # 17 of 21
+
+
+def test_cost_must_match_the_p0b_verdict():
+    # docs/03 Method step 3: qtrace and the 2x2 split rank by joules when P0b keeps fewest_joules and
+    # fewest_turns separate, and by turns when it merges them.
+    separate = [r for i in range(4) for r in ({"task": f"t{i}", "turns": 2, "j": 300.0, "kl": 0.3},
+                                              {"task": f"t{i}", "turns": 6, "j": 100.0, "kl": 0.3},
+                                              {"task": f"t{i}", "turns": 4, "j": 200.0, "kl": 0.35})]
+    with pytest.raises(ValueError, match="keeps fewest_joules and fewest_turns separate.*set select.cost: joules"):
+        go(separate)
+    picks, summary = go(separate, cost="joules")
+    assert summary["arm_overlap_rule"]["note"].startswith("separate")
+    assert [r["turns"] for r in picks["qtrace"][0]] == [6, 6, 6, 6]
+    merged = [r for i in range(4) for r in ({"task": f"t{i}", "turns": 2, "j": 103.0},
+                                            {"task": f"t{i}", "turns": 4, "j": 100.0})]
+    with pytest.raises(ValueError, match="merges fewest_joules into fewest_turns.*set select.cost: turns"):
+        go(merged, cost="joules")
+    # No built arm ranks by cost, so any cost is accepted.
+    assert set(go(separate, arms=["random", "fewest_turns", "fewest_joules", "stable"])[0]) == {
+        "random", "fewest_turns", "fewest_joules", "stable"}
 
 
 def test_arm_overlap_rule_is_not_applied_under_the_energy_fallback_or_without_joules():
@@ -564,7 +608,7 @@ def test_summary_reports_chance_rate_means_and_every_arm_pair():
             {"task": "a", "turns": 6, "out": 30, "kl": 0.2, "j": 4.0}]
     runs += [{"task": "b", "turns": t, "out": 20, "kl": k, "j": 2.0 * t}
              for t, k in ((4, 0.3), (5, 0.1), (7, 0.5), (8, 0.6))]
-    _, summary = go(runs, seeds=(0, 1))
+    _, summary = go(runs, seeds=(0, 1), cost="joules")
     assert summary["overlap"]["chance_rate"] == pytest.approx((1 / 2 + 1 / 4) / 2)
     assert summary["overlap"]["threshold"] == 0.85
     assert len(summary["overlap"]["by_seed"]["1"]) == len(ARMS) * (len(ARMS) - 1) // 2
