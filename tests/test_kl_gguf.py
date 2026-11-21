@@ -284,3 +284,55 @@ def test_bad_positions_fail_loudly():
     with pytest.raises(ValueError, match="idx must be sorted"):
         compare_gguf(BIN, P, Q, [(e["input_ids"], torch.tensor([5, 3]))])
 
+
+def load_check_script():
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("check_kl_runtime", REPO / "scripts" / "check_kl_runtime.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_noise_floor_is_exact_with_the_whole_vocabulary_and_a_lower_bound_with_top_k():
+    check = load_check_script()
+    g = torch.Generator().manual_seed(0)
+    head = torch.nn.Linear(8, 50, bias=False)
+    hidden, targets = torch.randn(20, 8, generator=g), torch.randint(0, 50, (20,), generator=g)
+    with torch.no_grad():
+        lp = torch.log_softmax(head(hidden).double(), -1)
+    lq = torch.log_softmax(lp + 0.5 * torch.randn(lp.shape, generator=g, dtype=torch.float64), -1)
+    exact = (lp.exp() * (lp - lq)).sum(-1).numpy()
+    top = lq.topk(50, dim=-1)
+    full = check.hf_stats(head, hidden, targets, top.indices, top.values)
+    assert np.allclose(full["kl_floor"], exact, atol=1e-6) and np.allclose(full["tail_mass_hf"], 0, atol=1e-6)
+    assert np.allclose(full["nll"], -lp.gather(1, targets[:, None]).squeeze(1).numpy())
+    part = check.hf_stats(head, hidden, targets, top.indices[:, :5], top.values[:, :5])
+    assert (part["kl_floor"] <= exact + 1e-9).all() and (part["kl_floor"] > 0).all()
+
+
+def test_runtime_criterion_flags_each_failure():
+    check = load_check_script()
+    n = 1000
+    hf = {"nll": np.full(n, 2.0), "entropy": np.full(n, 1.0), "argmax": np.arange(n), "kl_floor": np.full(n, 1e-4),
+          "tail_mass_hf": np.zeros(n)}
+    gguf = {"nll_p": hf["nll"] + 1e-3, "entropy_p": hf["entropy"].copy(), "topk_ids": np.arange(n)[:, None]}
+    ok = check.judge(gguf, hf, q4_kl_mean=0.019)
+    assert ok["all_pass"] and ok["noise_floor_over_q4_kl_mean"] == pytest.approx(1e-4 / 0.019)
+    gguf["nll_p"] = gguf["nll_p"] + np.where(np.arange(n) < 20, 0.5, 0)  # 2% of positions off by 0.5
+    assert {k for k, v in check.judge(gguf, hf, 0.019)["pass"].items() if not v} == {"abs_dnll_p99"}
+    assert not check.judge(gguf, hf, q4_kl_mean=1e-4)["pass"]["noise_floor_over_q4_kl_mean"]
+
+
+def test_check_script_runs_on_the_tiny_models(tiny, tmp_path):
+    check = load_check_script()
+    e = episode(vocab=VOCAB)
+    ep = tmp_path / "episode.npz"
+    np.savez(ep, input_ids=e["input_ids"][0].numpy(), model_mask=e["model_mask"].numpy())
+    row = check.main([str(ep), "--hf", tiny["p"].removesuffix(".gguf"), "--kl-score", tiny["bin"], "--gguf-bf16",
+                      tiny["p"], "--gguf-q4", tiny["q"], "--device", "cpu", "--top-k", "16",
+                      "--out", str(tmp_path / "row.json")])
+    assert row["n_scored"] == len(logit_index(e["model_mask"])) and len(row["pass"]) == 10
+    # The script loads HF in bf16 against f32 GGUFs, so only the noise floor is checked: top-1 agreement
+    # is low on a tiny model's near-tied logits.
+    assert row["noise_floor_over_q4_kl_mean"] < 0.1
