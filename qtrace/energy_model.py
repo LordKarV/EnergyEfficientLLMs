@@ -379,29 +379,81 @@ def pick_agreement(records, est_a, est_b, min_candidates=MIN_CANDIDATES):
             "mean_spearman": float(np.mean(rhos)) if rhos else None, "n_tasks_spearman": len(rhos)}
 
 
-def fit_batched(windows):
-    """Batched coefficients: each 1 s server-metrics window's joules ~ intercept + prefill + decode, non-negative.
+SAMPLE_FIELDS = ("t", "counter_j", "prompt_tokens_total", "predicted_tokens_total")
 
-    windows: [{t, joules, prompt_tokens, predicted_tokens}] with per-window token deltas. Raw joules
-    only: idle subtraction would shift the intercept and leave the token slopes unchanged.
+
+def _metrics_columns(samples):
+    """The 1 s metrics log as validated columns: t strictly increasing, every counter non-decreasing."""
+    if len(samples) < 2:
+        raise ValueError(f"batched fit needs at least two metrics samples, got {len(samples)}")
+    cols = np.array([[_num(_get(s, k, f"sample {i}"), f"sample {i}: {k}") for k in SAMPLE_FIELDS]
+                     for i, s in enumerate(samples)])
+    for j, k in enumerate(SAMPLE_FIELDS):
+        d = np.diff(cols[:, j])
+        if (d <= 0).any() if k == "t" else (d < 0).any():
+            i = int(np.flatnonzero(d <= 0 if k == "t" else d < 0)[0])
+            raise ValueError(f"metrics samples {i} -> {i + 1}: {k} goes from {cols[i, j]} to {cols[i + 1, j]}; "
+                             "t must increase and the counters are cumulative (a reset or per-window values?)")
+    return cols
+
+
+def _harness_window_tokens(edges, records):
+    """Prefill and decode tokens per window [edges[i], edges[i+1]) from the harness per-turn timestamps.
+
+    A turn's input_uncached is spread uniformly over [gen_t_start, gen_t_first_token) and its
+    output_tokens over [gen_t_first_token, gen_t_end); a zero-length span goes to the window holding it.
     """
-    if not windows:
-        raise ValueError("no server-metrics windows")
-    X, y = [], []
-    for i, w in enumerate(windows):
-        where = f"window {i}"
-        _get(w, "t", where)
-        y.append(_num(_get(w, "joules", where), f"{where}: joules"))
-        X.append([1.0] + [_num(_get(w, k, where), f"{where}: {k}") for k in ("prompt_tokens", "predicted_tokens")])
-    b = nnls(X, y)
-    return {"coef": {"intercept_per_window": float(b[0]), "prefill": float(b[1]), "decode": float(b[2])},
-            "n_windows": len(y)}
+    lo, hi = edges[:-1], edges[1:]
+    tokens = np.zeros((2, len(lo)))
+
+    def spread(row, a, b, n):
+        if b > a:
+            tokens[row] += n * np.clip(np.minimum(hi, b) - np.maximum(lo, a), 0, None) / (b - a)
+        elif lo[0] <= a < hi[-1]:
+            tokens[row, np.searchsorted(hi, a, side="right")] += n
+
+    for rec in records:
+        aid = rec.get("attempt_id")
+        for i, t in enumerate(_turns(rec)):
+            w = f"attempt {aid!r} turn {i}"
+            t0, t1, t2 = (_num(_get(t, k, w), f"{w}: {k}") for k in ("gen_t_start", "gen_t_first_token", "gen_t_end"))
+            if not t0 <= t1 <= t2:
+                raise ValueError(f"{w}: need gen_t_start <= gen_t_first_token <= gen_t_end, got {t0}, {t1}, {t2}")
+            spread(0, t0, t1, _num(_get(t, "input_uncached", w), f"{w}: input_uncached"))
+            spread(1, t1, t2, _num(_get(t, "output_tokens", w), f"{w}: output_tokens"))
+    return tokens
+
+
+def fit_batched(samples, records):
+    """Batched coefficients: window joules ~ intercept_w x seconds + prefill x tokens + decode x tokens, >= 0.
+
+    samples: the block's llama-server metrics log, [{t (epoch s), counter_j, prompt_tokens_total,
+    predicted_tokens_total}], cumulative values about every 1 s. Windows are consecutive samples, so
+    they are contiguous deltas; a missed sample makes one longer window, which the per-second
+    intercept absorbs. records: the block's attempts, every turn with gen_t_start, gen_t_first_token and
+    gen_t_end. The regression uses the harness-side tokens per window (_harness_window_tokens), not the
+    server counters: at the llama.cpp pin the predicted-token counter credits a whole request when it
+    ends. A fit on the counter deltas is reported only as a cross-check. Raw joules only: idle
+    subtraction would shift the intercept and leave the token slopes unchanged.
+    """
+    cols = _metrics_columns(samples)
+    seconds, joules, server_prefill, server_decode = np.diff(cols, axis=0).T
+    prefill, decode = _harness_window_tokens(cols[:, 0], records)
+
+    def fit(p, d):
+        b = nnls(np.column_stack([seconds, p, d]), joules)
+        return {"intercept_w": float(b[0]), "prefill": float(b[1]), "decode": float(b[2])}
+
+    return {"coef": fit(prefill, decode), "n_windows": len(joules), "seconds": float(seconds.sum()),
+            "server_counter_fit": {"coef": fit(server_prefill, server_decode)},
+            "tokens": {"harness": {"prefill": float(prefill.sum()), "decode": float(decode.sum())},
+                       "server": {"prefill": float(server_prefill.sum()), "decode": float(server_decode.sum())}}}
 
 
 def estimate_batched_joules(rec, batched):
     """An attempt's marginal joules under the batched fit: prefill x uncached tokens + decode x output tokens.
 
-    The per-window intercept is static power shared by every concurrent attempt, so it is left out.
+    The intercept (W) is static power shared by every concurrent attempt, so it is left out.
     """
     aid = rec.get("attempt_id")
     feats = np.array([turn_features(t, f"attempt {aid!r} turn {i}") for i, t in enumerate(_turns(rec))])

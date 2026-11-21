@@ -273,33 +273,89 @@ def test_pick_agreement_uses_the_arms_candidates():
         pick_agreement(mixed, by_out, by_unc, min_candidates=1)
 
 
-def test_batched_fit_recovers_coefficients_and_feeds_agreement():
-    rng = np.random.default_rng(5)
-    windows = []
-    for i in range(600):
-        p, d = int(rng.integers(0, 20000)), int(rng.integers(0, 800))
-        windows.append({"t": float(i), "joules": 60 + 0.02 * p + 0.8 * d + rng.normal(0, 2), "prompt_tokens": p,
-                        "predicted_tokens": d})
-    fit = fit_batched(windows)
-    assert fit["n_windows"] == 600
-    assert fit["coef"]["intercept_per_window"] == pytest.approx(60, rel=0.02)
-    assert fit["coef"]["prefill"] == pytest.approx(0.02, rel=0.02)
-    assert fit["coef"]["decode"] == pytest.approx(0.8, rel=0.02)
+def concurrent_block(rng, n_slots=16, seconds=600, idle_w=60.0, prefill_j=0.02, decode_j=0.8, noise_j=2.0):
+    """A concurrent llama-server block: per-slot attempts with harness timestamps, and its 1 s metrics log.
 
+    Each turn prefills at 4000 tok/s, then decodes at 15-40 tok/s, then waits for a tool. The energy
+    counter integrates idle_w plus prefill_j and decode_j per token as they are processed. The server's
+    token counters credit a request when it ends (predicted, as at the pin) or when its prefill ends.
+    """
+    records, turns = [], []
+    for slot in range(n_slots):
+        t, per_turn = float(rng.uniform(0, 5)), []
+        while t < seconds:
+            unc, out = int(rng.integers(200, 3000)), int(rng.integers(50, 1500))
+            t1 = t + unc / 4000
+            t2 = t1 + out / rng.uniform(15, 40)
+            per_turn.append({"output_tokens": out, "input_uncached": unc, "input_cached": 0,
+                             "gen_t_start": t, "gen_t_first_token": t1, "gen_t_end": t2})
+            t = t2 + rng.exponential(5)
+        records.append({"attempt_id": f"slot{slot}", "profile": "Q4_K_M", "per_turn": per_turn})
+        turns += per_turn
+    t0, t1, t2, unc, out = (np.array([x[k] for x in turns]) for k in
+                            ("gen_t_start", "gen_t_first_token", "gen_t_end", "input_uncached", "output_tokens"))
+    ts = np.arange(seconds + 1.0)
+    done = lambda a, b, n: (n * np.clip((ts[:, None] - a) / (b - a), 0, 1)).sum(1)
+    counter = (1e6 + idle_w * ts + prefill_j * done(t0, t1, unc) + decode_j * done(t1, t2, out)
+               + np.cumsum(rng.normal(0, noise_j, len(ts))))
+    samples = [{"t": float(t), "counter_j": float(c), "prompt_tokens_total": int(unc[t1 <= t].sum()),
+                "predicted_tokens_total": int(out[t2 <= t].sum())} for t, c in zip(ts, counter)]
+    return samples, records
+
+
+def test_batched_fit_uses_harness_timestamps_not_completion_credited_counters():
+    # The owner's review of PR #13: at the pin, llama-server credits a request's predicted tokens when it
+    # ends, so a regression on its counters found decode = 0.0 with 16 slots and a true 0.8 J/token.
+    samples, records = concurrent_block(np.random.default_rng(5))
+    fit = fit_batched(samples, records)
+    assert fit["n_windows"] == 600
+    assert fit["coef"]["decode"] == pytest.approx(0.8, rel=0.05)
+    assert fit["coef"]["prefill"] == pytest.approx(0.02, rel=0.25)
+    assert fit["coef"]["intercept_w"] == pytest.approx(60, rel=0.05)
+    assert fit["server_counter_fit"]["coef"]["decode"] < 0.2  # the cross-check alone would be wrong
+    tok = fit["tokens"]
+    assert tok["server"]["decode"] < tok["harness"]["decode"]  # requests still running at the end
+
+    # A missed sample makes one 2 s window; the intercept is per second, so the fit barely moves.
+    gappy = fit_batched(samples[:300] + samples[301:], records)
+    assert gappy["n_windows"] == 599
+    for k, v in fit["coef"].items():
+        assert gappy["coef"][k] == pytest.approx(v, rel=0.02), k
+
+
+def test_batched_fit_rejects_non_cumulative_or_unordered_samples():
+    samples, records = concurrent_block(np.random.default_rng(6), n_slots=4, seconds=60)
+    deltas = [{**s, "counter_j": 50.0 + (i % 2)} for i, s in enumerate(samples)]  # per-window values, not totals
+    unordered = samples[:5] + [samples[6], samples[5]] + samples[7:]
+    reset = copy.deepcopy(samples)
+    assert reset[-2]["predicted_tokens_total"] > 0
+    reset[-1]["predicted_tokens_total"] = 0  # a server restart resets its counters
+    for bad, field in [(deltas, "counter_j"), (unordered, "t"), (reset, "predicted_tokens_total")]:
+        with pytest.raises(ValueError, match=field):
+            fit_batched(bad, records)
+    late = copy.deepcopy(records)
+    late[0]["per_turn"][0]["gen_t_first_token"] = late[0]["per_turn"][0]["gen_t_end"] + 1
+    with pytest.raises(ValueError, match="gen_t_first_token"):
+        fit_batched(samples, late)
+    with pytest.raises(ValueError, match="gen_t_end"):
+        fit_batched(samples, [{"attempt_id": "x", "per_turn": [{"output_tokens": 1, "input_uncached": 1,
+                                                                 "gen_t_start": 0.0, "gen_t_first_token": 0.5}]}])
+    with pytest.raises(ValueError, match="two metrics samples"):
+        fit_batched(samples[:1], records)
+
+
+def test_batched_estimate_feeds_agreement():
     rec = pool_rec("x", "X", 10, 100)
-    assert estimate_batched_joules(rec, fit) == pytest.approx(fit["coef"]["prefill"] * 100 + fit["coef"]["decode"] * 10)
+    fit = {"coef": {"intercept_w": 60.0, "prefill": 0.02, "decode": 0.8}}
+    assert estimate_batched_joules(rec, fit) == pytest.approx(0.02 * 100 + 0.8 * 10)
     pool = [pool_rec("a1", "A", 100, 900), pool_rec("a2", "A", 200, 100), pool_rec("b1", "B", 50, 50),
             pool_rec("b2", "B", 60, 40)]
     c1 = lambda r: estimate_attempt_joules(r, {"coef": {"output": 1.0}})
-    decode_only = {"coef": {"intercept_per_window": 60.0, "prefill": 0.0, "decode": 1.0}}
-    prefill_heavy = {"coef": {"intercept_per_window": 60.0, "prefill": 1.0, "decode": 0.0}}
+    decode_only = {"coef": {"intercept_w": 60.0, "prefill": 0.0, "decode": 1.0}}
+    prefill_heavy = {"coef": {"intercept_w": 60.0, "prefill": 1.0, "decode": 0.0}}
     agree = lambda est: pick_agreement(pool, c1, est, min_candidates=2)["share_same_pick"]
     assert agree(lambda r: estimate_batched_joules(r, decode_only)) == 1.0
     assert agree(lambda r: estimate_batched_joules(r, prefill_heavy)) == 0.0
-
-    fit_neg = fit_batched([{**w, "joules": 60 - 1e-4 * w["prompt_tokens"] + 0.8 * w["predicted_tokens"]}
-                           for w in windows])
-    assert min(fit_neg["coef"].values()) >= 0
 
 
 def test_fit_data_keeps_only_attributable_concurrency_one_attempts():
@@ -360,10 +416,8 @@ def test_malformed_inputs_fail_loudly():
     with pytest.raises(ValueError, match="unknown"):
         estimate_attempt_joules(pool_rec("p", "t", 1, 1), {"coef": {"prefill": 1.0}})
 
-    with pytest.raises(ValueError, match="no server-metrics windows"):
-        fit_batched([])
-    with pytest.raises(ValueError, match="predicted_tokens"):
-        fit_batched([{"t": 0.0, "joules": 1.0, "prompt_tokens": 1}])
+    with pytest.raises(ValueError, match="predicted_tokens_total"):
+        fit_batched([{"t": 0.0, "counter_j": 1.0, "prompt_tokens_total": 1}] * 2, [])
 
 
 def test_pool_records_drop_and_count_infrastructure_errors():
@@ -387,15 +441,15 @@ def test_cli_writes_model_and_estimates(tmp_path):
     pool[1]["end_reason"] = "error"
     pool_path = tmp_path / "pool.jsonl"
     pool_path.write_text("".join(json.dumps(r) + "\n" for r in pool))
-    windows = [{"t": float(i), "joules": 60 + 0.1 * p + 2.5 * d, "prompt_tokens": p, "predicted_tokens": d}
-               for i, (p, d) in enumerate(rng.integers(0, 2000, (200, 2)).tolist())]
-    win_path = tmp_path / "windows.jsonl"
-    win_path.write_text("".join(json.dumps(w) + "\n" for w in windows))
+    samples, block = concurrent_block(rng, n_slots=8, seconds=300, decode_j=2.5, noise_j=0.5)
+    win_path, block_path = tmp_path / "metrics.jsonl", tmp_path / "block.jsonl"
+    win_path.write_text("".join(json.dumps(w) + "\n" for w in samples))
+    block_path.write_text("".join(json.dumps(r) + "\n" for r in block))
 
     out = tmp_path / "p0a"
     script = os.path.join(ROOT, "scripts", "p0a_energy_model.py")
-    args = ["--subrun", str(sub), "--pool", str(pool_path), "--windows", str(win_path), "--out", str(out),
-            "--n-boot", "30"]
+    args = ["--subrun", str(sub), "--pool", str(pool_path), "--windows", str(win_path), "--window-attempts",
+            str(block_path), "--out", str(out), "--n-boot", "30"]
     res = subprocess.run([sys.executable, script, *args], capture_output=True, text=True, check=False)
     assert res.returncode == 0, res.stderr
     em = json.loads((out / "energy_model.json").read_text())
@@ -410,7 +464,7 @@ def test_cli_writes_model_and_estimates(tmp_path):
     assert em["bf16_vs_q4"]["n_tasks"] == 19 and em["bf16_vs_q4"]["min_candidates"] == 4
     assert em["bf16_vs_q4"]["share_same_pick"] is not None
     b = em["batched"]
-    assert b["coef"]["decode"] == pytest.approx(2.5, rel=0.01)
+    assert b["coef"]["decode"] == pytest.approx(2.5, rel=0.02) and b["n_windows"] == 300
     assert b["below_85pct"] == (b["agreement_with_c1"]["share_same_pick"] < 0.85)
 
     rows = [json.loads(line) for line in (out / "est_joules.jsonl").read_text().splitlines()]

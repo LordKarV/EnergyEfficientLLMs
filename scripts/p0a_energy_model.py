@@ -1,14 +1,18 @@
 """Fit the P0a per-turn energy model (docs/04) and estimate Q4_K_M joules for every pool attempt.
 
     python scripts/p0a_energy_model.py --subrun outputs/attempts/sub-*.jsonl \
-        --pool outputs/attempts/p0b-*.jsonl [--windows outputs/p0a/q4_windows.jsonl] --out outputs/p0a
+        --pool outputs/attempts/p0b-*.jsonl \
+        [--windows outputs/p0a/q4_metrics.jsonl --window-attempts outputs/attempts/p0a-q4-*.jsonl] --out outputs/p0a
 
 --subrun: attempt files holding the energy sub-run; only concurrency-1 attributable attempts are fitted,
           per profile, and Q4_K_M must be among them.
 --pool:   candidate pool attempt files (P0b); held-out lists or repos fail. end_reason "error" is dropped.
           Every attempt gets an estimate; the pick-agreement checks use the arms' candidates (resolved,
           unflagged BF16 runs) on tasks with at least --min-candidates of them (4; the P0b fallback is 2).
---windows: the Q4_K_M block's 1 s llama-server metrics windows {t, joules, prompt_tokens, predicted_tokens}.
+--windows: the Q4_K_M block's 1 s llama-server metrics log, cumulative values
+          {t, counter_j, prompt_tokens_total, predicted_tokens_total}.
+--window-attempts: that block's attempt files; the batched fit spreads their per-turn tokens over the
+          windows with gen_t_start, gen_t_first_token and gen_t_end (the server counters are a cross-check).
 
 Writes energy_model.json ({"profiles": {...}, "fewest_joules_fallback": bool, ...}) and
 est_joules.jsonl (one {attempt_id, est_joules_q4} per pool attempt, written even under the fallback;
@@ -50,11 +54,14 @@ def main():
     ap.add_argument("--subrun", nargs="+", required=True)
     ap.add_argument("--pool", nargs="+", required=True)
     ap.add_argument("--windows")
+    ap.add_argument("--window-attempts", nargs="+")
     ap.add_argument("--out", default="outputs/p0a")
     ap.add_argument("--min-candidates", type=int, default=MIN_CANDIDATES)
     ap.add_argument("--n-boot", type=int, default=2000)
     ap.add_argument("--seed", type=int, default=20261119)
     args = ap.parse_args()
+    if bool(args.windows) != bool(args.window_attempts):
+        ap.error("--windows and --window-attempts go together")
 
     by_profile, excluded = fit_attempts([r for p in args.subrun for r in read_jsonl(p)])
     if RANK_PROFILE not in by_profile:
@@ -71,7 +78,11 @@ def main():
                               args.min_candidates)
     batched = None
     if args.windows:
-        fit = fit_batched(read_jsonl(args.windows))
+        block = [r for p in args.window_attempts for r in read_jsonl(p)]
+        other = sorted({str(r.get("profile")) for r in block} - {RANK_PROFILE})
+        if other:
+            raise SystemExit(f"--window-attempts must all be {RANK_PROFILE} (the --windows block), found {other}")
+        fit = fit_batched(read_jsonl(args.windows), block)
         agree = pick_agreement(pool, lambda r: estimate_batched_joules(r, fit), by_q4, args.min_candidates)
         share = agree["share_same_pick"]
         batched = {**fit, "agreement_with_c1": agree, "below_85pct": None if share is None else share < AGREEMENT_MIN}
