@@ -8,7 +8,9 @@ Run on the box:
 Token-matched rerun (docs/04, Training), stopping once the supervised tokens of another run are reached:
     python scripts/p1_train_lora.py --arm qtrace --seed 0 --match-supervised-tokens <its supervised_tokens_seen>
 Writes outputs/runs/<arm>_seed<s>[_tokmatch<N>]/: loss.jsonl, train_meta.json and merged/ (model and
-tokenizer, the input of the GGUF round trip).
+tokenizer, the input of the GGUF round trip). Training runs in bf16 on a GPU; the merge and the saved model are
+F32 (merged_dtype), so no part of the update is rounded away before the GGUF conversion. train_meta.json also has
+update_size (qtrace.probe.lora_update_size), measured on the trained adapter before the merge.
 Training cost (docs/03, Metrics): wall_seconds, gpu_hours and gpu_joules cover the training loop only (not
 model load, merge or save). gpu_joules is the NVML energy counter of GPU 0 (qtrace.energy.EnergyMeter), raw,
 idle draw included and GPU only; it is null when torch sees no CUDA device. gpu_hours is null on CPU.
@@ -27,7 +29,7 @@ from qtrace import sft
 from qtrace.common import load_config
 from qtrace.energy import EnergyMeter
 from qtrace.models import pick_device
-from qtrace.probe import kernel_paths, kernel_status
+from qtrace.probe import kernel_paths, kernel_status, lora_update_size
 
 
 def check_kernels(allow_slow):
@@ -91,9 +93,12 @@ def main(argv=None):
             records = sft.train(model, examples, plan, tr["learning_rate"], warmup, tr["loss_norm"], tr["chunk"],
                                 log)
 
-    # Fold W <- W + BA and save the plain model: quantization (GGUF) must see the deployed weights.
+    # Measured on the trained adapter before the merge drops it (issue #1): how big the update is and how
+    # much of it a bf16 file would keep.
+    update_size = lora_update_size(model)
+    # Fold W <- W + BA in f32 and save the plain model: quantization (GGUF) must see the deployed weights.
     merged_dir = os.path.join(run_dir, "merged")
-    model.merge_and_unload().save_pretrained(merged_dir)
+    sft.save_merged(model, merged_dir)
     tokenizer.save_pretrained(merged_dir)
     meta = {
         "arm": args.arm, "seed": args.seed, "arm_file": arm_file, "examples": len(examples), "steps": len(plan),
@@ -106,7 +111,8 @@ def main(argv=None):
         "learning_rate": tr["learning_rate"], "warmup_steps": warmup, "grad_clip": sft.GRAD_CLIP,
         "targets": list(tr["targets"]), "include_gates": tr["include_gates"], "lora_r": tr["lora_r"],
         "lora_alpha": tr["lora_alpha"], "kernels": kernels, "model": model_path, "device": device,
-        "dtype": str(dtype), "merged": merged_dir, "wall_seconds": meter.seconds,
+        "dtype": str(dtype), "merged": merged_dir, "merged_dtype": "float32", "update_size": update_size,
+        "wall_seconds": meter.seconds,
         "gpu_hours": None if device == "cpu" else meter.seconds / 3600, "gpu_joules": meter.joules,
     }
     with open(os.path.join(run_dir, "train_meta.json"), "w") as f:

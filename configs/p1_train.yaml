@@ -22,4 +22,5 @@ train:
 
 paths:
   arms_dir: outputs/arms
-  runs_dir: outputs/runs
+  runs_dir: outputs/runs         # <run>/merged/ is the F32 merge (qtrace.sft.save_merged), about 16 GB
+                                 # per 4B arm and seed

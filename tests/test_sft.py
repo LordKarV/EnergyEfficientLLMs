@@ -15,7 +15,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 import yaml
-from test_probe import tiny_qwen35
+from test_probe import plant_update, tiny_qwen35
 
 from qtrace import sft
 
@@ -247,6 +247,33 @@ def test_inputs_are_validated_at_the_boundary(tmp_path):
         sft.attach(tiny_qwen35(), {**TRAIN, "targets": TARGETS + ["in_proj_a"]}, 0)
 
 
+def test_save_merged_writes_the_exact_f32_merge_not_the_bf16_one(tmp_path):
+    import copy
+
+    from safetensors.torch import load_file
+
+    model = sft.attach(tiny_qwen35().to(torch.bfloat16), TRAIN, 0)  # bf16 base, as trained on the GPU
+    plant_update(model, 1e-3)  # a small update: about half of it is below half a bf16 step
+    expected, lora = {}, set()
+    for name, mod in model.named_modules():
+        if "default" in getattr(mod, "lora_A", {}):
+            key = name.removeprefix("base_model.model.") + ".weight"
+            a, b = mod.lora_A["default"].weight.float(), mod.lora_B["default"].weight.float()
+            expected[key] = mod.base_layer.weight.float() + mod.scaling["default"] * (b @ a)
+            lora.add(key)
+    expected.update({k: v.float() for k, v in model.get_base_model().state_dict().items() if k not in expected})
+    bf16_merge = copy.deepcopy(model).merge_and_unload().state_dict()
+
+    sft.save_merged(model, tmp_path / "merged")
+    saved = load_file(tmp_path / "merged" / "model.safetensors")
+    assert {v.dtype for v in saved.values()} == {torch.float32}
+    assert json.loads((tmp_path / "merged" / "config.json").read_text())["dtype"] == "float32"
+    assert lora <= set(saved) and set(saved) <= set(expected)
+    assert all(torch.equal(saved[k], expected[k]) for k in saved)  # bit-exact in f32
+    differ = [k for k in lora if not torch.equal(saved[k], bf16_merge[k].float())]
+    assert sorted(differ) == sorted(lora)
+
+
 def load_script():
     spec = importlib.util.spec_from_file_location("p1_train_lora", os.path.join(ROOT, "scripts", "p1_train_lora.py"))
     module = importlib.util.module_from_spec(spec)
@@ -292,11 +319,15 @@ def test_script_end_to_end_writes_logs_meta_and_a_merged_model(tmp_path):
     assert meta["truncated_supervised_share"] == 0.0 and meta["loss_norm"] == 32
     assert meta["targets"] == TARGETS and meta["include_gates"] is False and meta["model"] == str(ckpt)
     assert set(meta["kernels"]["in_use"]) == {"chunk_gated_delta_rule", "causal_conv1d_fn"}
+    assert meta["merged_dtype"] == "float32" and meta["update_size"]["modules"] == 4 * 3 + 3 * 3 + 1 * 4
+    assert set(meta["update_size"]["by_type"]) == set(TARGETS)  # measured on the adapter, before the merge
+    assert 0 < meta["update_size"]["carried_bf16"] <= 1.05
 
     base = AutoModelForCausalLM.from_pretrained(ckpt).state_dict()
     merged_model = AutoModelForCausalLM.from_pretrained(run / "merged")
     merged = merged_model.state_dict()
     assert merged_model.config.architectures == ["Qwen3_5ForCausalLM"]
+    assert merged_model.config.dtype == torch.float32
     assert not any("lora" in k for k in merged)
     assert not torch.equal(base["model.layers.0.linear_attn.in_proj_qkv.weight"],
                            merged["model.layers.0.linear_attn.in_proj_qkv.weight"])
