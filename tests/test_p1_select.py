@@ -492,7 +492,7 @@ def test_bad_input_fails_with_a_message_naming_the_problem():
 
 # Summary and overlap.
 
-def test_overlap_table_flags_pairs_at_or_above_85_percent():
+def test_overlap_table_flags_pairs_above_85_percent():
     def rows(ids):
         return [{"task_id": f"t{i}", "attempt_id": x} for i, x in enumerate(ids)]
 
@@ -500,7 +500,7 @@ def test_overlap_table_flags_pairs_at_or_above_85_percent():
     b = rows(["x"] * 17 + ["y"] * 3)
     c = rows(["x"] * 18 + ["y"] * 2)
     pairs = {tuple(p["arms"]): p for p in overlap({"a": a, "b": b, "c": c})}
-    assert pairs[("a", "b")] == {"arms": ["a", "b"], "share_same": 0.85, "not_separable": True}  # "at least 85%"
+    assert pairs[("a", "b")] == {"arms": ["a", "b"], "share_same": 0.85, "not_separable": False}  # "above 85%"
     assert pairs[("a", "c")]["share_same"] == 0.9 and pairs[("a", "c")]["not_separable"] is True
     assert overlap({"a": a, "d": rows(["x"] * 16 + ["y"] * 4)})[0]["not_separable"] is False
     assert pairs[("b", "c")]["share_same"] == 0.95

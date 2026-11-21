@@ -33,7 +33,7 @@ HELDOUT_LISTS = frozenset({"heldout100", "verified100", "inrepo_test"})
 MALFORMED = ("misnested_tag", "wrong_name", "text_after_call", "truncated_call", "no_call_no_answer")
 PROBE = "Q3_K_M"
 COST_FIELD = {"turns": "turns", "joules": "est_joules_q4"}
-NOT_SEPARABLE = 0.85  # inclusive: docs/04 says "at least 85%"
+NOT_SEPARABLE = 0.85  # docs/04: the two P0b rules say "at least 85%", the arm-pair table "above 85%"
 REGRET_MERGE = 0.05  # strict: fewest_turns' median joule regret "below 5%" merges it with fewest_joules
 # docs/04 P0b's arm-overlap rankings. turns and joules are exactly the fewest_turns and fewest_joules rules; the
 # HERO ones are its reward cost (total tokens) and its API price (uncached + 0.1 x cached + 4 x output tokens).
@@ -326,14 +326,14 @@ def arm_stats(rows):
 def overlap(picks, threshold=NOT_SEPARABLE):
     """Share of tasks where two arms pick the same run, for every pair of arms built for one seed.
 
-    picks: arm -> rows. A pair at or above threshold is "not separable" (docs/04, P0b): training both arms
-    would test nothing, so their hypothesis is reported as untestable.
+    picks: arm -> rows. A pair above threshold is "not separable" (docs/04, P0b): training both arms would
+    test nothing, so their hypothesis is reported as untestable.
     """
     pairs = []
     for a, b in itertools.combinations(picks, 2):
         chosen = {r["task_id"]: r["attempt_id"] for r in picks[a]}
         same = sum(chosen[r["task_id"]] == r["attempt_id"] for r in picks[b]) / len(picks[b])
-        pairs.append({"arms": [a, b], "share_same": same, "not_separable": same >= threshold})
+        pairs.append({"arms": [a, b], "share_same": same, "not_separable": same > threshold})
     return pairs
 
 

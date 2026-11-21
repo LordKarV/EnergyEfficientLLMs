@@ -67,7 +67,7 @@ def report(summary):
                   f"{fmt(st['mean_score'], '.4f'):>8s}")
     close = [f"{a}~{b} {p['share_same']:.2f} (seed {s})" for s, pairs in ov["by_seed"].items() for p in pairs
              if p["not_separable"] for a, b in [p["arms"]]]
-    print(f"\noverlap: chance rate {ov['chance_rate']:.3f}; not separable (at least {ov['threshold']:.0%}): "
+    print(f"\noverlap: chance rate {ov['chance_rate']:.3f}; not separable (above {ov['threshold']:.0%}): "
           + (", ".join(close) or "none"))
     rule = summary["arm_overlap_rule"]
     print("P0b fewest_joules/fewest_turns rule:", rule["note"])
