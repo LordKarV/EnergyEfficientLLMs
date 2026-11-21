@@ -35,7 +35,8 @@ def test_stratified_sample_is_deterministic_and_order_free():
 
 def test_build_lists_are_disjoint_and_sized():
     verified = [f"repo__x-{i}" for i in range(500)]
-    lists = build_lists(fake_rows(), verified, seed=7, inrepo_size=30, pool_size=20, heldout_size=10, verified_size=5)
+    lists = build_lists(fake_rows(), verified, seed=7, inrepo_size=30, pool_size=20, heldout_size=10, verified_size=5,
+                        pilot_size=1, pilot_verified_size=1, subrun_size=1)
     inrepo, pool, held, ver = (set(lists[k]["ids"]) for k in ("inrepo_test", "pool200", "heldout100", "verified100"))
     assert (len(inrepo), len(pool), len(held), len(ver)) == (30, 20, 10, 5)
     assert not inrepo & pool
@@ -56,7 +57,8 @@ def test_build_lists_rejects_duplicate_task_ids():
 
 def test_heldout691_is_every_heldout_task():
     rows = fake_rows()
-    lists = build_lists(rows, ["v-1"], seed=7, inrepo_size=1, pool_size=1, heldout_size=10, verified_size=1)
+    lists = build_lists(rows, ["v-1"], seed=7, inrepo_size=1, pool_size=1, heldout_size=10, verified_size=1,
+                        pilot_size=1, pilot_verified_size=1, subrun_size=1)
     every = lists["heldout691"]
     assert every["ids"] == sorted(tid for tid, repo in rows if repo in HELDOUT_REPOS)
     assert every["size"] == 60 * len(HELDOUT_REPOS)
@@ -72,3 +74,31 @@ def test_frozen_heldout691_matches_04_and_contains_heldout100():
     assert set(every["by_repo"]) == set(HELDOUT_REPOS)
     assert set(held["ids"]) <= set(every["ids"])
     assert every["sources"] == held["sources"]
+
+
+def test_pilot_and_subrun_lists_are_seeded_subsets():
+    verified = [f"repo__x-{i}" for i in range(500)]
+    kw = {"inrepo_size": 30, "pool_size": 60, "heldout_size": 40, "verified_size": 20,
+          "pilot_size": 12, "pilot_verified_size": 3, "subrun_size": 8}
+    lists = build_lists(fake_rows(), verified, seed=7, **kw)
+    pairs = {"pilot20": "pool200", "pilot_verified3": "verified100", "energy_subrun15": "heldout100"}
+    for sub, parent in pairs.items():
+        assert set(lists[sub]["ids"]) <= set(lists[parent]["ids"])
+    assert [lists[k]["size"] for k in pairs] == [12, 3, 8]
+    # Stratified by repo: 60 pool tasks over 6 equal repos give 10 each, so 12 picks give 2 each.
+    assert set(lists["pilot20"]["by_repo"].values()) == {2}
+    assert set(lists["energy_subrun15"]["by_repo"].values()) == {2}
+    assert lists == build_lists(fake_rows(), verified, seed=7, **kw)
+    assert lists["pilot20"]["ids"] != build_lists(fake_rows(), verified, seed=8, **kw)["pilot20"]["ids"]
+
+
+def test_frozen_pilot_and_subrun_lists():
+    def load(name):
+        with open(os.path.join(LISTS, f"{name}.json")) as f:
+            return json.load(f)
+    for sub, parent, size in [("pilot20", "pool200", 20), ("pilot_verified3", "verified100", 3),
+                              ("energy_subrun15", "heldout100", 15)]:
+        child, par = load(sub), load(parent)
+        assert child["size"] == len(child["ids"]) == len(set(child["ids"])) == size
+        assert set(child["ids"]) <= set(par["ids"])
+        assert child["seed"] == par["seed"] and child["sources"] == par["sources"]

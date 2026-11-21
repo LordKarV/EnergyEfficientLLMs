@@ -59,12 +59,16 @@ def _summary(name, ids, rows, seed, size_note):
             "by_repo": dict(sorted(by_repo.items())), "ids": ids}
 
 
-def build_lists(rows, verified_ids, seed, inrepo_size=300, pool_size=200, heldout_size=100, verified_size=100):
-    """Build inrepo_test, pool200, heldout100, heldout691 and verified100.
+def build_lists(rows, verified_ids, seed, inrepo_size=300, pool_size=200, heldout_size=100, verified_size=100,
+                pilot_size=20, pilot_verified_size=3, subrun_size=15):
+    """Build inrepo_test, pool200, heldout100, heldout691, verified100 and the three subsets below.
 
     rows: (task_id, repo_name) pairs for R2E-Gym. inrepo_test is drawn first from the pool repos
     and excluded from pool200, as 04 requires. heldout100 comes only from the held-out repos.
     heldout691 is every held-out-repo task (P2 runs on all of them), so it is not sampled.
+    pilot20 and energy_subrun15 are stratified by repo from pool200 and heldout100; pilot_verified3
+    is a plain draw from verified100. Each has its own seed string, so adding them leaves the
+    other lists unchanged.
     """
     ids = [task_id for task_id, _ in rows]
     if len(ids) != len(set(ids)):
@@ -76,6 +80,11 @@ def build_lists(rows, verified_ids, seed, inrepo_size=300, pool_size=200, heldou
     every_held = [task_id for repo in sorted(held_by_repo) for task_id in sorted(held_by_repo[repo])]
     rng = random.Random(f"{seed}:verified100")
     verified = sorted(rng.sample(sorted(verified_ids), verified_size))
+    pool_rows = [row for row in rows if row[0] in set(pool)]
+    pilot = stratified_sample(_by_repo(pool_rows, POOL_REPOS), pilot_size, f"{seed}:pilot20")
+    pilot_verified = sorted(random.Random(f"{seed}:pilot_verified3").sample(verified, pilot_verified_size))
+    held_rows = [row for row in rows if row[0] in set(held)]
+    subrun = stratified_sample(_by_repo(held_rows, HELDOUT_REPOS), subrun_size, f"{seed}:energy_subrun15")
     return {
         "inrepo_test": _summary("inrepo_test", inrepo, rows, seed,
                                 "working default 300; the owner sets the final size (04, Owner decisions)"),
@@ -84,4 +93,10 @@ def build_lists(rows, verified_ids, seed, inrepo_size=300, pool_size=200, heldou
         "heldout691": _summary("heldout691", every_held, rows, seed,
                                "every held-out-repo task, a superset of heldout100; 04 gives 691"),
         "verified100": _summary("verified100", verified, rows, seed, "fixed by 04"),
+        "pilot20": _summary("pilot20", pilot, rows, seed, "fixed by 04 (P0b pilot), drawn from pool200"),
+        "pilot_verified3": _summary("pilot_verified3", pilot_verified, rows, seed,
+                                    "fixed by 04 (P0b pilot extra, owner-approved), drawn from verified100"),
+        "energy_subrun15": _summary("energy_subrun15", subrun, rows, seed,
+                                    "fixed by 04 (P0a energy sub-run); 04 names no source list, "
+                                    "heldout100 is the working default"),
     }
