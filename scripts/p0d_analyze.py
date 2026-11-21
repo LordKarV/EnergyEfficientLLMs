@@ -20,8 +20,10 @@ rows are {task_id, prefix, profile, replay_valid, low_attempt_id, high_attempt_i
 attempts}; the two ids must be the frozen pair's runs, and a replay_valid false row needs no results.
 It also writes docs/04's secondary results, which never change the decision: did_q4.json, the same
 test on the Q4_K_M continuation rows (when there are any), and did_kl_mean.json, the Q3_K_M test with
-each pair's low and high prefix set by kl_mean. A secondary file that the inputs no longer produce
-is removed.
+each pair's low and high prefix set by kl_mean. All three files are removed before the test runs,
+so each one left in --out-dir comes from this run's continuations. A secondary that cannot be
+computed from them (no Q4_K_M rows, a pair with Q4_K_M rows on one prefix only, or pairs frozen
+without kl_mean) is not written, the reason is printed, and the other files are still written.
 """
 
 import argparse
@@ -140,6 +142,11 @@ def did_step(args):
         why = "H3 was answered negatively" if frozen["decided"] else "the score rule is undecided"
         raise SystemExit(f"{path} has no chosen score ({why}: {frozen['verdict']}), so there are no replay pairs")
     rows, pairs = read_jsonl(args.continuations), frozen["pairs"]["tasks"]
+    for name in DID_FILES:
+        stale = os.path.join(args.out_dir, name)
+        if os.path.exists(stale):
+            os.remove(stale)
+            print("removed", stale, "(from an earlier continuations file)")
     did = did_test(rows, pairs=pairs, n_boot=args.n_boot, seed=args.seed)
     did["score"], did["score_choice"] = frozen["chosen"], path
     write_json(os.path.join(args.out_dir, "did.json"), did)
@@ -151,19 +158,18 @@ def did_step(args):
         print(did["adjusted"]["note"])
     if did["pair_tasks_without_continuations"]:
         print(f"{len(did['pair_tasks_without_continuations'])} pairs have no BF16 and Q3_K_M continuation rows")
-    secondary = {"did_q4.json": (did_q4(rows, pairs, n_boot=args.n_boot, seed=args.seed), "no Q4_K_M rows"),
-                 "did_kl_mean.json": (did_kl_mean(rows, pairs, n_boot=args.n_boot, seed=args.seed),
-                                      "the frozen pairs have no low_kl_mean")}
-    for name, (sec, why) in secondary.items():
-        target = os.path.join(args.out_dir, name)
+    secondary = {"did_q4.json": (did_q4, "no Q4_K_M rows"),
+                 "did_kl_mean.json": (did_kl_mean, "the frozen pairs have no low_kl_mean")}
+    for name, (test, why) in secondary.items():
+        try:
+            sec = test(rows, pairs, n_boot=args.n_boot, seed=args.seed)
+        except ValueError as e:  # bad secondary rows never undo the primary result already written
+            sec, why = None, str(e)
         if sec is None:
             print(f"secondary {name} not written: {why}")
-            if os.path.exists(target):
-                os.remove(target)
-                print("removed", target)
             continue
         sec["pairs_score"], sec["score_choice"] = frozen["chosen"], path
-        write_json(target, sec)
+        write_json(os.path.join(args.out_dir, name), sec)
         print(f"secondary {name}: DiD {sec['did_mean']:+.3f} (p one-sided {sec['p_one_sided']:.4f}) on "
               f"{sec['n_tasks']} tasks: {sec['decision']}")
 

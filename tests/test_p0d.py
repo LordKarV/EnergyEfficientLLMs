@@ -886,7 +886,7 @@ def write_inputs(tmp_path, attempts, scores, joules):
     return paths
 
 
-def test_analyze_writes_score_choice_and_did(tmp_path):
+def test_analyze_writes_score_choice_and_did(tmp_path, capsys):
     attempts, scores, joules = make_pool(n_tasks=30)
     attempts.append(attempt("flagged", "task0", touched=True))  # no score row, as the scorer skips it
     attempts.append(attempt("p0c-run", "task0", run_id="p0c"))  # P0c's draw: never scored, never missing
@@ -928,6 +928,24 @@ def test_analyze_writes_score_choice_and_did(tmp_path):
     q4_did = json.loads((out_dir / "did_q4.json").read_text())
     assert q4_did["profile"] == "Q4_K_M" and q4_did["did_mean"] == did["did_mean"] and q4_did["pairs_score"] == "kl_mean"
     assert json.loads((out_dir / "did.json").read_text())["did_mean"] == did["did_mean"]  # the primary is unchanged
+    # A later file with one more Q3_K_M seed while the Q4_K_M run is part-way: task0 has Q4_K_M rows on the
+    # low prefix only, so did_q4 raises. did.json and did_kl_mean.json are rewritten and no did_q4.json is left.
+    extra = {**rows[1], "successes": 4 - rows[1]["successes"]}  # task0, low prefix, Q3_K_M
+    assert extra["task_id"] == "task0" and extra["profile"] == "Q3_K_M" and extra["prefix"] == "low"
+    partial = [r for r in q4 if not (r["task_id"] == "task0" and r["prefix"] == "high")]
+    cont.write_text("".join(json.dumps(r) + "\n" for r in rows + [extra] + partial))
+    mod.main(["--out-dir", str(out_dir), "--continuations", str(cont), "--n-boot", "300"])
+    new = json.loads((out_dir / "did.json").read_text())
+    assert new["did_mean"] != did["did_mean"] and not (out_dir / "did_q4.json").exists()
+    assert json.loads((out_dir / "did_kl_mean.json").read_text())["did_mean"] == new["did_mean"]
+    assert "no Q4_K_M attempts on the high prefix" in capsys.readouterr().out
+    # Back to complete Q4_K_M rows, then a file without them: the did_q4.json they produced is removed.
+    cont.write_text("".join(json.dumps(r) + "\n" for r in rows + q4))
+    mod.main(["--out-dir", str(out_dir), "--continuations", str(cont), "--n-boot", "300"])
+    assert (out_dir / "did_q4.json").exists()
+    cont.write_text("".join(json.dumps(r) + "\n" for r in rows))
+    mod.main(["--out-dir", str(out_dir), "--continuations", str(cont), "--n-boot", "300"])
+    assert not (out_dir / "did_q4.json").exists() and (out_dir / "did_kl_mean.json").exists()
 
 
 def test_did_step_says_a_constant_covariate_is_not_separated(tmp_path, capsys):
