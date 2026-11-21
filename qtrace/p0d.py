@@ -23,6 +23,7 @@ import numpy as np
 CANDIDATES = ("kl_decision", "kl_command", "kl_mean")  # frozen order, docs/04 (2026-11-20)
 PROBE, AGREEMENT_PROBE = "Q3_K_M", "Q4_K_M"
 HELD_OUT_LISTS = ("heldout100", "verified100", "inrepo_test")  # never part of any pool (docs/04, Task sets)
+POOL_LISTS = ("pool200",)  # the default of p0d_score_pool.py --lists
 CONFOUNDS = ("turns", "output_tokens", "est_joules_q4", "entropy_bf16")
 COVARIATES = ("entropy", "turns", "malformed")
 MAX_ABS_RHO, MIN_SPLIT_HALF, MIN_AGREEMENT, MIN_RUNS = 0.8, 0.5, 0.5, 3
@@ -100,28 +101,36 @@ def _scores(row, what):
     return {c: _number(_field(row, c, what), f"{what} {c}") for c in CANDIDATES}
 
 
-def join_runs(attempts, scores, est_joules=None):
+def join_runs(attempts, scores, est_joules=None, lists=POOL_LISTS):
     """One record per scored pool run, joining attempt fields, both probes' scores and estimated joules.
 
-    Runs are the attempts with a Q3_K_M score row. Each must be a resolved BF16 attempt on a pool list;
-    anything else (an unknown attempt, another profile, a failure, a held-out list, a duplicate row, a
-    non-finite number) raises ValueError, since it means the scorer read the wrong files. A run the
-    test-file tripwire flagged can never be a selection candidate and is excluded. info's
-    flagged_excluded counts, per list, the resolved BF16 attempts it flagged, from the attempt records,
-    because the scorer writes no rows for them. est_joules: est_joules.jsonl rows, or None if P0a's
-    file does not exist yet. Runs without a Q4_K_M row or an est_joules value are counted in info, and
-    candidate_stats does not run the check they feed. Returns (runs, info).
+    Runs are the attempts with a Q3_K_M score row. Each must be a resolved BF16 attempt on one of
+    `lists` (the scorer's --lists); anything else (an unknown attempt, another profile, a failure,
+    another list, a duplicate row, a non-finite number) raises ValueError, since it means the scorer
+    read the wrong files. A run the test-file tripwire flagged can never be a selection candidate and
+    is excluded. info's flagged_excluded counts, per list, the resolved BF16 attempts it flagged, from
+    the attempt records, because the scorer writes no rows for them. info's n_eligible_without_q3
+    counts the resolved, unflagged BF16 attempts on `lists` with no Q3_K_M row (the scorer still
+    running or a row lost); choose_score must not decide while it is non-zero. est_joules:
+    est_joules.jsonl rows, or None if P0a's file does not exist yet. Runs without a Q4_K_M row or an
+    est_joules value are counted in info, and candidate_stats does not run the check they feed.
+    Returns (runs, info).
     """
-    by_id, flagged_by_list = {}, defaultdict(int)
+    bad = sorted(set(lists) & set(HELD_OUT_LISTS))
+    if bad:
+        raise ValueError(f"{bad} are held-out lists and never enter a pool")
+    by_id, flagged_by_list, eligible = {}, defaultdict(int), set()
     for a in attempts:
         aid = _field(a, "attempt_id", "attempt")
         if aid in by_id:
             raise ValueError(f"duplicate attempt_id {aid!r} in the attempts files")
         by_id[aid] = a
         what = f"attempt {aid}"
-        if _field(a, "profile", what) == "BF16" and _field(a, "resolved", what) and flagged(a) and \
-                _field(a, "list", what) not in HELD_OUT_LISTS:
-            flagged_by_list[a["list"]] += 1
+        if _field(a, "profile", what) == "BF16" and _field(a, "resolved", what) and _field(a, "list", what) in lists:
+            if flagged(a):
+                flagged_by_list[a["list"]] += 1
+            else:
+                eligible.add(aid)
     rows = {}
     for s in scores:
         key = (_field(s, "attempt_id", "score row"), _field(s, "probe", "score row"))
@@ -147,6 +156,8 @@ def join_runs(attempts, scores, est_joules=None):
         a = by_id[aid]
         if _field(a, "list", what) in HELD_OUT_LISTS:
             raise ValueError(f"{what}: list {a['list']!r} is held-out and never enters a pool")
+        if a["list"] not in lists:
+            raise ValueError(f"{what}: list {a['list']!r} is not one of the pool lists {list(lists)}")
         if _field(a, "profile", what) != "BF16" or not _field(a, "resolved", what):
             raise ValueError(f"{what}: pool runs are resolved BF16 attempts (profile {a['profile']!r}, "
                              f"resolved {a['resolved']!r})")
@@ -181,6 +192,7 @@ def join_runs(attempts, scores, est_joules=None):
     info = {"n_runs": len(runs), "n_tasks": len({r["task_id"] for r in runs}),
             "flagged_excluded": dict(sorted(flagged_by_list.items())),
             "q4_rows_without_q3": sum(1 for aid, p in rows if p == AGREEMENT_PROBE and aid not in q3_ids),
+            "lists": list(lists), "n_eligible_without_q3": len(eligible - q3_ids),
             "n_runs_without_q4": sum(1 for r in runs if r["q4"] is None),
             "est_joules_given": est_joules is not None,
             "n_runs_without_est_joules": sum(1 for r in runs if r["est_joules_q4"] is None)}
@@ -232,13 +244,14 @@ def candidate_stats(runs, name, have_joules=True, min_runs=MIN_RUNS):
             "failed": failed, "not_run": not_run, "pass": not failed and not not_run}
 
 
-def choose_score(runs, have_joules=True, min_runs=MIN_RUNS):
+def choose_score(runs, have_joules=True, min_runs=MIN_RUNS, missing_q3=0):
     """docs/04's rule: the first candidate, in the frozen order, that passes every check.
 
     A candidate that fails a check is skipped. One that fails none but has a check that could not run
     (an est_joules value or a Q4_K_M row missing for any run, no task with enough runs) stops the walk:
     chosen stays None and decided is False, because a later candidate may only be chosen once the
-    earlier one has failed.
+    earlier one has failed. missing_q3 (join_runs' n_eligible_without_q3) above 0 leaves the rule
+    undecided whatever the candidates show, since every check ran on part of the pool.
     decided with chosen None answers H3 negatively and drops the stability arms before P1.
     """
     candidates = {c: candidate_stats(runs, c, have_joules, min_runs) for c in CANDIDATES}
@@ -252,6 +265,8 @@ def choose_score(runs, have_joules=True, min_runs=MIN_RUNS):
             decided = False
             verdict = f"incomplete: {c} fails no check but {', '.join(candidates[c]['not_run'])} did not run"
             break
+    if missing_q3:
+        chosen, decided, verdict = None, False, f"incomplete: {missing_q3} eligible pool attempts have no {PROBE} score row"
     return {"chosen": chosen, "decided": decided, "verdict": verdict, "order": list(CANDIDATES), "probe": PROBE,
             "agreement_probe": AGREEMENT_PROBE,
             "rule": {"max_abs_rho": MAX_ABS_RHO, "min_split_half": MIN_SPLIT_HALF, "min_probe_agreement": MIN_AGREEMENT,

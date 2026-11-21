@@ -20,7 +20,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from qtrace.common import read_jsonl
-from qtrace.p0d import CANDIDATES, CONFOUNDS, choose_score, did_test, join_runs, power, select_pairs
+from qtrace.p0d import CANDIDATES, CONFOUNDS, POOL_LISTS, choose_score, did_test, join_runs, power, select_pairs
 
 POWER_EFFECTS = (0.05, 0.10, 0.15, 0.20, 0.25, 0.30)
 POWER_SEEDS = (4, 8)  # docs/04: 4 seeded attempts per prefix, extra budget goes to 8
@@ -54,6 +54,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("attempts", nargs="+")
     ap.add_argument("--scores", default="outputs/p0d/scores.jsonl")
+    ap.add_argument("--lists", nargs="+", default=list(POOL_LISTS), help="the pool lists p0d_score_pool.py scored")
     ap.add_argument("--est-joules", help="outputs/p0a/est_joules.jsonl; omit until P0a's energy model exists")
     ap.add_argument("--continuations", help="continuation results, one row per (task, prefix, profile)")
     ap.add_argument("--power-rates", nargs=2, type=float, metavar=("BF16", "Q3"))
@@ -64,8 +65,8 @@ def main(argv=None):
 
     attempts = [r for path in args.attempts for r in read_jsonl(path)]
     joules = read_jsonl(args.est_joules) if args.est_joules else None
-    runs, info = join_runs(attempts, read_jsonl(args.scores), joules)
-    choice = choose_score(runs, have_joules=joules is not None)
+    runs, info = join_runs(attempts, read_jsonl(args.scores), joules, lists=args.lists)
+    choice = choose_score(runs, have_joules=joules is not None, missing_q3=info["n_eligible_without_q3"])
     pairs = select_pairs(runs, choice["chosen"]) if choice["chosen"] else None
     out = {**choice, "inputs": {**info, "scores": args.scores, "est_joules": args.est_joules}, "pairs": pairs}
     if args.power_rates and pairs and pairs["n_tasks"] >= 2:

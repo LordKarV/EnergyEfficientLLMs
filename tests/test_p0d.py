@@ -206,6 +206,30 @@ def test_partial_q4_or_joules_coverage_leaves_the_rule_undecided():
     assert out["chosen"] is None and not out["decided"]
 
 
+def test_missing_q3_rows_leave_the_rule_undecided():
+    # 240 eligible attempts, Q3_K_M rows for 120 of them: the rule must not decide on the scored half.
+    attempts, scores, joules = make_pool()
+    scored = {f"task{t}" for t in range(20)}
+    runs, info = join_runs(attempts, [s for s in scores if s["task_id"] in scored], joules)
+    assert info["n_eligible_without_q3"] == 120
+    out = choose_score(runs, missing_q3=info["n_eligible_without_q3"])
+    assert out["chosen"] is None and not out["decided"] and "120" in out["verdict"]
+    assert choose_score(runs)["chosen"] == "kl_mean"  # the same runs decide once nothing is missing
+
+
+def test_runs_on_other_lists_are_not_missing_and_never_scored():
+    attempts, scores, joules = make_pool(n_tasks=4, runs=3)
+    other = attempt("other", "task0", lst="pool_extra")
+    _, info = join_runs(attempts + [other], scores, joules)
+    assert info["n_eligible_without_q3"] == 0
+    _, info = join_runs(attempts + [other], scores, joules, lists=("pool200", "pool_extra"))
+    assert info["n_eligible_without_q3"] == 1
+    row = score_row("other", "task0", "Q3_K_M", {c: 1.0 for c in CANDIDATES},
+                    {"even": {c: 1.0 for c in CANDIDATES}, "odd": {c: 1.0 for c in CANDIDATES}}, 1.0)
+    with pytest.raises(ValueError, match="pool lists"):
+        join_runs(attempts + [other], scores + [row], joules)
+
+
 def boundary_pool(field, values):
     """One task with five runs. Every score ranks them 1..5, under both probes and in both halves,
     except `field` ("odd", "Q4_K_M" or "entropy"), which gives run k the value values[k]."""
