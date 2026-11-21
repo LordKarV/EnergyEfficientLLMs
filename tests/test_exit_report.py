@@ -229,7 +229,27 @@ def test_wall_seconds_p99_and_proposed_cap():
     assert w["censored"] is False
     rows[0]["end_reason"] = "infra_timeout"
     assert attempt_stats(rows)["vllm"]["wall_seconds"]["censored"] is True  # hits stop at the old cap
-    assert "Proposed cap" in render_markdown(attempt_stats(rows), probe=[], extras={}, projections={})
+    assert "Proposed infra cap" in render_markdown(attempt_stats(rows), probe=[], extras={}, projections={})
+
+
+def test_one_infra_cap_per_runtime_from_its_bf16_attempts():
+    # Owner's agent on PR #7 (answer 2): one cap per runtime, from that runtime's BF16 pilot attempts, applied
+    # to every profile on it, so no within-runtime profile comparison runs under two caps.
+    rows = [rec("llama.cpp", "submitted", 0, 600, wall_s=60.0 * i) for i in range(1, 101)]
+    rows += [rec("llama.cpp", "submitted", 0, 600, wall_s=1e5, profile="Q4_K_M")] * 5  # not BF16: no say
+    rows += [rec("llama.cpp", "infra_timeout", 0, 600, profile="Q3_K_M")]  # nor in the censoring flag
+    rows += [rec("vllm", "submitted", 0, 600, wall_s=600.0 * i) for i in range(1, 101)]
+    stats = attempt_stats(rows)
+    lc, vl = stats["llama.cpp"]["wall_seconds"], stats["vllm"]["wall_seconds"]
+    assert abs(lc["p99"] - 60 * 99.01) < 1e-9 and lc["censored"] is False and lc["profile"] == "BF16"
+    assert abs(vl["proposed_cap_s"] - 3 * 600 * 99.01) < 1e-9
+    md = render_markdown(stats, probe=[], extras={}, projections={})
+    assert "the larger runtime" not in md
+    assert f"| llama.cpp | {60 * 99.01 / 3600:.2f} h | {3 * 60 * 99.01 / 3600:.2f} h |" in md
+    assert "one cap per runtime, from its BF16 pilot attempts, for every profile on that runtime" in md
+    q4_only = attempt_stats([rec("llama.cpp", "submitted", 0, 600, profile="Q4_K_M")])
+    assert q4_only["llama.cpp"]["wall_seconds"]["p99"] is None
+    assert "| llama.cpp | n/a (no BF16 pilot attempts) | n/a |" in render_markdown(q4_only, [], {}, {})
 
 
 def test_wall_clock_share_by_profile_and_concurrency():

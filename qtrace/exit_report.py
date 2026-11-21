@@ -33,6 +33,9 @@ NOT_INCLUDED = ["KL scoring (projected separately below, on its own machine)",
 HERO_PREFIX_HIT = 0.92
 WALL_HIT_FLAG = 0.02  # 04: the owner revisits the wall-clock cap if any runtime/profile/concurrency cell exceeds it
 WALL_CAP_FACTOR = 3  # 04: the infra cap is about 3x the pilot's 99th-percentile attempt time
+# Owner's agent on PR #7 (answer 2): one cap per runtime, from its BF16 pilot attempts, for every profile on it,
+# so a within-runtime profile comparison never runs under two caps.
+CAP_PROFILE = "BF16"
 # 04 (Model and decoding): pinned per request in both runtimes and logged; server defaults are never relied on.
 SAMPLER = {"temperature": 0.6, "top_p": 0.95, "top_k": 20, "min_p": 0.0, "presence_penalty": 0.0,
            "repetition_penalty": 1.0}
@@ -82,10 +85,12 @@ def _p99(xs):
 
 
 def _wall(scored):
-    p99 = _p99([r["wall_seconds"] for r in scored])
+    """The runtime's infra cap: WALL_CAP_FACTOR x p99 over its CAP_PROFILE attempts only."""
+    base = [r for r in scored if r["profile"] == CAP_PROFILE]
+    p99 = _p99([r["wall_seconds"] for r in base])
     # An infra_timeout attempt stopped at the old cap, so its true time is longer and p99 is a lower bound.
-    return {"p99": p99, "proposed_cap_s": None if p99 is None else WALL_CAP_FACTOR * p99,
-            "censored": any(r["end_reason"] == "infra_timeout" for r in scored)}
+    return {"profile": CAP_PROFILE, "p99": p99, "proposed_cap_s": None if p99 is None else WALL_CAP_FACTOR * p99,
+            "censored": any(r["end_reason"] == "infra_timeout" for r in base)}
 
 
 def _wall_cells(scored):
@@ -383,17 +388,16 @@ def _md_wall(stats):
     for rt, s in stats.items():
         lines += [f"| {rt} | {c['profile']} | {c['concurrency']} | {c['n']} | {_pct(c['share'])}"
                   f"{' **over**' if c['over_2pct'] else ''} |" for c in s["wall_clock_by_cell"]]
-    lines += ["", "| runtime | p99 attempt time | 3 x p99 |", "|---|---|---|"]
-    caps = []
+    lines += ["", (f"Proposed infra cap for P0: one cap per runtime, from its {CAP_PROFILE} pilot attempts, for "
+              "every profile on that runtime."), "", f"| runtime | {CAP_PROFILE} p99 attempt time | 3 x p99 |",
+              "|---|---|---|"]
     for rt, s in stats.items():
         w = s["wall_seconds"]
         if w["p99"] is None:
+            lines.append(f"| {rt} | n/a (no {CAP_PROFILE} pilot attempts) | n/a |")
             continue
-        caps.append(w["proposed_cap_s"])
         note = " (lower bound: some attempts hit the old cap)" if w["censored"] else ""
         lines.append(f"| {rt} | {w['p99'] / 3600:.2f} h{note} | {w['proposed_cap_s'] / 3600:.2f} h |")
-    if caps:
-        lines += ["", f"Proposed cap for P0 (the larger runtime's 3 x p99): {max(caps) / 3600:.2f} h."]
     return lines
 
 
