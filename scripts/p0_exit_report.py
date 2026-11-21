@@ -3,11 +3,16 @@
     python scripts/p0_exit_report.py outputs/attempts/*.jsonl --probe outputs/probe/probe.jsonl \
         --extras outputs/p0/pilot_extras.json
 
-The extras JSON holds what attempt records can't: {"rates": {runtime: {"decode_tok_s", "prefill_tok_s"}},
-"peak_gpu_gib": {runtime: GiB}, "energy_counter": {"readable", "monotonic", "update_period_s",
-"idle_w": {...}}, "replay_match_rate": float, "sampler_echo_ok": {runtime: bool},
-"per_turn_energy_ok": bool, "concurrency": {"containers", "vcpus_per_container"}}.
-Missing keys are listed in the report.
+The extras JSON holds what attempt records can't:
+{"rates": {runtime: {profile: {"decode_tok_s", "prefill_tok_s"}}},          # synthetic load, 64K x 16
+ "rates_128k_x8": {runtime: {profile: {"decode_tok_s", "prefill_tok_s"}}},  # synthetic load, 128K x 8
+ "peak_gpu_gib": {runtime: GiB}, "energy_counter": {"readable", "monotonic", "update_period_s", "idle_w": {...}},
+ "replay_match_rate": float, "sampler_echo_ok": {runtime: bool}, "per_turn_energy_ok": bool,
+ "concurrency": {"containers", "vcpus_per_container"},
+ "kl_scoring": {"machine", "seconds_per_run", "tokens_per_run"}}             # optional; defaults to PR #11's M5 Pro
+runtime is vllm or llama.cpp, profile one of BF16 Q8_0 Q4_K_M Q3_K_M Q4_K_M_gate8; any other rates shape
+raises. Missing keys are listed in the report. Without a synthetic 64K x 16 rate, the rate the pilot
+records reached is used and marked "pilot"; 128K x 8 has no such fallback.
 """
 
 import argparse

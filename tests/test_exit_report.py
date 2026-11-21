@@ -7,20 +7,29 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pytest
 
-from qtrace.exit_report import attempt_stats, project_hours, render_markdown
+from qtrace.exit_report import attempt_stats, project_hours, projections, render_markdown
+
+SAMPLER = {"temperature": 0.6, "top_p": 0.95, "top_k": 20, "min_p": 0.0, "presence_penalty": 0.0,
+           "repetition_penalty": 1.0}
 
 
 def rec(runtime, end_reason, t0, t1, out=1000, unc=3000, cached=20000, server_cached=20000, malformed=None,
-        tool_s=60.0, cpu_s=30.0, gen_s=120.0, profile="BF16", touched=False):
-    return {"runtime": runtime, "end_reason": end_reason, "resolved": end_reason == "submitted",
-            "grading": {"test_files_touched": touched},
+        tool_s=60.0, cpu_s=30.0, gen_s=120.0, profile="BF16", touched=False, wall_s=None, concurrency=14):
+    # One generation window per attempt: prefill over its first second, decode for the rest of gen_s.
+    turn = {"turn": 0, "output_tokens": out, "input_uncached": unc, "input_cached": cached,
+            "gen_t_start": t0, "gen_t_first_token": t0 + 1.0, "gen_t_end": t0 + gen_s}
+    return {"attempt_id": f"{runtime}-{profile}-{t0}-{t1}", "seed": 7, "sampler": dict(SAMPLER),
+            "runtime": runtime, "end_reason": end_reason,
+            "resolved": end_reason == "submitted",
+            "grading": {"test_files_touched": touched}, "per_turn": [turn],
+            "wall_seconds": t1 - t0 if wall_s is None else wall_s,
             "tokens": {"output": out, "input_uncached": unc, "input_cached": cached,
                        "server_reported_cached": server_cached},
             "malformed": malformed or {"misnested_tag": 0, "wrong_name": 0, "text_after_call": 0,
                                        "truncated_call": 0, "no_call_no_answer": 0},
             "energy": {"t_start": t0, "t_end": t1}, "tool_seconds": tool_s, "container_cpu_seconds": cpu_s,
             "gen_seconds": gen_s,
-            "turns": 10, "tool_calls": 10, "profile": profile, "concurrency": 14}
+            "turns": 10, "tool_calls": 10, "profile": profile, "concurrency": concurrency}
 
 
 def test_attempt_stats_rates_and_shares():
@@ -75,18 +84,19 @@ def test_realized_cache_misses_raise_the_projection():
 
 
 def test_projections_by_profile_with_fallback_and_sub_run():
-    from qtrace.exit_report import projections
-
     rows = [rec("llama.cpp", "submitted", 0, 600), rec("vllm", "submitted", 0, 600)]
     stats = attempt_stats(rows)
     extras = {"rates": {"llama.cpp": {"BF16": {"decode_tok_s": 400, "prefill_tok_s": 4000},
                                       "Q4_K_M": {"decode_tok_s": 600, "prefill_tok_s": 5000}}}}
-    p = projections(stats, extras)
-    assert p["P0a"]["profiles"]["Q3_K_M"]["rate_from"] == "Q4_K_M"
-    assert p["P0a"]["profiles"]["Q8_0"]["rate_from"] == "BF16"
-    assert p["P0a"]["upper_hours"] > p["P0a"]["point_hours"]  # the 600-attempt top-up
-    assert "P0b" not in p and any("vllm BF16" in x for x in p["not_included"])
-    assert p["energy_sub_run"]["serial"] and abs(p["energy_sub_run"]["point_hours"] - 150 * (120 + 60 + 45) / 3600) < 1e-9
+    steps = projections(stats, extras)["scenarios"]["64K x 16"]["steps"]
+    assert steps["P0a"]["profiles"]["Q3_K_M"]["rate_from"] == "Q4_K_M"
+    assert steps["P0a"]["profiles"]["Q8_0"]["rate_from"] == "BF16"
+    assert steps["P0a"]["profiles"]["BF16"]["rate_source"] == "synthetic"
+    assert steps["P0a"]["upper_hours"] > steps["P0a"]["point_hours"]  # the 600-attempt top-up
+    # No synthetic vLLM rate: P0b uses the rate its pilot records reached, and says so.
+    assert steps["P0b"]["profiles"]["BF16"]["rate_source"] == "pilot"
+    sub = steps["energy_sub_run"]
+    assert sub["serial"] and abs(sub["point_hours"] - 150 * (120 + 60 + 45) / 3600) < 1e-9
 
 
 def test_null_server_cached_counts_as_not_reported():
@@ -145,3 +155,146 @@ def test_unknown_runtime_or_profile_raises(field, value):
     r[field] = value
     with pytest.raises(ValueError, match="not in"):
         attempt_stats([r])
+
+
+RATE = {"decode_tok_s": 500.0, "prefill_tok_s": 5000.0}
+
+
+def test_rates_are_printed_and_derived_from_the_pilot_records():
+    # Audit gap 1. Two overlapping BF16 attempts: prefill windows [0, 1) and [0.5, 1.5) cover 1.5 s,
+    # decode windows [1, 11) and [1.5, 11.5) cover 10.5 s.
+    rows = [rec("llama.cpp", "submitted", 0, 600, out=500, unc=1000, gen_s=11.0),
+            rec("llama.cpp", "submitted", 0.5, 600, out=500, unc=1000, gen_s=11.0)]
+    pilot = attempt_stats(rows)["llama.cpp"]["pilot_rates"]["BF16"]
+    assert abs(pilot["decode_tok_s"] - 1000 / 10.5) < 1e-9
+    assert abs(pilot["prefill_tok_s"] - 2000 / 1.5) < 1e-9
+    # The server reported 1,000 fewer cached tokens per attempt than the ideal split, so it prefilled twice the
+    # ideal count in the same windows.
+    for r in rows:
+        r["tokens"]["server_reported_cached"] = 19000
+    assert abs(attempt_stats(rows)["llama.cpp"]["pilot_rates"]["BF16"]["prefill_tok_s"] - 4000 / 1.5) < 1e-9
+    stats = attempt_stats(rows)
+    extras = {"rates": {"llama.cpp": {"Q4_K_M": {"decode_tok_s": 812.5, "prefill_tok_s": 9100.0}}}}
+    md = render_markdown(stats, probe=[], extras=extras, projections=projections(stats, extras))
+    assert "| llama.cpp | Q4_K_M | synthetic 64K x 16 | 812.5 | 9100.0 |" in md
+    assert f"| llama.cpp | BF16 | pilot | {1000 / 10.5:.1f} | {4000 / 1.5:.1f} |" in md
+
+
+def test_rates_in_the_per_runtime_shape_raise():
+    # Audit gap 2: the old docstring shape {runtime: {decode_tok_s, prefill_tok_s}} has no profile level, so
+    # every step used to drop silently to "not included".
+    stats = attempt_stats([rec("llama.cpp", "submitted", 0, 600)])
+    with pytest.raises(ValueError, match=r"rates\[runtime\]\[profile\]"):
+        projections(stats, {"rates": {"llama.cpp": {"decode_tok_s": 400, "prefill_tok_s": 4000}}})
+    script = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts", "p0_exit_report.py")
+    with open(script) as f:
+        doc = f.read()
+    assert '{"rates": {runtime: {profile: {"decode_tok_s", "prefill_tok_s"}}}' in doc
+
+
+def test_wall_seconds_p99_and_proposed_cap():
+    # Audit gap 3: 100 scored attempts of 1..100 minutes; an error row's wall time stays out.
+    rows = [rec("vllm", "submitted", 0, 600, wall_s=60.0 * i) for i in range(1, 101)]
+    rows.append(rec("vllm", "error", 0, 600, wall_s=1e6))
+    rows[-1]["grading"] = None
+    w = attempt_stats(rows)["vllm"]["wall_seconds"]
+    assert abs(w["p99"] - 60 * 99.01) < 1e-9  # linear interpolation, as numpy.percentile
+    assert abs(w["proposed_cap_s"] - 3 * 60 * 99.01) < 1e-9
+    assert w["censored"] is False
+    rows[0]["end_reason"] = "infra_timeout"
+    assert attempt_stats(rows)["vllm"]["wall_seconds"]["censored"] is True  # hits stop at the old cap
+    assert "Proposed cap" in render_markdown(attempt_stats(rows), probe=[], extras={}, projections={})
+
+
+def test_wall_clock_share_by_profile_and_concurrency():
+    # Audit gap 4: one cell at 2.5% is over the 2% check while the runtime as a whole (2 of 150) is not.
+    rows = ([rec("llama.cpp", "infra_timeout", 0, 600)] + [rec("llama.cpp", "submitted", 0, 600)] * 39
+            + [rec("llama.cpp", "submitted", 0, 600, profile="Q4_K_M")] * 10
+            + [rec("llama.cpp", "infra_timeout", 0, 600, concurrency=16)]
+            + [rec("llama.cpp", "submitted", 0, 600, concurrency=16)] * 99)
+    s = attempt_stats(rows)["llama.cpp"]
+    assert s["wall_clock_check"]["over_2pct"] is False
+    cells = {(c["profile"], c["concurrency"]): c for c in s["wall_clock_by_cell"]}
+    assert cells[("BF16", 14)]["share"] == 1 / 40 and cells[("BF16", 14)]["over_2pct"] is True
+    assert cells[("BF16", 16)]["share"] == 1 / 100 and cells[("BF16", 16)]["over_2pct"] is False
+    assert cells[("Q4_K_M", 14)]["n"] == 10 and cells[("Q4_K_M", 14)]["share"] == 0.0
+    md = render_markdown({"llama.cpp": s}, probe=[], extras={}, projections={})
+    assert "| llama.cpp | BF16 | 14 | 40 | 2.5% **over** |" in md
+
+
+def test_projection_scenarios_64k_x16_and_128k_x8():
+    # Audit gap 5: tool time is shared over the scenario's slots (16 or 8), not the pilot's 14, and 128K x 8
+    # needs its own measured rates: nothing is scaled from 64K.
+    stats = attempt_stats([rec("vllm", "submitted", 0, 600), rec("llama.cpp", "submitted", 0, 600),
+                           rec("llama.cpp", "submitted", 0, 600, profile="Q4_K_M")])
+    s = stats["vllm"]
+    p = projections(stats, {"rates": {"vllm": {"BF16": RATE}}})
+    p64, p128 = p["scenarios"]["64K x 16"], p["scenarios"]["128K x 8"]
+    assert p64["slots"] == 16 and p128["slots"] == 8
+    assert p64["steps"]["P0b"]["point_hours"] == project_hours(s, RATE, 4800, 16)["hours"]
+    assert "P0b" not in p128["steps"] and any("rates_128k_x8" in x and "vllm BF16" in x for x in p128["missing"])
+    md = render_markdown(stats, probe=[], extras={}, projections=p)
+    assert "| partial total (see below) |" in md.split("### 128K x 8")[1]
+    assert "| total |" in md.split("### 128K x 8")[0].split("### 64K x 16")[1]
+    half = {"decode_tok_s": 250.0, "prefill_tok_s": 2500.0}
+    p128 = projections(stats, {"rates": {"vllm": {"BF16": RATE}}, "rates_128k_x8": {"vllm": {"BF16": half}}})
+    assert p128["scenarios"]["128K x 8"]["steps"]["P0b"]["point_hours"] == project_hours(s, half, 4800, 8)["hours"]
+    md = render_markdown(stats, probe=[], extras={}, projections=p128)
+    assert "### 64K x 16" in md and "### 128K x 8" in md
+
+
+def test_bf16_throughput_ratio_for_the_optional_p0b_rule():
+    # Audit gap 6.
+    stats = attempt_stats([rec("vllm", "submitted", 0, 600), rec("llama.cpp", "submitted", 0, 600)])
+    extras = {"rates": {"vllm": {"BF16": {"decode_tok_s": 800.0, "prefill_tok_s": 10000.0}},
+                        "llama.cpp": {"BF16": {"decode_tok_s": 400.0, "prefill_tok_s": 4000.0}}}}
+    p = projections(stats, extras)
+    r = p["bf16_throughput_ratio"]
+    assert r["decode"] == 0.5 and r["prefill"] == 0.4
+    assert r["sources"] == {"llama.cpp": "synthetic", "vllm": "synthetic"}
+    assert "llama.cpp BF16 / vLLM BF16: decode 0.50, prefill 0.40" in render_markdown(stats, [], extras, p)
+
+
+def test_kl_scoring_hours_on_the_stated_machine():
+    # Audit gap 7: 2 of 4 vLLM attempts resolve, each 4,000 tokens long (output + ideal uncached input).
+    rows = [rec("vllm", "submitted", 0, 600)] * 2 + [rec("vllm", "turn_limit", 0, 600)] * 2
+    rows += [rec("llama.cpp", "submitted", 0, 600)]
+    k = projections(attempt_stats(rows), {})["kl_scoring"]
+    assert k["seconds_per_run"] == 43.0 and k["tokens_per_run"] == 16500 and "M5 Pro" in k["machine"]
+    p0b = k["jobs"]["P0b"]
+    assert p0b["runs"] == 2400 and abs(p0b["point_hours"] - 2400 * 43 * 4000 / 16500 / 3600) < 1e-9
+    p0a = k["jobs"]["P0a"]  # BF16 against each of the 4 quantized profiles, on every P0a BF16 trajectory
+    assert p0a["pairs"] == 4 and abs(p0a["upper_hours"] - 900 * 4 * 43 * 4000 / 16500 / 3600) < 1e-9
+    ec2 = projections(attempt_stats(rows), {"kl_scoring": {"machine": "g6e.16xlarge", "seconds_per_run": 20.0,
+                                                           "tokens_per_run": 16500}})
+    assert ec2["kl_scoring"]["machine"] == "g6e.16xlarge"
+    assert abs(ec2["kl_scoring"]["jobs"]["P0b"]["point_hours"] - 2400 * 20 * 4000 / 16500 / 3600) < 1e-9
+    md = render_markdown(attempt_stats(rows), [], {}, ec2)
+    assert "## KL scoring" in md and "g6e.16xlarge" in md
+
+
+def test_resolve_rates_overall_and_excluding_flagged():
+    # Audit gap 8 (tripwire amendment): 2 of 4 resolve, one of them flagged; excluding it, 1 of 3.
+    rows = [rec("llama.cpp", "submitted", 0, 600, touched=True), rec("llama.cpp", "submitted", 0, 600),
+            rec("llama.cpp", "turn_limit", 0, 600), rec("llama.cpp", "turn_limit", 0, 600),
+            rec("llama.cpp", "submitted", 0, 600, profile="Q4_K_M")]
+    s = attempt_stats(rows)["llama.cpp"]
+    assert s["resolve_rate"] == 0.6 and s["resolve_rate_excluding_flagged"] == 0.5
+    assert s["resolve_by_profile"]["BF16"] == {"overall": 0.5, "excluding_flagged": 1 / 3}
+    assert s["resolve_by_profile"]["Q4_K_M"] == {"overall": 1.0, "excluding_flagged": 1.0}
+    md = render_markdown({"llama.cpp": s}, probe=[], extras={}, projections={})
+    assert "| llama.cpp | BF16 | 25.0% | 50.0% | 33.3% |" in md
+
+
+def test_sampler_and_seed_check():
+    # Audit gap 9: a server default leaking in (temperature 0.7, top_k missing) or an unset seed is caught.
+    rows = [rec("vllm", "submitted", i, 600) for i in range(5)]
+    assert attempt_stats(rows)["vllm"]["sampler_check"] == {"ok": True, "n_mismatch": 0, "n_seed_missing": 0,
+                                                            "examples": []}
+    rows[1]["sampler"] = {**SAMPLER, "temperature": 0.7}
+    del rows[2]["sampler"]["top_k"]
+    rows[3]["seed"] = None
+    c = attempt_stats(rows)["vllm"]["sampler_check"]
+    assert c["ok"] is False and c["n_mismatch"] == 2 and c["n_seed_missing"] == 1
+    assert c["examples"] == [rows[1]["attempt_id"], rows[2]["attempt_id"], rows[3]["attempt_id"]]
+    assert "| vllm | 2 **FAIL** | 1 **FAIL** |" in render_markdown(attempt_stats(rows), [], {}, {})
