@@ -423,12 +423,24 @@ def _cheapest(cands, est):
     return min(range(len(cands)), key=lambda i: (est[i], cands[i]["turns"], cands[i]["attempt_id"]))
 
 
+def flagged(rec):
+    """The grader's test-file tripwire (docs/04), read strictly as in qtrace/p0d.py.
+
+    grading.test_files_touched is a required bool of every attempt record: a missing key raises KeyError and
+    a null or 0/1 raises TypeError, instead of silently counting the run as unflagged.
+    """
+    v = rec["grading"]["test_files_touched"]
+    if not isinstance(v, bool):
+        raise TypeError(f"attempt {rec.get('attempt_id')!r}: grading.test_files_touched must be a bool, got {v!r}")
+    return v
+
+
 def pick_agreement(records, est_a, est_b, min_candidates=MIN_CANDIDATES):
     """How often two energy estimators pick the same cheapest run per task, and their mean within-task Spearman.
 
     Candidates are the runs the P1 arms pick from: BF16 runs (records from pool_records) that resolved
-    and whose grader did not flag test-file edits (grading.test_files_touched, a required field read
-    strictly), grouped by task. Tasks with
+    and whose grader did not flag test-file edits (grading.test_files_touched, read through
+    flagged), grouped by task. Tasks with
     fewer than min_candidates are skipped; fewer candidates agree more often by chance, so a looser
     pool would bias the 85% check toward agreement. A pick breaks ties by fewer turns, then by
     attempt id (deterministic here; the arms break remaining ties with their seed). Spearman uses
@@ -438,7 +450,7 @@ def pick_agreement(records, est_a, est_b, min_candidates=MIN_CANDIDATES):
         raise ValueError(f"min_candidates must be an integer >= 2, got {min_candidates!r}")
     by_task = defaultdict(list)
     for r in records:
-        if r["profile"] == "BF16" and r["resolved"] and not r["grading"]["test_files_touched"]:
+        if r["profile"] == "BF16" and r["resolved"] and not flagged(r):
             by_task[r["task_id"]].append(r)
     same, rhos = [], []
     for c in by_task.values():

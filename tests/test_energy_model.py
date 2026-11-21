@@ -538,6 +538,10 @@ def test_pick_agreement_reads_the_tripwire_strictly():
     by_out = lambda r: estimate_attempt_joules(r, {"coef": {"output": 1.0}})
     with pytest.raises(KeyError):
         pick_agreement(pool, by_out, by_out, min_candidates=2)
+    for bad in (None, 0, 1, "false"):  # a null from a grading error, or a 0/1, is not a bool and must not count
+        pool[1]["grading"]["test_files_touched"] = bad
+        with pytest.raises(TypeError, match="must be a bool"):
+            pick_agreement(pool, by_out, by_out, min_candidates=2)
 
 
 def test_cli_writes_model_and_estimates(tmp_path):
