@@ -233,15 +233,22 @@ def test_wall_seconds_p99_and_proposed_cap():
 
 
 def test_wall_clock_share_by_profile_and_concurrency():
-    # Audit gap 4: one cell at 2.5% is over the 2% check while the runtime as a whole (2 of 150) is not.
+    # Audit gap 4: one cell at 2.5% is over the 2% check while the runtime as a whole (3 of 200) is not.
     rows = ([rec("llama.cpp", "infra_timeout", 0, 600)] + [rec("llama.cpp", "submitted", 0, 600)] * 39
             + [rec("llama.cpp", "submitted", 0, 600, profile="Q4_K_M")] * 10
             + [rec("llama.cpp", "infra_timeout", 0, 600, concurrency=16)]
-            + [rec("llama.cpp", "submitted", 0, 600, concurrency=16)] * 99)
+            + [rec("llama.cpp", "submitted", 0, 600, concurrency=16)] * 99
+            + [rec("llama.cpp", "infra_timeout", 0, 600, profile="Q3_K_M")]
+            + [rec("llama.cpp", "submitted", 0, 600, profile="Q3_K_M")] * 49)
+    error = rec("llama.cpp", "error", 0, 600)
+    error["grading"] = None
+    rows.append(error)  # an infra fault stays out of its cell, or it would dilute the BF16/14 share
     s = attempt_stats(rows)["llama.cpp"]
     assert s["wall_clock_check"]["over_2pct"] is False
     cells = {(c["profile"], c["concurrency"]): c for c in s["wall_clock_by_cell"]}
-    assert cells[("BF16", 14)]["share"] == 1 / 40 and cells[("BF16", 14)]["over_2pct"] is True
+    assert cells[("BF16", 14)]["n"] == 40 and cells[("BF16", 14)]["share"] == 1 / 40
+    assert cells[("BF16", 14)]["over_2pct"] is True
+    assert cells[("Q3_K_M", 14)]["share"] == 0.02 and cells[("Q3_K_M", 14)]["over_2pct"] is False  # strictly above
     assert cells[("BF16", 16)]["share"] == 1 / 100 and cells[("BF16", 16)]["over_2pct"] is False
     assert cells[("Q4_K_M", 14)]["n"] == 10 and cells[("Q4_K_M", 14)]["share"] == 0.0
     md = render_markdown({"llama.cpp": s}, probe=[], extras={}, projections={})
@@ -267,8 +274,9 @@ def test_projection_scenarios_64k_x16_and_128k_x8():
     extras = {"rates": rates, "rates_128k_x8": {"vllm": {"BF16": half}}}
     p128 = projections(stats, extras)
     assert p128["scenarios"]["128K x 8"]["steps"]["P0b"]["point_hours"] == project_hours(s, half, 4800, 8)["hours"]
-    md = render_markdown(stats, probe=[], extras={}, projections=p128)
+    md = render_markdown(stats, probe=[], extras=extras, projections=p128)
     assert "### 64K x 16" in md and "### 128K x 8" in md
+    assert "| vllm | BF16 | synthetic 128K x 8 | 250.0 | 2500.0 |" in md
 
 
 def test_bf16_throughput_ratio_for_the_optional_p0b_rule():
@@ -328,7 +336,9 @@ def test_sampler_and_seed_check():
     rows[1]["sampler"] = {**SAMPLER, "temperature": 0.7}
     del rows[2]["sampler"]["top_k"]
     rows[3]["seed"] = None
+    rows[4]["end_reason"], rows[4]["grading"] = "error", None  # sampled with the same request, so it counts
+    rows[4]["sampler"] = {**SAMPLER, "top_p": 1.0}
     c = attempt_stats(rows)["vllm"]["sampler_check"]
-    assert c["ok"] is False and c["n_mismatch"] == 2 and c["n_seed_missing"] == 1
-    assert c["examples"] == [rows[1]["attempt_id"], rows[2]["attempt_id"], rows[3]["attempt_id"]]
-    assert "| vllm | 2 **FAIL** | 1 **FAIL** |" in render_markdown(attempt_stats(rows), [], {}, {})
+    assert c["ok"] is False and c["n_mismatch"] == 3 and c["n_seed_missing"] == 1
+    assert c["examples"] == [rows[i]["attempt_id"] for i in (1, 2, 4, 3)]  # mismatches first, then seeds
+    assert "| vllm | 3 **FAIL** | 1 **FAIL** |" in render_markdown(attempt_stats(rows), [], {}, {})
