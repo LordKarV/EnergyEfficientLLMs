@@ -18,6 +18,13 @@
           cross-check). Only Q4_K_M rows are used, so a P0c run file holding every llama.cpp profile can be
           passed as is; the other profiles' rows are skipped and counted per profile in
           batched.n_skipped_other_profiles.
+--idle:   optional JSON of the idle readings in W, {profile: {none_before, loaded_before, none_after,
+          loaded_after}} (no process and llama-server loaded, before and after the sub-run), copied to
+          energy_model.json["idle_readings_w"] after validation; null when not given.
+
+The --subrun attempts of every profile must cover the same task_ids (04 P0a); the script stops otherwise.
+Energy is GPU only (04, energy boundary): energy_model.json says so in "energy_boundary", and each
+profile entry gives container_cpu_seconds over its fitted sub-run attempts.
 
 Writes energy_model.json ({"profiles": {...}, "fewest_joules_fallback": bool, ...}) and
 est_joules.jsonl (one {attempt_id, est_joules_q4, est_gen_joules_q4} per pool attempt, written even under
@@ -39,6 +46,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from qtrace.common import read_jsonl, write_jsonl
 from qtrace.energy_model import (
     AGREEMENT_MIN,
+    ENERGY_BOUNDARY,
     FALLBACK_MAX_REL_ERR,
     MIN_CANDIDATES,
     POOL_LISTS,
@@ -50,6 +58,7 @@ from qtrace.energy_model import (
     estimate_batched_joules,
     fit_attempts,
     fit_batched,
+    idle_readings,
     pick_agreement,
     pool_records,
     profile_report,
@@ -66,6 +75,7 @@ def main():
     ap.add_argument("--pool", nargs="+", required=True)
     ap.add_argument("--windows")
     ap.add_argument("--window-attempts", nargs="+")
+    ap.add_argument("--idle", help="JSON of idle readings in W per profile (see the module docstring)")
     ap.add_argument("--out", default="outputs/p0a")
     ap.add_argument("--min-candidates", type=int, default=MIN_CANDIDATES)
     ap.add_argument("--lists", nargs="+", default=list(POOL_LISTS), help="pool lists to estimate")
@@ -74,6 +84,10 @@ def main():
     args = ap.parse_args()
     if bool(args.windows) != bool(args.window_attempts):
         ap.error("--windows and --window-attempts go together")
+    idle = None
+    if args.idle:
+        with open(args.idle) as f:
+            idle = idle_readings(json.load(f))
 
     by_profile, excluded = fit_attempts([r for p in args.subrun for r in read_jsonl(p)])
     if RANK_PROFILE not in by_profile:
@@ -109,6 +123,8 @@ def main():
         batched = {**fit, "agreement_with_c1": agree, "below_85pct": None if share is None else share < AGREEMENT_MIN}
 
     report = {
+        "energy_boundary": ENERGY_BOUNDARY,
+        "idle_readings_w": idle,
         "ranking": {"profile": RANK_PROFILE, "target": RANK_TARGET, "quantity": "whole_attempt_raw_joules",
                     "idle_w": idle_w, "provisional": True,
                     "rule": "generation-window model + idle_w x tool_seconds; provisional until the owner "
@@ -132,15 +148,17 @@ def main():
     write_jsonl(os.path.join(args.out, "est_joules.jsonl"),
                 [{"attempt_id": aid, "est_joules_q4": j, "est_gen_joules_q4": q4_gen[aid]} for aid, j in q4.items()])
 
-    print(f"{'profile':8} {'target':16} {'nested':>7} {'loao':>7} {'pairs':>6}  terms")
+    print(f"energy: {ENERGY_BOUNDARY}; cpu_s = median container CPU-seconds per fitted sub-run attempt")
+    print(f"{'profile':8} {'target':16} {'cpu_s':>7} {'nested':>7} {'loao':>7} {'pairs':>6}  terms")
     for p, rep in profiles.items():
+        cpu_s = f"{rep['container_cpu_seconds']['median']:.1f}"
         for t in TARGETS:
             r = rep[t]
             if "error" in r:
-                print(f"{p:8} {t:16} not fitted: {r['error']}")
+                print(f"{p:8} {t:16} {cpu_s:>7} not fitted: {r['error']}")
                 continue
             pairs = f"{r['pairs']['n_correct']}/{r['pairs']['n_pairs']}"
-            print(f"{p:8} {t:16} {pct(r['cv']['nested_loao']):>7} {pct(r['cv']['loao']):>7} {pairs:>6}  "
+            print(f"{p:8} {t:16} {cpu_s:>7} {pct(r['cv']['nested_loao']):>7} {pct(r['cv']['loao']):>7} {pairs:>6}  "
                   + "+".join(r["terms"]))
     print(f"fewest_joules_fallback: {model['fallback']} ({RANK_PROFILE} {RANK_TARGET} nested LOAO "
           f"{pct(model['cv']['nested_loao'])} vs {pct(FALLBACK_MAX_REL_ERR)})")
