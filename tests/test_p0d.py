@@ -295,7 +295,7 @@ def runs_in_orders(field, orders):
     ("q4", [(2, 3, 1), (1, 2, 3, 4, 5), (1, 2, 3, 4, 5)], "probe_agreement", 0.5),
     # rhos -1/2, 1/2, 1: the float mean is 0.33333333333333326
     ("odd", [(2, 3, 1), (1, 3, 5, 2, 4), (1, 2, 3, 4, 5)], "split_half", 1 / 3),
-    # rhos 0.7, 0.9, 0.8 and their negatives
+    # rhos 0.7, 0.9, 0.8 and their negatives; the float mean is 0.7999999999999998, inside the bound either way
     ("turns", [(1, 2, 4, 5, 3), (1, 2, 3, 5, 4), (1, 2, 4, 3)], "turns", 0.8),
     ("turns", [(5, 4, 2, 1, 3), (5, 4, 3, 1, 2), (4, 3, 1, 2)], "turns", -0.8),
 ])
@@ -305,6 +305,16 @@ def test_rule_thresholds_hold_exactly_at_the_boundary(field, orders, check, mean
             "turns": c["against"]["turns"]}[check]
     assert stat["n_tasks"] == 3 and stat["mean"] == pytest.approx(mean, abs=1e-12)
     assert c["checks"][check] is True
+
+
+@pytest.mark.parametrize("mean", [0.8000000000000002, -0.8000000000000002])
+def test_confound_threshold_tolerates_a_mean_a_few_ulps_past_0_8(monkeypatch, mean):
+    # No 3- to 5-run rho lattice point found lands above 0.8 with this module's Spearman (the triple above
+    # averages to 0.7999999999999998), so the mean is planted directly.
+    from qtrace import p0d
+    real = p0d.within_task
+    monkeypatch.setattr(p0d, "within_task", lambda g, m: {**real(g, m), "mean": mean})
+    assert candidate_stats(runs_in_orders("turns", [(1, 2, 3)] * 3), "kl_mean")["checks"]["turns"] is True
 
 
 def test_tasks_below_three_runs_count_for_pairs_but_not_for_the_rule():
@@ -524,6 +534,15 @@ def test_pair_drop_rate_is_over_every_selected_pair():
     assert out["pair_tasks_only_other_profiles"] == ["t0"] and out["decision"] == "incomplete"
 
 
+def test_other_profile_replay_drops_leave_the_primary_test_unchanged():
+    # The reviewer's case: a secondary Q4_K_M run with failed replays of its own on t0-t5.
+    pairs, rows = frozen_pairs(30), did_rows(30, 4, 0.6, 0.4)
+    q4 = [{**r, "profile": "Q4_K_M", "replay_valid": r["task_id"] not in {f"t{i}" for i in range(6)}} for r in rows]
+    alone, merged = did_test(rows, pairs=pairs), did_test(rows + q4, pairs=pairs)
+    assert merged["rows_ignored_by_profile"] == {"Q4_K_M": len(q4)}
+    assert {**merged, "rows_ignored_by_profile": {}} == alone and alone["n_tasks"] == 30
+
+
 def test_continuations_must_name_the_frozen_pair():
     pairs, rows = frozen_pairs(10), did_rows(10, 4, 0.6, 0.4)
     assert did_test(rows, pairs=pairs)["adjusted"]["estimate"] is not None  # covariates come from the pairs
@@ -541,6 +560,13 @@ def test_power_rises_with_the_effect():
     assert by_effect[0.0] < 0.15 and by_effect[0.10] > 0.9 and out["mde_80"] == 0.10
     paired = power([0.9, 0.5], [0.8, 0.3], n_tasks=10, seeds=4, effects=(0.10,), n_sim=200, n_boot=500)
     assert paired["power"][0]["power"] < 0.5 and paired["mde_80"] is None
+
+
+def test_power_counts_bootstrap_means_of_exactly_zero():
+    # At 4 seeds every DiD is a multiple of 1/4, so many bootstrap means are exactly 0. Float weights left some
+    # at +1e-17, outside "<= 0", and gave a null rate of 0.0525 instead of 0.0425 at this seed.
+    out = power(0.6, 0.5, n_tasks=20, seeds=4, effects=(0.0,), n_sim=400, n_boot=500, seed=0)
+    assert out["power"][0]["power"] == 0.0425
 
 
 def test_power_plants_the_full_effect_at_the_rate_bounds():

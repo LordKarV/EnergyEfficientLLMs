@@ -333,7 +333,7 @@ def _boot_counts(n, n_boot, rng):
 
 def _continuation_cells(rows, profile, pairs=None):
     """(task, prefix, profile) -> [successes, attempts], the tasks with rows of BF16 or `profile`, the
-    tasks with an invalid replay (on a row of any profile: the replay is shared), rows ignored.
+    tasks with an invalid replay on a row of BF16 or `profile`, rows of other profiles ignored (valid or not).
 
     pairs: {task_id: frozen pair}; each row must then name the pair's runs in low_attempt_id and
     high_attempt_id, so a continuation can only be scored against the pair it replayed.
@@ -351,11 +351,11 @@ def _continuation_cells(rows, profile, pairs=None):
             if ids != (pairs[task]["low"], pairs[task]["high"]):
                 raise ValueError(f"{what}: replayed runs {ids} are not the frozen pair "
                                  f"({pairs[task]['low']!r}, {pairs[task]['high']!r})")
+        if prof not in ("BF16", profile):
+            ignored[prof] += 1  # a secondary run's own replay drops must not change the primary sample
+            continue
         if not valid:
             invalid.add(task)  # the harness writes these without results, so successes are not read
-            continue
-        if prof not in ("BF16", profile):
-            ignored[prof] += 1
             continue
         s, n = (_field(r, k, what) for k in ("successes", "attempts"))
         if not (isinstance(s, int) and isinstance(n, int) and 0 <= s <= n):
@@ -404,9 +404,10 @@ def did_test(rows, covariates=None, profile=PROBE, n_boot=5000, seed=0, alpha=0.
     rows: {task_id, prefix "low"|"high", profile, replay_valid, successes, attempts}, plus
     low_attempt_id and high_attempt_id when `pairs` is given; rows of one cell are summed (one row per
     cell or per seed both work). Rows for profiles other than BF16 and `profile` are ignored and
-    counted (Q4_K_M continuations are a separate, secondary run). A pair is dropped if any of its rows
-    has replay_valid false; those rows need no successes or attempts. Per task DiD = (Q - BF16 success
-    rate on the low prefix) - (Q - BF16 on the high prefix). p = share of task-bootstrap means <= 0.
+    counted, replay_valid false or not (Q4_K_M continuations are a separate, secondary run). A pair is
+    dropped if any of its BF16 or `profile` rows has replay_valid false; those rows need no successes
+    or attempts. Per task DiD = (Q - BF16 success rate on the low prefix) - (Q - BF16 on the high
+    prefix). p = share of task-bootstrap means <= 0.
     covariates: {task_id: {entropy, turns, malformed}} per COVARIATE_CONVENTION, for the adjusted
     estimate.
 
