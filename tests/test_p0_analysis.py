@@ -17,20 +17,23 @@ from qtrace.p0_analysis import (
     flagged_share,
     p0a_factors,
     p0a_primary,
+    p0a_secondary,
     p0a_verdict,
     p0b_report,
     p0c_breakage,
+    paired_permutation,
     processed_tokens,
+    profile_summary,
 )
 
 _ids = iter(range(10**9))
 
 
 def rec(task, profile, resolved, out=100, unc=900, cached=4000, lst="heldout100", runtime="llama.cpp", repo="scrapy",
-        end_reason=None, run_id="run-a"):
+        end_reason=None, run_id="run-a", turns=10):
     end_reason = end_reason or ("submitted" if resolved else "turn_limit")
     return {"attempt_id": f"a{next(_ids)}", "run_id": run_id, "task_id": task, "profile": profile,
-            "resolved": resolved, "list": lst, "runtime": runtime, "repo": repo, "end_reason": end_reason,
+            "resolved": resolved, "list": lst, "runtime": runtime, "repo": repo, "end_reason": end_reason, "turns": turns,
             "grading": {"test_files_touched": False},
             "tokens": {"output": out, "input_uncached": unc, "input_cached": cached}}
 
@@ -291,3 +294,71 @@ def test_cli_p0b_tables_use_the_run_seed_and_draw_count(tmp_path):
     assert set(g["heldout_per_task"]) == {"h0", "h1", "h2"}
     assert "heldout_per_task" not in g["sensitivity_excluding_infra_timeout"]
     assert g["sensitivity_excluding_infra_timeout"]["rl_share_mixed_g8"] == g["rl_share_mixed_g8"]
+
+
+def test_profile_summary_turns_and_flagged_rates():
+    # Audit item "Add P0a's secondary analyses": turns per resolved task, and every resolve rate also
+    # excluding flagged attempts (04 tripwire rule).
+    rows = [rec("t0", "Q8_0", True, turns=4), rec("t0", "Q8_0", True, turns=6), rec("t0", "Q8_0", False, turns=20),
+            rec("t1", "Q8_0", False, turns=30)]
+    rows[0]["grading"] = {"test_files_touched": True}
+    s = profile_summary(rows, "Q8_0")
+    assert s["turns_per_resolved"] == 60 / 2 and s["mean_turns_resolved"] == 5.0  # failed attempts charged
+    assert s["resolve_rate"] == 0.5 and s["resolve_rate_excluding_flagged"] == 1 / 3 and s["flagged_share"] == 0.25
+    assert s["n_attempts"] == 4 and s["n_tasks"] == 2
+    none = profile_summary([rec("t0", "Q8_0", False)], "Q8_0")
+    assert none["turns_per_resolved"] is None and none["mean_turns_resolved"] is None
+
+
+def test_paired_permutation_on_per_task_pass_counts():
+    same = []
+    for r in varied(seed=8):
+        if r["profile"] == "BF16":
+            same += [r, {**r, "profile": "Q3_K_M", "attempt_id": r["attempt_id"] + "q"}]
+    t = paired_permutation(same, "Q3_K_M", n_perm=500, seed=0)
+    assert t["mean_rate_diff"] == 0.0 and t["p_value"] == 1.0 and t["n_tasks"] == 40
+    gap = []
+    for i in range(20):
+        gap += [rec(f"t{i}", "BF16", True) for _ in range(3)] + [rec(f"t{i}", "Q3_K_M", a == 0) for a in range(3)]
+    t = paired_permutation(gap, "Q3_K_M", n_perm=500, seed=0)
+    assert abs(t["mean_rate_diff"] + 2 / 3) < 1e-12 and t["p_value"] == 1 / 501
+    mixed = varied(q_rate=0.7, seed=9)
+    assert paired_permutation(mixed, "Q4_K_M", n_perm=300, seed=1) == paired_permutation(mixed, "Q4_K_M", n_perm=300,
+                                                                                            seed=1)
+    assert 0 < paired_permutation(mixed, "Q4_K_M", n_perm=300, seed=1)["p_value"] <= 1
+
+
+def test_p0a_secondary_covers_every_profile_and_both_lists():
+    import random
+    rng = random.Random(10)
+    rows = []
+    for lst in ("heldout100", "verified100"):
+        for i in range(15):
+            for prof, rate in (("BF16", 0.6), ("Q8_0", 0.6), ("Q4_K_M", 0.5), ("Q3_K_M", 0.3), ("Q4_K_M_gate8", 0.5)):
+                rows += [rec(f"{lst[0]}{i}", prof, rng.random() < rate, lst=lst, turns=rng.randint(3, 40))
+                         for _ in range(3)]
+    for r in [r for r in rows if r["profile"] == "Q3_K_M" and r["resolved"]][:4]:
+        r["grading"] = {"test_files_touched": True}
+    sec = p0a_secondary(rows, n_boot=100, seed=2)
+    assert set(sec) == {"heldout100", "verified100"}
+    v = sec["verified100"]
+    assert set(v["per_profile"]) == {"BF16", "Q8_0", "Q4_K_M", "Q3_K_M", "Q4_K_M_gate8"}
+    assert set(v["vs_BF16"]) == {"Q8_0", "Q4_K_M", "Q3_K_M", "Q4_K_M_gate8"}
+    ver = [r for r in rows if r["list"] == "verified100"]
+    assert v["vs_BF16"]["Q3_K_M"]["primary"] == p0a_primary(ver, quantized="Q3_K_M", n_boot=100, seed=2)
+    q3 = sec["heldout100"]["vs_BF16"]["Q3_K_M"]
+    assert q3["factors_excluding_flagged"]["resolve_rate"]["Q3_K_M"] < q3["factors"]["resolve_rate"]["Q3_K_M"]
+    assert q3["permutation_excluding_flagged"]["mean_rate_diff"] < q3["permutation"]["mean_rate_diff"]
+    json.dumps(sec, allow_nan=False)
+    assert p0a_secondary([r for r in rows if r["profile"] != "BF16"], n_boot=10)["heldout100"]["vs_BF16"] == {}
+
+
+def test_cli_p0a_reports_secondary_and_flagged_factors(tmp_path):
+    rows = [rec(f"{lst[0]}{i}", prof, (i + a) % 3 == 0, lst=lst, run_id="p0a")
+            for lst in ("heldout100", "verified100") for i in range(6) for prof in ("BF16", "Q4_K_M", "Q8_0")
+            for a in range(3)]
+    rows.append(rec("v0", "Q8_0", False, lst="verified100", run_id="p0a"))
+    g = _cli(tmp_path, rows, {"P0a": ["p0a"]})["P0a"]
+    assert set(g["secondary"]) == {"heldout100", "verified100"} and "Q8_0" in g["secondary"]["verified100"]["vs_BF16"]
+    assert g["secondary"]["heldout100"]["vs_BF16"]["Q8_0"]["permutation"]["n_perm"] == 50
+    assert "factors_excluding_flagged" in g and g["design_mismatches"] == [["v0", "Q8_0", 4]]

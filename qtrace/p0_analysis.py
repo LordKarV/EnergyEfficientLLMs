@@ -152,6 +152,68 @@ def flagged_share(rows):
     return {p: k[p] / n[p] for p in sorted(n)}
 
 
+def profile_summary(rows, profile):
+    """One profile's resolve rate (overall and excluding flagged attempts), flagged share and turns.
+
+    turns_per_resolved charges failed attempts, like R: turns summed over all attempts / resolved
+    attempts. mean_turns_resolved is the mean over resolved attempts only. Both are None with no resolve.
+    """
+    sel = [r for r in rows if r["profile"] == profile]
+    un = [r for r in sel if not flagged(r)]
+    res = [r["turns"] for r in sel if r["resolved"]]
+    return {"n_attempts": len(sel), "n_tasks": len({r["task_id"] for r in sel}),
+            "resolve_rate": len(res) / len(sel) if sel else None,
+            "resolve_rate_excluding_flagged": sum(bool(r["resolved"]) for r in un) / len(un) if un else None,
+            "flagged_share": (len(sel) - len(un)) / len(sel) if sel else None,
+            "turns_per_resolved": sum(r["turns"] for r in sel) / len(res) if res else None,
+            "mean_turns_resolved": float(np.mean(res)) if res else None}
+
+
+def paired_permutation(rows, quantized, base="BF16", n_perm=5000, seed=0):
+    """Two-sided sign-flip test on per-task resolve-rate differences, quantized minus base (04, P0a secondary).
+
+    04 states it on per-task pass counts (0-3). With the design's 3 attempts per task the rate is the
+    count / 3, so the p-value is the same; rates also stay comparable when flagged attempts are dropped.
+    p = (1 + draws at least as extreme) / (1 + n_perm), seeded.
+    """
+    q, b = _per_task(rows, quantized), _per_task(rows, base)
+    tasks = sorted(set(q) & set(b))
+    d = np.array([q[t][1] / q[t][2] - b[t][1] / b[t][2] for t in tasks])
+    out = {"mean_rate_diff": None, "p_value": None, "n_tasks": len(tasks), "n_perm": n_perm, "seed": seed}
+    if not len(d):
+        return out
+    obs = float(d.mean())
+    perm = (np.random.default_rng(seed).choice([-1.0, 1.0], size=(n_perm, len(d))) * d).mean(axis=1)
+    extreme = int(np.sum(np.abs(perm) >= abs(obs) - 1e-12))  # tolerance: the same mean summed in another order
+    return {**out, "mean_rate_diff": obs, "p_value": (1 + extreme) / (1 + n_perm)}
+
+
+SECONDARY_LISTS = ("heldout100", "verified100")
+
+
+def p0a_secondary(rows, n_boot=5000, seed=0, base="BF16"):
+    """04's P0a secondaries (reported, not used for the gate): every profile on both lists.
+
+    Per list: each profile's summary, and each non-base profile against `base` with R, the factors
+    (also excluding flagged attempts) and the paired permutation test (also excluding flagged attempts).
+    """
+    out = {}
+    for lst in SECONDARY_LISTS:
+        sel = [r for r in rows if r["list"] == lst]
+        if not sel:
+            continue
+        un = [r for r in sel if not flagged(r)]
+        profiles = sorted({r["profile"] for r in sel})
+        vs = {p: {"primary": p0a_primary(sel, quantized=p, base=base, n_boot=n_boot, seed=seed),
+                  "factors": p0a_factors(sel, quantized=p, base=base),
+                  "factors_excluding_flagged": p0a_factors(un, quantized=p, base=base),
+                  "permutation": paired_permutation(sel, p, base, n_perm=n_boot, seed=seed),
+                  "permutation_excluding_flagged": paired_permutation(un, p, base, n_perm=n_boot, seed=seed)}
+              for p in profiles if p != base and base in profiles}
+        out[lst] = {"per_profile": {p: profile_summary(sel, p) for p in profiles}, "vs_BF16": vs}
+    return out
+
+
 def _by_repo(tasks, min_candidates):
     """repo -> task count, tasks with at least `min_candidates` successes, successes and attempts."""
     out = defaultdict(lambda: {"n_tasks": 0, "n_ge4": 0, "successes": 0, "attempts": 0})

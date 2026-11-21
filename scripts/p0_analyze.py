@@ -7,9 +7,10 @@ run's attempts (the pilot, the energy sub-run, P0d continuations):
     {"P0b": ["run-..."], "P0a": ["run-..."], "P0c": ["run-..."]}
 Records with end_reason "error" are dropped (04 reruns them as fresh attempts) and duplicate
 attempt ids are dropped; both are counted per gate. Attempt counts per task and profile are
-checked against the design (P0b 16, P0a 3, P0c 4). Every gate also reports its result excluding
-flagged attempts (test-file tripwire), the flagged share per profile, and a sensitivity analysis
-excluding infra_timeout hits (04).
+checked against the design (P0b 16, P0a 3 on heldout100 and verified100, P0c 4). Every gate also
+reports its result excluding flagged attempts (test-file tripwire), the flagged share per profile, and
+a sensitivity analysis excluding infra_timeout hits (04). P0a.secondary holds 04's secondaries: every
+profile against BF16 on both lists, turns per resolved attempt, and a paired permutation test.
 """
 
 import argparse
@@ -27,6 +28,7 @@ from qtrace.p0_analysis import (
     flagged_share,
     p0a_factors,
     p0a_primary,
+    p0a_secondary,
     p0b_report,
     p0c_breakage,
 )
@@ -75,14 +77,17 @@ def main():
                             if k not in ("per_task", "heldout_per_task", "tasks_below_design_attempts")},
                         "dropped": dropped, "design_mismatches": design_mismatches(sel, DESIGN["P0b"])}
     if "P0a" in manifest:
-        sel, dropped = gate_rows(rows, manifest["P0a"], "heldout100")
+        both, dropped = gate_rows(rows, manifest["P0a"], None)
+        sel = [r for r in both if r["list"] == "heldout100"]
         gates["P0a"] = {"primary": p0a_primary(sel, n_boot=args.n_boot, seed=args.seed),
                         "primary_excluding_flagged": p0a_primary(unflagged(sel), n_boot=args.n_boot, seed=args.seed),
                         "flagged_share": flagged_share(sel),
                         "factors": p0a_factors(sel),
+                        "factors_excluding_flagged": p0a_factors(unflagged(sel)),
                         "sensitivity_excluding_infra_timeout": p0a_primary(no_timeouts(sel), n_boot=args.n_boot,
                                                                            seed=args.seed),
-                        "dropped": dropped, "design_mismatches": design_mismatches(sel, DESIGN["P0a"])}
+                        "secondary": p0a_secondary(both, n_boot=args.n_boot, seed=args.seed),
+                        "dropped": dropped, "design_mismatches": design_mismatches(both, DESIGN["P0a"])}
     if "P0c" in manifest:
         if "P0b" not in gates:
             raise SystemExit("P0c bins tasks by P0b's success counts; add P0b's run ids to the manifest")
