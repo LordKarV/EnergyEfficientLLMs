@@ -21,6 +21,7 @@ from qtrace.common import read_jsonl
 from qtrace.p0d import (
     CANDIDATES,
     average_ranks,
+    candidate_stats,
     choose_score,
     did_test,
     join_runs,
@@ -273,6 +274,37 @@ def test_rule_thresholds_at_their_boundaries(field, values, check, rho, passes):
     stat = {"split_half": c["split_half"]["rho"], "entropy_bf16": c["against"]["entropy_bf16"],
             "probe_agreement": c["probe_agreement"]}[check]
     assert stat["mean"] == pytest.approx(rho) and c["checks"][check] is passes
+
+
+def runs_in_orders(field, orders):
+    """Runs whose scores rank task t's runs 1..n and whose `field` ("q4", "odd" or "turns") puts them in
+    orders[t], so that task's rho is the Spearman of 1..n against orders[t]."""
+    runs = []
+    for t, order in enumerate(orders):
+        for k, v in enumerate(order):
+            rank = {c: float(k + 1) for c in CANDIDATES}
+            run = {"attempt_id": f"t{t}-{k}", "task_id": f"t{t}", "turns": 1, "output_tokens": 1,
+                   "est_joules_q4": 1.0, "entropy_bf16": 1.0, "score": rank, "q4": rank, "even": rank, "odd": rank}
+            run[field] = v if field == "turns" else {c: float(v) for c in CANDIDATES}
+            runs.append(run)
+    return runs
+
+
+@pytest.mark.parametrize("field, orders, check, mean", [
+    # rhos -1/2, 1, 1: the float mean is 0.49999999999999994
+    ("q4", [(2, 3, 1), (1, 2, 3, 4, 5), (1, 2, 3, 4, 5)], "probe_agreement", 0.5),
+    # rhos -1/2, 1/2, 1: the float mean is 0.33333333333333326
+    ("odd", [(2, 3, 1), (1, 3, 5, 2, 4), (1, 2, 3, 4, 5)], "split_half", 1 / 3),
+    # rhos 0.7, 0.9, 0.8 and their negatives
+    ("turns", [(1, 2, 4, 5, 3), (1, 2, 3, 5, 4), (1, 2, 4, 3)], "turns", 0.8),
+    ("turns", [(5, 4, 2, 1, 3), (5, 4, 3, 1, 2), (4, 3, 1, 2)], "turns", -0.8),
+])
+def test_rule_thresholds_hold_exactly_at_the_boundary(field, orders, check, mean):
+    c = candidate_stats(runs_in_orders(field, orders), "kl_mean")
+    stat = {"probe_agreement": c["probe_agreement"], "split_half": c["split_half"]["rho"],
+            "turns": c["against"]["turns"]}[check]
+    assert stat["n_tasks"] == 3 and stat["mean"] == pytest.approx(mean, abs=1e-12)
+    assert c["checks"][check] is True
 
 
 def test_tasks_below_three_runs_count_for_pairs_but_not_for_the_rule():

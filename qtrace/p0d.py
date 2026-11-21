@@ -28,6 +28,10 @@ CONFOUNDS = ("turns", "output_tokens", "est_joules_q4", "entropy_bf16")
 COVARIATES = ("entropy", "turns", "malformed")
 MAX_ABS_RHO, MIN_SPLIT_HALF, MIN_AGREEMENT, MIN_RUNS = 0.8, 0.5, 0.5, 3
 MIN_EFFECT = 0.10
+# Means of 3- to 5-run task rhos sit on a lattice that contains 0.8, 0.5 and 1/3, and float sums land
+# them a few ulps to either side (rhos -1/2, 1, 1 average to 0.49999999999999994). The lattice spacing
+# is far above this, so the tolerance moves only those float errors.
+THRESHOLD_TOL = 1e-12
 UPPER_BOUND_DEFINITION = ("95th percentile (inverted_cdf order statistic) of the task-bootstrap means: the "
                           "one-sided 95% interval is (-inf, upper]")
 COVARIATE_CONVENTION = ("each covariate is the low-score run minus the high-score run of the task's pair, in raw "
@@ -238,10 +242,10 @@ def candidate_stats(runs, name, have_joules=True, min_runs=MIN_RUNS):
         rho = within_task(_grouped(runs, lambda r: (r["even"][name], r["odd"][name])), min_runs)
         split = {"rho": rho, "spearman_brown_mean": spearman_brown(rho["mean"]),
                  "spearman_brown_median": spearman_brown(rho["median"])}
-    checks = {k: _check(against[k].get("mean"), lambda m: abs(m) <= MAX_ABS_RHO) for k in CONFOUNDS}
+    checks = {k: _check(against[k].get("mean"), lambda m: abs(m) <= MAX_ABS_RHO + THRESHOLD_TOL) for k in CONFOUNDS}
     # SB(r) >= 0.5 exactly when r >= 1/3; testing the raw mean keeps r = -1 a failure, not "not run".
-    checks["split_half"] = _check(rho.get("mean"), lambda m: m >= MIN_SPLIT_HALF / (2 - MIN_SPLIT_HALF))
-    checks["probe_agreement"] = _check(agreement.get("mean"), lambda m: m >= MIN_AGREEMENT)
+    checks["split_half"] = _check(rho.get("mean"), lambda m: m >= MIN_SPLIT_HALF / (2 - MIN_SPLIT_HALF) - THRESHOLD_TOL)
+    checks["probe_agreement"] = _check(agreement.get("mean"), lambda m: m >= MIN_AGREEMENT - THRESHOLD_TOL)
     failed = [k for k, v in checks.items() if v is False]
     not_run = [k for k, v in checks.items() if v is None]
     return {"against": against, "probe_agreement": agreement, "split_half": split, "checks": checks,
