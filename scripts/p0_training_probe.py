@@ -4,8 +4,11 @@ The loss is the one SFT uses: chunked cross-entropy over supervised (model-writt
 probed at two supervised fractions. --full-logits-loss reproduces the transformers full-vocab loss as a
 comparison point; it is expected to run out of memory at long lengths.
 
+LoRA targets, r, alpha and include_gates come from the P1 training config, so the probe measures the
+adapter P1 will train. Each row records them.
+
 Run on the pilot box before the pilot attempts:
-    python scripts/p0_training_probe.py --model Qwen/Qwen3.5-4B
+    python scripts/p0_training_probe.py --model Qwen/Qwen3.5-4B --config configs/p1_train.yaml
 Writes one JSON line per length to outputs/probe/probe.jsonl and prints a table.
 """
 
@@ -18,7 +21,9 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from qtrace.probe import attach_lora, kernel_paths, kernel_status, probe_length
+from qtrace import sft
+from qtrace.common import load_config
+from qtrace.probe import kernel_paths, kernel_status, probe_length
 
 
 def main(argv=None):
@@ -26,7 +31,10 @@ def main(argv=None):
     ap.add_argument("--model", default="Qwen/Qwen3.5-4B")
     ap.add_argument("--lengths", type=int, nargs="+", default=[16384, 32768, 65536])
     ap.add_argument("--steps", type=int, default=3)
-    ap.add_argument("--include-gates", action="store_true", help="also put LoRA on in_proj_a / in_proj_b")
+    ap.add_argument("--config", default="configs/p1_train.yaml",
+                    help="P1 training config; its train section sets targets, lora_r, lora_alpha, include_gates")
+    ap.add_argument("--include-gates", action="store_true",
+                    help="also put LoRA on in_proj_a / in_proj_b, whatever the config says")
     ap.add_argument("--supervised-frac", type=float, nargs="+", default=[0.15, 0.5],
                     help="share of tokens the model wrote (T1 measured about 13%% in SWE-agent runs)")
     ap.add_argument("--chunk", type=int, default=2048, help="positions per logits chunk in the loss")
@@ -35,6 +43,9 @@ def main(argv=None):
                     help="run even if fla / causal_conv1d are not in use (numbers would not represent training)")
     ap.add_argument("--out", default="outputs/probe/probe.jsonl")
     args = ap.parse_args(argv)
+    tr = load_config(args.config)["train"]
+    lora = {"targets": list(tr["targets"]), "lora_r": tr["lora_r"], "lora_alpha": tr["lora_alpha"],
+            "include_gates": bool(tr["include_gates"] or args.include_gates)}
 
     from transformers import AutoModelForCausalLM
 
@@ -48,7 +59,7 @@ def main(argv=None):
 
     dtype = torch.bfloat16 if device in ("cuda", "mps") else torch.float32
     model = AutoModelForCausalLM.from_pretrained(args.model, dtype=dtype).to(device)
-    model = attach_lora(model, include_gates=args.include_gates)
+    model = sft.attach(model, lora, seed=0)  # the trainer's attach: same targets check, same adapter
     model.print_trainable_parameters()
     vocab = model.config.vocab_size
 
@@ -59,7 +70,7 @@ def main(argv=None):
             for length in sorted(args.lengths):
                 rec = probe_length(model, length, args.steps, device, vocab, supervised_frac=frac,
                                    loss_path=path, chunk=args.chunk)
-                rec.update(model=args.model, include_gates=args.include_gates, kernels=kernels)
+                rec.update(model=args.model, config=args.config, **lora, kernels=kernels)
                 f.write(json.dumps(rec) + "\n")
                 f.flush()
                 sec = f"{rec['sec_per_step']:.1f} s/step" if rec["status"] == "ok" else "OOM"

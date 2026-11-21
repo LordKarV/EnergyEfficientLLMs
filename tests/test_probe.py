@@ -1,6 +1,7 @@
 """Tests for the training probe on a tiny Qwen3.5. Run:  python -m pytest tests/test_probe.py -q"""
 
 import importlib.util
+import inspect
 import json
 import os
 import sys
@@ -10,10 +11,14 @@ sys.path.insert(0, ROOT)
 
 import pytest
 import torch
+import yaml
 
+from qtrace.common import load_config
 from qtrace.probe import (
+    ATTENTION_TARGETS,
     DELTANET_TARGETS,
     GATE_TARGETS,
+    MLP_TARGETS,
     attach_lora,
     chunked_ce_loss,
     kernel_paths,
@@ -102,6 +107,18 @@ def test_kernel_paths_report_what_transformers_resolved():
         assert not paths["causal_conv1d_fn"]["fast"]
 
 
+P1_CONFIG = os.path.join(ROOT, "configs", "p1_train.yaml")
+
+
+def test_p1_config_and_probe_defaults_agree():
+    # attach_lora's defaults are the lists the probe module documents; P1 must train the same adapter.
+    tr = load_config(P1_CONFIG)["train"]
+    defaults = inspect.signature(attach_lora).parameters
+    assert tr["targets"] == ATTENTION_TARGETS + MLP_TARGETS + DELTANET_TARGETS
+    assert tr["lora_r"] == defaults["r"].default and tr["lora_alpha"] == defaults["alpha"].default
+    assert tr["include_gates"] is defaults["include_gates"].default
+
+
 def load_script():
     path = os.path.join(ROOT, "scripts", "p0_training_probe.py")
     spec = importlib.util.spec_from_file_location("p0_training_probe", path)
@@ -120,7 +137,7 @@ def test_script_refuses_importable_kernels_that_are_not_in_use(tmp_path, monkeyp
     monkeypatch.setattr(script, "kernel_paths", lambda: SLOW_IN_USE)
     out = tmp_path / "probe.jsonl"
     with pytest.raises(SystemExit, match="allow-slow-kernels"):
-        script.main(["--model", str(tmp_path / "no_model"), "--out", str(out)])
+        script.main(["--model", str(tmp_path / "no_model"), "--config", P1_CONFIG, "--out", str(out)])
     assert not out.exists()
 
 
@@ -131,7 +148,36 @@ def test_script_records_kernels_in_use_in_every_row(tmp_path, monkeypatch):
     monkeypatch.setattr(torch.backends.mps, "is_available", lambda: False)
     out = tmp_path / "probe.jsonl"
     load_script().main(["--model", str(ckpt), "--lengths", "48", "64", "--steps", "1", "--chunk", "16",
-                        "--supervised-frac", "0.5", "--allow-slow-kernels", "--out", str(out)])
+                        "--supervised-frac", "0.5", "--allow-slow-kernels", "--config", P1_CONFIG, "--out", str(out)])
     rows = [json.loads(line) for line in out.read_text().splitlines()]
     assert len(rows) == 2 and all(r["status"] == "ok" for r in rows)
     assert all(r["kernels"] == {"in_use": kernel_paths(), "importable": kernel_status()} for r in rows)
+
+
+def test_script_trains_and_records_the_config_lora(tmp_path, monkeypatch):
+    ckpt = tmp_path / "ckpt"
+    tiny_qwen35().save_pretrained(ckpt)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: False)
+    cfg = tmp_path / "p1_train.yaml"
+    cfg.write_text(yaml.safe_dump({"train": {"targets": ["q_proj", "in_proj_qkv"], "include_gates": False,
+                                             "lora_r": 4, "lora_alpha": 8}}))
+    script = load_script()
+    seen, real = [], script.probe_length
+
+    def spy(model, *args, **kwargs):
+        names = {n.split(".lora_A.")[0].rsplit(".", 1)[-1] for n, _ in model.named_parameters() if ".lora_A." in n}
+        seen.append((names, model.peft_config["default"].r, model.peft_config["default"].lora_alpha))
+        return real(model, *args, **kwargs)
+
+    monkeypatch.setattr(script, "probe_length", spy)
+    out = tmp_path / "probe.jsonl"
+    base = ["--model", str(ckpt), "--lengths", "48", "--steps", "1", "--chunk", "16", "--supervised-frac", "0.5",
+            "--allow-slow-kernels", "--config", str(cfg), "--out", str(out)]
+    script.main(base)
+    script.main(base + ["--include-gates"])
+    assert seen == [({"q_proj", "in_proj_qkv"}, 4, 8), ({"q_proj", "in_proj_qkv", *GATE_TARGETS}, 4, 8)]
+    rows = [json.loads(line) for line in out.read_text().splitlines()]
+    assert [r["include_gates"] for r in rows] == [False, True]
+    assert all(r["targets"] == ["q_proj", "in_proj_qkv"] and r["lora_r"] == 4 and r["lora_alpha"] == 8
+               and r["config"] == str(cfg) for r in rows)
