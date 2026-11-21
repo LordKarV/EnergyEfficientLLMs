@@ -354,6 +354,35 @@ def test_batched_fit_uses_harness_timestamps_not_completion_credited_counters():
         assert gappy["coef"][k] == pytest.approx(v, rel=0.02), k
 
 
+def test_batched_fit_skips_and_counts_turns_without_a_first_token():
+    # The owner's review of PR #13: a request that errors before its first token gets gen_t_first_token null.
+    # Its tokens leave the window rebuild (no faked timestamp) and the block is flagged above 1% of turns.
+    samples, records = concurrent_block(np.random.default_rng(5))
+    full = fit_batched(samples, records)
+    n_turns = sum(len(r["per_turn"]) for r in records)
+    assert full["n_turns"] == n_turns and full["n_turns_without_first_token"] == 0
+    one = copy.deepcopy(records)
+    lost = one[0]["per_turn"][3]
+    lost["gen_t_first_token"] = None
+    fit = fit_batched(samples, one)
+    assert fit["n_turns_without_first_token"] == 1 and not fit["turns_without_first_token_over_1pct"]
+    assert fit["share_turns_without_first_token"] == pytest.approx(1 / n_turns)
+    assert fit["tokens"]["harness"]["decode"] == pytest.approx(full["tokens"]["harness"]["decode"]
+                                                               - lost["output_tokens"])
+    assert fit["tokens"]["harness"]["prefill"] == pytest.approx(full["tokens"]["harness"]["prefill"]
+                                                                - lost["input_uncached"])
+    assert fit["coef"]["decode"] == pytest.approx(0.8, rel=0.05)
+
+    many = copy.deepcopy(records)
+    for r in many:
+        r["per_turn"][0]["gen_t_first_token"] = None  # 16 of about 280 turns
+    fit = fit_batched(samples, many)
+    assert fit["n_turns_without_first_token"] == 16 and fit["turns_without_first_token_over_1pct"]
+    many[0]["per_turn"][0]["gen_t_end"] = many[0]["per_turn"][0]["gen_t_start"] - 1
+    with pytest.raises(ValueError, match="gen_t_end"):
+        fit_batched(samples, many)  # start and end are still checked on such a turn
+
+
 def test_batched_fit_rejects_non_cumulative_or_unordered_samples():
     samples, records = concurrent_block(np.random.default_rng(6), n_slots=4, seconds=60)
     deltas = [{**s, "counter_j": 50.0 + (i % 2)} for i, s in enumerate(samples)]  # per-window values, not totals

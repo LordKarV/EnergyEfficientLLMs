@@ -44,6 +44,7 @@ TARGETS = ("raw", "idle_subtracted")
 RANK_PROFILE, RANK_TARGET = "Q4_K_M", "raw"
 FALLBACK_MAX_REL_ERR = 0.10  # 04: fewest_joules falls back to fewest_turns above this
 AGREEMENT_MIN = 0.85  # 04: batched vs concurrency-1 picks below this name their regime
+MAX_SHARE_WITHOUT_FIRST_TOKEN = 0.01  # owner review of PR #13: flag a block above about 1% of such turns
 MIN_CANDIDATES = 4  # 03 Method step 1: pool tasks have at least 4 successful BF16 runs; the P0b fallback is 2
 HELDOUT_LISTS = ("heldout100", "verified100", "inrepo_test")
 HELDOUT_REPOS = ("scrapy", "pyramid", "datalad", "coveragepy")
@@ -462,9 +463,11 @@ def _harness_window_tokens(edges, records):
 
     A turn's input_uncached is spread uniformly over [gen_t_start, gen_t_first_token) and its
     output_tokens over [gen_t_first_token, gen_t_end); a zero-length span goes to the window holding it.
+    A turn with gen_t_first_token null (no token arrived) has no prefill/decode split, so its tokens
+    are left out and counted; a faked timestamp would misplace them. Returns (tokens, n_turns, n_skipped).
     """
     lo, hi = edges[:-1], edges[1:]
-    tokens = np.zeros((2, len(lo)))
+    tokens, n_turns, n_skipped = np.zeros((2, len(lo))), 0, 0
 
     def spread(row, a, b, n):
         if b > a:
@@ -476,12 +479,19 @@ def _harness_window_tokens(edges, records):
         aid = rec.get("attempt_id")
         for i, t in enumerate(_turns(rec)):
             w = f"attempt {aid!r} turn {i}"
-            t0, t1, t2 = (_num(_get(t, k, w), f"{w}: {k}") for k in ("gen_t_start", "gen_t_first_token", "gen_t_end"))
+            n_turns += 1
+            t0, t2 = (_num(_get(t, k, w), f"{w}: {k}") for k in ("gen_t_start", "gen_t_end"))
+            if _get(t, "gen_t_first_token", w) is None:
+                if not t0 <= t2:
+                    raise ValueError(f"{w}: need gen_t_start <= gen_t_end, got {t0}, {t2}")
+                n_skipped += 1
+                continue
+            t1 = _num(t["gen_t_first_token"], f"{w}: gen_t_first_token")
             if not t0 <= t1 <= t2:
                 raise ValueError(f"{w}: need gen_t_start <= gen_t_first_token <= gen_t_end, got {t0}, {t1}, {t2}")
             spread(0, t0, t1, _num(_get(t, "input_uncached", w), f"{w}: input_uncached"))
             spread(1, t1, t2, _num(_get(t, "output_tokens", w), f"{w}: output_tokens"))
-    return tokens
+    return tokens, n_turns, n_skipped
 
 
 def fit_batched(samples, records):
@@ -491,20 +501,25 @@ def fit_batched(samples, records):
     predicted_tokens_total}], cumulative values about every 1 s. Windows are consecutive samples, so
     they are contiguous deltas; a missed sample makes one longer window, which the per-second
     intercept absorbs. records: the block's attempts, every turn with gen_t_start, gen_t_first_token and
-    gen_t_end. The regression uses the harness-side tokens per window (_harness_window_tokens), not the
-    server counters: at the llama.cpp pin the predicted-token counter credits a whole request when it
-    ends. A fit on the counter deltas is reported only as a cross-check. Raw joules only: idle
+    gen_t_end; turns with gen_t_first_token null are skipped and counted in n_turns_without_first_token,
+    and turns_without_first_token_over_1pct flags a block where they are over 1% of n_turns. The
+    regression uses the harness-side tokens per window (_harness_window_tokens), not the server
+    counters: at the llama.cpp pin the predicted-token counter credits a whole request when it ends. A
+    fit on the counter deltas is reported only as a cross-check. Raw joules only: idle
     subtraction would shift the intercept and leave the token slopes unchanged.
     """
     cols = _metrics_columns(samples)
     seconds, joules, server_prefill, server_decode = np.diff(cols, axis=0).T
-    prefill, decode = _harness_window_tokens(cols[:, 0], records)
+    (prefill, decode), n_turns, n_skipped = _harness_window_tokens(cols[:, 0], records)
+    share = n_skipped / n_turns if n_turns else 0.0
 
     def fit(p, d):
         b = nnls(np.column_stack([seconds, p, d]), joules)
         return {"intercept_w": float(b[0]), "prefill": float(b[1]), "decode": float(b[2])}
 
     return {"coef": fit(prefill, decode), "n_windows": len(joules), "seconds": float(seconds.sum()),
+            "n_turns": n_turns, "n_turns_without_first_token": n_skipped, "share_turns_without_first_token": share,
+            "turns_without_first_token_over_1pct": share > MAX_SHARE_WITHOUT_FIRST_TOKEN,
             "server_counter_fit": {"coef": fit(server_prefill, server_decode)},
             "tokens": {"harness": {"prefill": float(prefill.sum()), "decode": float(decode.sum())},
                        "server": {"prefill": float(server_prefill.sum()), "decode": float(server_decode.sum())}}}
