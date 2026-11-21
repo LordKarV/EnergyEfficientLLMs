@@ -327,7 +327,8 @@ def select_pairs(runs, score):
 
     Runs are ordered by (score, attempt_id): low is the first, high the last, so ties go to the
     smaller attempt_id for low and the larger for high, and the two are always different runs. diff
-    holds the DiD covariates (COVARIATE_CONVENTION).
+    holds the DiD covariates (COVARIATE_CONVENTION). low_kl_mean and high_kl_mean are frozen with the
+    pair for the secondary kl_mean-ordered DiD (did_kl_mean).
     """
     by_task, unscored = defaultdict(list), 0
     for r in runs:
@@ -343,6 +344,7 @@ def select_pairs(runs, score):
         lo, hi = rs[0], rs[-1]
         pairs.append({"task_id": task, "low": lo["attempt_id"], "high": hi["attempt_id"],
                       "low_score": lo["score"][score], "high_score": hi["score"][score],
+                      "low_kl_mean": lo["score"]["kl_mean"], "high_kl_mean": hi["score"]["kl_mean"],
                       "spread": hi["score"][score] - lo["score"][score], "n_runs": len(rs),
                       "diff": {"entropy": lo["entropy_decision_bf16"] - hi["entropy_decision_bf16"],
                                "turns": lo["turns"] - hi["turns"],
@@ -504,6 +506,44 @@ def did_test(rows, covariates=None, profile=PROBE, n_boot=5000, seed=0, alpha=0.
             "small_sample_note": SMALL_SAMPLE_NOTE if len(kept) < SMALL_SAMPLE else None,
             "min_effect": min_effect, "pass_rule": pass_rule, "fail_rule": fail_rule, "decision": decision,
             "n_boot": n_boot, "seed": seed, "per_task": [{"task_id": t, "did": float(d)} for t, d in zip(kept, did)]}
+
+
+def did_q4(rows, pairs, **kw):
+    """docs/04's secondary Q4_K_M result: did_test with profile Q4_K_M on the frozen pairs with Q4_K_M rows.
+
+    Q4_K_M continuations run "if budget allows", possibly on part of the pairs, so the test runs on
+    the pairs that have any Q4_K_M row and says how many of the frozen pairs that is. None without
+    Q4_K_M rows. kw goes to did_test.
+    """
+    tasks = {r.get("task_id") for r in rows if r.get("profile") == AGREEMENT_PROBE}
+    if not tasks:
+        return None
+    sub = [p for p in pairs if p["task_id"] in tasks]
+    out = did_test([r for r in rows if r.get("task_id") in tasks], pairs=sub, profile=AGREEMENT_PROBE, **kw)
+    return {**out, "secondary": True, "n_pairs_frozen": len(pairs), "n_pairs_with_q4_rows": len(sub)}
+
+
+def did_kl_mean(rows, pairs, **kw):
+    """docs/04's secondary kl_mean result on the same replays: the Q3_K_M DiD with each pair's low and high
+    prefix set by kl_mean instead of the chosen score.
+
+    Order is (kl_mean, attempt_id), as in select_pairs, so ties go the same way. A reordered pair
+    swaps its runs, its rows' prefix labels and attempt ids, and the sign of its covariate diff
+    (COVARIATE_CONVENTION is low minus high). None for pairs frozen without low_kl_mean (before
+    this field existed). kw goes to did_test.
+    """
+    if any("low_kl_mean" not in p for p in pairs):
+        return None
+    flipped = {p["task_id"] for p in pairs if (p["high_kl_mean"], p["high"]) < (p["low_kl_mean"], p["low"])}
+    swap = {"low": "high", "high": "low"}
+    new_pairs = [{**p, "low": p["high"], "high": p["low"], "low_kl_mean": p["high_kl_mean"],
+                  "high_kl_mean": p["low_kl_mean"], "diff": {k: -v for k, v in p["diff"].items()}}
+                 if p["task_id"] in flipped else p for p in pairs]
+    new_rows = [{**r, "prefix": swap.get(r.get("prefix"), r.get("prefix")), "low_attempt_id": r.get("high_attempt_id"),
+                 "high_attempt_id": r.get("low_attempt_id")} if r.get("task_id") in flipped else r for r in rows]
+    out = did_test(new_rows, pairs=new_pairs, **kw)
+    return {**out, "secondary": True, "order": "kl_mean", "n_pairs_reordered": len(flipped),
+            "pairs_reordered": sorted(flipped)}
 
 
 def power(p_bf16, p_q3, n_tasks, seeds, effects=(MIN_EFFECT,), n_sim=1000, n_boot=2000, alpha=0.05, seed=0,

@@ -23,6 +23,8 @@ from qtrace.p0d import (
     average_ranks,
     candidate_stats,
     choose_score,
+    did_kl_mean,
+    did_q4,
     did_test,
     join_runs,
     power,
@@ -445,6 +447,7 @@ def test_pairs_take_lowest_and_highest_with_attempt_id_tie_break():
     # low (i=1) minus high (i=2); the entropy covariate is the decision-position entropy, not entropy_mean
     assert by_task["x"]["diff"] == {"entropy": -3.0, "turns": -1, "malformed": -1}
     assert (by_task["y"]["low"], by_task["y"]["high"]) == ("y-a", "y-b") and by_task["y"]["spread"] == 0.0
+    assert (by_task["x"]["low_kl_mean"], by_task["x"]["high_kl_mean"]) == (0.1, 0.5)  # frozen for did_kl_mean
     assert p["spread"]["max"] == 0.4 and p["n_tasks_zero_spread"] == 1
 
 
@@ -597,6 +600,44 @@ def test_other_profile_replay_drops_leave_the_primary_test_unchanged():
     alone, merged = did_test(rows, pairs=pairs), did_test(rows + q4, pairs=pairs)
     assert merged["rows_ignored_by_profile"] == {"Q4_K_M": len(q4)}
     assert {**merged, "rows_ignored_by_profile": {}} == alone and alone["n_tasks"] == 30
+
+
+def test_q4_secondary_runs_on_the_pairs_with_q4_rows():
+    pairs, rows = frozen_pairs(30), did_rows(30, 4, 0.6, 0.4)
+    assert did_q4(rows, pairs) is None  # no Q4_K_M continuations: no secondary result
+    q4 = [{**r, "profile": "Q4_K_M"} for r in did_rows(30, 4, 0.7, 0.3, seed=5) if r["profile"] == "Q3_K_M"
+          and int(r["task_id"][1:]) < 20]  # budget for 20 of the 30 pairs
+    out = did_q4(rows + q4, pairs, n_boot=500)
+    assert out["profile"] == "Q4_K_M" and out["secondary"] and out["n_tasks"] == 20
+    assert (out["n_pairs_frozen"], out["n_pairs_with_q4_rows"]) == (30, 20) and out["decision"] != "incomplete"
+    # The same numbers as the primary test run on those rows relabelled Q3_K_M.
+    as_q3 = [{**r, "profile": "Q3_K_M"} for r in q4] + [r for r in rows if r["profile"] == "BF16"
+                                                       and int(r["task_id"][1:]) < 20]
+    want = did_test(as_q3, pairs=pairs[:20], n_boot=500)
+    assert out["per_task"] == want["per_task"] and out["p_one_sided"] == want["p_one_sided"]
+
+
+def test_kl_mean_secondary_reorders_pairs_by_kl_mean():
+    pairs, rows = frozen_pairs(30), did_rows(30, 4, 0.6, 0.4)
+    assert did_kl_mean(rows, pairs) is None  # pairs frozen before low_kl_mean was recorded
+    same = [{**p, "low_kl_mean": 0.1, "high_kl_mean": 0.2} for p in pairs]
+    primary = did_test(rows, pairs=pairs, n_boot=500)
+    out = did_kl_mean(rows, same, n_boot=500)
+    assert out["n_pairs_reordered"] == 0 and out["per_task"] == primary["per_task"] and out["order"] == "kl_mean"
+    # kl_mean ranks t0-t9 the other way round; t10 ties and keeps the smaller attempt_id ("t10-hi") as low.
+    swapped = [{**p, "low_kl_mean": 0.3 if i < 10 else 0.1, "high_kl_mean": 0.1 if i <= 10 else 0.2}
+               for i, p in enumerate(same)]
+    out = did_kl_mean(rows, swapped, n_boot=500)
+    assert out["pairs_reordered"] == sorted(f"t{i}" for i in range(11)) and out["n_tasks"] == 30
+    flipped = set(out["pairs_reordered"])
+    want = {d["task_id"]: -d["did"] if d["task_id"] in flipped else d["did"] for d in primary["per_task"]}
+    assert {d["task_id"]: d["did"] for d in out["per_task"]} == want
+    # Covariates are low minus high, so they flip with the pair: the adjusted fit sees the negated diffs.
+    diff = {p["task_id"]: p["diff"] for p in pairs}
+    cov = {t: {k: -v for k, v in d.items()} if t in flipped else d for t, d in diff.items()}
+    relabelled = [{**r, "prefix": {"low": "high", "high": "low"}[r["prefix"]]} if r["task_id"] in flipped else r
+                  for r in rows]
+    assert out["adjusted"] == did_test(relabelled, covariates=cov, n_boot=500)["adjusted"]
 
 
 def test_continuations_must_name_the_frozen_pair():
@@ -877,6 +918,16 @@ def test_analyze_writes_score_choice_and_did(tmp_path):
     assert did["n_tasks"] == 30 and did["decision"] in ("pass", "fail", "inconclusive")
     assert did["pair_tasks_without_continuations"] == [] and did["adjusted"]["estimate"] is not None
     assert did["score"] == "kl_mean" and did["n_pairs_selected"] == 30
+    # The chosen score is kl_mean here, so the kl_mean-ordered secondary reorders nothing.
+    sec = json.loads((out_dir / "did_kl_mean.json").read_text())
+    assert sec["secondary"] and sec["n_pairs_reordered"] == 0 and sec["did_mean"] == did["did_mean"]
+    assert not (out_dir / "did_q4.json").exists()
+    q4 = [{**r, "profile": "Q4_K_M"} for r in rows if r["profile"] == "Q3_K_M"]
+    cont.write_text("".join(json.dumps(r) + "\n" for r in rows + q4))
+    mod.main(["--out-dir", str(out_dir), "--continuations", str(cont), "--n-boot", "300"])
+    q4_did = json.loads((out_dir / "did_q4.json").read_text())
+    assert q4_did["profile"] == "Q4_K_M" and q4_did["did_mean"] == did["did_mean"] and q4_did["pairs_score"] == "kl_mean"
+    assert json.loads((out_dir / "did.json").read_text())["did_mean"] == did["did_mean"]  # the primary is unchanged
 
 
 def test_did_step_says_a_constant_covariate_is_not_separated(tmp_path, capsys):
@@ -896,7 +947,8 @@ def test_did_step_says_a_constant_covariate_is_not_separated(tmp_path, capsys):
 def test_analyze_rerun_removes_a_stale_did_and_says_why_there_are_no_pairs(tmp_path):
     out_dir = tmp_path / "p0d"
     out_dir.mkdir()
-    (out_dir / "did.json").write_text("{}")
+    for name in ("did.json", "did_q4.json", "did_kl_mean.json"):
+        (out_dir / name).write_text("{}")
     mod = load_script("p0d_analyze")
 
     def run(roles, with_joules):
@@ -909,7 +961,7 @@ def test_analyze_rerun_removes_a_stale_did_and_says_why_there_are_no_pairs(tmp_p
         return str(stop.value)
 
     assert "undecided" in run({c: "trait" for c in CANDIDATES}, with_joules=False)
-    assert not (out_dir / "did.json").exists()
+    assert not any((out_dir / name).exists() for name in ("did.json", "did_q4.json", "did_kl_mean.json"))
     assert "H3 was answered negatively" in run({c: "noise" for c in CANDIDATES}, with_joules=True)
 
 

@@ -18,6 +18,10 @@ The second form runs the DiD test on the pairs frozen in --out-dir/score_choice.
 recomputed from inputs that may have changed since the replays, and writes did.json. Continuation
 rows are {task_id, prefix, profile, replay_valid, low_attempt_id, high_attempt_id, successes,
 attempts}; the two ids must be the frozen pair's runs, and a replay_valid false row needs no results.
+It also writes docs/04's secondary results, which never change the decision: did_q4.json, the same
+test on the Q4_K_M continuation rows (when there are any), and did_kl_mean.json, the Q3_K_M test with
+each pair's low and high prefix set by kl_mean. A secondary file that the inputs no longer produce
+is removed.
 """
 
 import argparse
@@ -28,10 +32,22 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from qtrace.common import read_jsonl
-from qtrace.p0d import CANDIDATES, CONFOUNDS, POOL_LISTS, choose_score, did_test, join_runs, power, select_pairs
+from qtrace.p0d import (
+    CANDIDATES,
+    CONFOUNDS,
+    POOL_LISTS,
+    choose_score,
+    did_kl_mean,
+    did_q4,
+    did_test,
+    join_runs,
+    power,
+    select_pairs,
+)
 
 POWER_EFFECTS = (0.05, 0.10, 0.15, 0.20, 0.25, 0.30)
 POWER_SEEDS = (4, 8)  # docs/04: 4 seeded attempts per prefix, extra budget goes to 8
+DID_FILES = ("did.json", "did_q4.json", "did_kl_mean.json")  # all test the pairs of one score_choice.json
 
 
 def rates(text):
@@ -103,10 +119,11 @@ def main(argv=None):
                               n_boot=args.n_boot, seed=args.seed, drop_rate=args.replay_drop_rate,
                               covariates=[p["diff"] for p in pairs["tasks"]]) for s in POWER_SEEDS]
     write_json(os.path.join(args.out_dir, "score_choice.json"), out)
-    stale = os.path.join(args.out_dir, "did.json")
-    if os.path.exists(stale):
-        os.remove(stale)
-        print("removed", stale, "(it tested the pairs of the score_choice.json just replaced)")
+    for name in DID_FILES:
+        stale = os.path.join(args.out_dir, name)
+        if os.path.exists(stale):
+            os.remove(stale)
+            print("removed", stale, "(it tested the pairs of the score_choice.json just replaced)")
     print_table(choice)
     if pairs:
         print(f"pairs: {pairs['n_tasks']} tasks, spread {pairs['spread']}")
@@ -122,8 +139,8 @@ def did_step(args):
     if not frozen["pairs"]:
         why = "H3 was answered negatively" if frozen["decided"] else "the score rule is undecided"
         raise SystemExit(f"{path} has no chosen score ({why}: {frozen['verdict']}), so there are no replay pairs")
-    did = did_test(read_jsonl(args.continuations), pairs=frozen["pairs"]["tasks"], n_boot=args.n_boot,
-                   seed=args.seed)
+    rows, pairs = read_jsonl(args.continuations), frozen["pairs"]["tasks"]
+    did = did_test(rows, pairs=pairs, n_boot=args.n_boot, seed=args.seed)
     did["score"], did["score_choice"] = frozen["chosen"], path
     write_json(os.path.join(args.out_dir, "did.json"), did)
     adj = did["adjusted"]["estimate"] if did["adjusted"] else None
@@ -134,6 +151,21 @@ def did_step(args):
         print(did["adjusted"]["note"])
     if did["pair_tasks_without_continuations"]:
         print(f"{len(did['pair_tasks_without_continuations'])} pairs have no BF16 and Q3_K_M continuation rows")
+    secondary = {"did_q4.json": (did_q4(rows, pairs, n_boot=args.n_boot, seed=args.seed), "no Q4_K_M rows"),
+                 "did_kl_mean.json": (did_kl_mean(rows, pairs, n_boot=args.n_boot, seed=args.seed),
+                                      "the frozen pairs have no low_kl_mean")}
+    for name, (sec, why) in secondary.items():
+        target = os.path.join(args.out_dir, name)
+        if sec is None:
+            print(f"secondary {name} not written: {why}")
+            if os.path.exists(target):
+                os.remove(target)
+                print("removed", target)
+            continue
+        sec["pairs_score"], sec["score_choice"] = frozen["chosen"], path
+        write_json(target, sec)
+        print(f"secondary {name}: DiD {sec['did_mean']:+.3f} (p one-sided {sec['p_one_sided']:.4f}) on "
+              f"{sec['n_tasks']} tasks: {sec['decision']}")
 
 
 if __name__ == "__main__":
