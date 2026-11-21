@@ -130,14 +130,6 @@ static std::vector<float> score(Model & P, Model & Q, int n_vocab, int n_batch, 
                                 const std::vector<int32_t> & tok, const std::vector<int32_t> & idx) {
     const std::string where = "job " + std::to_string(job) + ": ";
     const int n = int(tok.size());
-    for (size_t k = 0; k < idx.size(); ++k) {
-        if (idx[k] < 0 || idx[k] >= n - 1 || (k && idx[k] <= idx[k - 1])) {
-            die(where + "idx must be sorted, unique and in [0, n_tokens - 1)");
-        }
-    }
-    for (int32_t t : tok) {
-        if (t < 0 || t >= n_vocab) die(where + "token id " + std::to_string(t) + " is outside the vocabulary");
-    }
     const size_t width = 5 + 2 * size_t(top_k);
     std::vector<float> out(idx.size() * width);
     if (idx.empty()) return out;
@@ -226,13 +218,20 @@ int main(int argc, char ** argv) {
     for (Job j; f >> j.tok >> j.idx >> j.out;) jobs.push_back(j);
     if (jobs.empty()) die("no jobs in " + pos[2]);
 
-    // Every input is read before the models load, so a missing file fails in seconds.
+    // Every input is read, and every idx checked, before the models load, so a bad input fails in seconds.
     std::vector<std::vector<int32_t>> toks, idxs;
     size_t n_ctx = 1;  // the longest run sets the context size
     for (const Job & j : jobs) {
         toks.push_back(read_i32(j.tok));
         idxs.push_back(read_i32(j.idx));
         n_ctx = std::max(n_ctx, toks.back().size());
+        const std::vector<int32_t> & idx = idxs.back();
+        const long n = long(toks.back().size());
+        for (size_t k = 0; k < idx.size(); ++k) {
+            if (idx[k] < 0 || idx[k] >= n - 1 || (k && idx[k] <= idx[k - 1])) {
+                die("job " + std::to_string(toks.size() - 1) + ": idx must be sorted, unique and in [0, n_tokens - 1)");
+            }
+        }
     }
 
     llama_log_set(quiet, nullptr);
@@ -244,6 +243,15 @@ int main(int argc, char ** argv) {
     check_same_vocab(vocab, llama_model_get_vocab(Q.model));
     const int n_vocab = llama_vocab_n_tokens(vocab);
     if (top_k > n_vocab) die("--top-k is larger than the vocabulary");
+    // Every job's ids are checked before any is scored, so a bad id in the last job does not fail
+    // the batch after the others were scored.
+    for (size_t j = 0; j < toks.size(); ++j) {
+        for (int32_t t : toks[j]) {
+            if (t < 0 || t >= n_vocab) {
+                die("job " + std::to_string(j) + ": token id " + std::to_string(t) + " is outside the vocabulary");
+            }
+        }
+    }
     printf("{\"devices\": %s, \"n_batch\": %u, \"n_ubatch\": %u, \"n_ctx\": %u, \"type_k\": \"%s\", "
            "\"type_v\": \"%s\", \"flash_attn\": \"%s\", \"n_vocab\": %d, \"top_k\": %d}\n",
            devices_json(cpu).c_str(), llama_n_batch(P.ctx), llama_n_ubatch(P.ctx), llama_n_ctx(P.ctx),

@@ -199,6 +199,24 @@ def test_tiny_bad_job_exits_1_and_names_it(tiny):
                                                           for e in (good, bad)])
 
 
+def test_tiny_bad_token_fails_before_any_job_is_scored(tiny, tmp_path):
+    # The helper writes each job's output as it finishes, so an output for job 0 means it was scored
+    # before the bad id in job 1 was seen (PR #11 review minor 4: fail in seconds, not after the batch).
+    good, bad = episode(vocab=VOCAB), episode(vocab=VOCAB)
+    bad["input_ids"][0, 5] = VOCAB
+    lines = []
+    for i, e in enumerate((good, bad)):
+        ids, idx = kl_gguf.check_run(i, e["input_ids"], logit_index(e["model_mask"]))
+        ids.tofile(tmp_path / f"{i}.tok")
+        idx.tofile(tmp_path / f"{i}.idx")
+        lines.append(f"{tmp_path / f'{i}.tok'} {tmp_path / f'{i}.idx'} {tmp_path / f'{i}.out'}\n")
+    (tmp_path / "jobs.txt").write_text("".join(lines))
+    r = subprocess.run([tiny["bin"], "--cpu", tiny["p"], tiny["q"], str(tmp_path / "jobs.txt")], capture_output=True,
+                       text=True, check=False)
+    assert r.returncode == 1 and "job 1: token id 320 is outside the vocabulary" in r.stderr
+    assert not (tmp_path / "0.out").exists()
+
+
 def test_tiny_different_vocabularies_fail(tiny):
     e = episode(vocab=VOCAB)
     with pytest.raises(RuntimeError, match="different vocabularies: token"):
@@ -312,16 +330,38 @@ def test_noise_floor_is_exact_with_the_whole_vocabulary_and_a_lower_bound_with_t
 
 
 def test_runtime_criterion_flags_each_failure():
+    # Each case breaks exactly one criterion, so a comparison hard-wired to True fails its case.
     check = load_check_script()
     n = 1000
-    hf = {"nll": np.full(n, 2.0), "entropy": np.full(n, 1.0), "argmax": np.arange(n), "kl_floor": np.full(n, 1e-4),
+    pos = np.arange(n)
+    alt = np.where(pos % 2, 1.0, -1.0)  # alternating signs keep the run mean
+    few = np.where(pos < 20, alt, 0.0)  # 2% of positions, above p99's 1%
+    one = (pos == 0).astype(float)
+    hf = {"nll": np.full(n, 0.5), "entropy": np.full(n, 0.5), "argmax": pos, "kl_floor": np.full(n, 1e-4),
           "tail_mass_hf": np.zeros(n)}
-    gguf = {"nll_p": hf["nll"] + 1e-3, "entropy_p": hf["entropy"].copy(), "topk_ids": np.arange(n)[:, None]}
-    ok = check.judge(gguf, hf, q4_kl_mean=0.019)
-    assert ok["all_pass"] and ok["noise_floor_over_q4_kl_mean"] == pytest.approx(1e-4 / 0.019)
-    gguf["nll_p"] = gguf["nll_p"] + np.where(np.arange(n) < 20, 0.5, 0)  # 2% of positions off by 0.5
-    assert {k for k, v in check.judge(gguf, hf, 0.019)["pass"].items() if not v} == {"abs_dnll_p99"}
-    assert not check.judge(gguf, hf, q4_kl_mean=1e-4)["pass"]["noise_floor_over_q4_kl_mean"]
+    gguf = {"nll_p": hf["nll"] + 1e-3, "entropy_p": hf["entropy"].copy(), "topk_ids": pos[:, None]}
+    exact = np.full(128, 2e-4)
+    ok = check.judge(gguf, hf, 0.019, exact)
+    assert ok["all_pass"] and ok["noise_floor_over_q4_kl_mean"] == pytest.approx(2e-4 / 0.019)
+    assert ok["noise_floor_kl"]["n_positions"] == 128 and ok["noise_floor_kl_topk"]["mean"] == pytest.approx(1e-4)
+    cases = {
+        "abs_dnll_median": {"nll_p": hf["nll"] + 0.02 * alt},
+        "abs_dnll_p99": {"nll_p": hf["nll"] + 0.5 * few},
+        "abs_dnll_max": {"nll_p": hf["nll"] + 2.0 * one},  # moves the mean by 0.4%
+        "abs_dentropy_median": {"entropy_p": hf["entropy"] + 0.02 * alt},
+        "abs_dentropy_p99": {"entropy_p": hf["entropy"] + 0.5 * few},
+        "abs_dentropy_max": {"entropy_p": hf["entropy"] + 2.0 * one},
+        "rel_mean_change_nll": {"nll_p": hf["nll"] + 0.008},  # 1.6% of the mean, 0.008 per position
+        "rel_mean_change_entropy": {"entropy_p": hf["entropy"] + 0.008},
+        "top1_agreement": {"topk_ids": (pos + (pos < 30))[:, None]},  # 3% disagree
+    }
+    for key, change in cases.items():
+        assert {k for k, v in check.judge({**gguf, **change}, hf, 0.019, exact)["pass"].items() if not v} == {key}, key
+    # The ceiling is judged on the exact KL: a top-k lower bound far under 10% must not pass it.
+    for q4, kl_exact in ((1e-4, exact), (0.019, np.full(128, 0.01))):
+        failed = {k for k, v in check.judge(gguf, hf, q4, kl_exact)["pass"].items() if not v}
+        assert failed == {"noise_floor_over_q4_kl_mean"}
+    assert set(cases) | {"noise_floor_over_q4_kl_mean"} == set(ok["pass"])
 
 
 def test_check_script_runs_on_the_tiny_models(tiny, tmp_path):
@@ -333,6 +373,7 @@ def test_check_script_runs_on_the_tiny_models(tiny, tmp_path):
                       tiny["p"], "--gguf-q4", tiny["q"], "--device", "cpu", "--top-k", "16",
                       "--out", str(tmp_path / "row.json")])
     assert row["n_scored"] == len(logit_index(e["model_mask"])) and len(row["pass"]) == 10
+    assert row["noise_floor_kl"]["n_positions"] == len(row["noise_floor_positions"]) == 128
     # The script loads HF in bf16 against f32 GGUFs, so only the noise floor is checked: top-1 agreement
     # is low on a tiny model's near-tied logits.
     assert row["noise_floor_over_q4_kl_mean"] < 0.1
