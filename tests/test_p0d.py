@@ -391,6 +391,19 @@ def test_did_drops_invalid_replays_and_validates_rows():
     assert did_test(rows)["adjusted"] is None and did_test(rows)["decision"] != "pass"
 
 
+def test_did_counts_bootstrap_means_of_exactly_zero():
+    # The reviewer's 20 tasks at 4 seeds: every DiD is a multiple of 0.25, so many bootstrap means are exactly 0.
+    # Float weights left some at +1e-17, outside "<= 0", and gave p = 0.0466 instead of 0.0502 at seed 0.
+    did = [-.25, .25, .5, 0, .5, 0, 0, .25, .25, .5, .5, -.5, 0, .5, -.25, -.5, 0, .25, .25, .25]
+    rows = []
+    for i, d in enumerate(did):
+        for prefix, q in (("low", 2 + round(4 * d)), ("high", 2)):
+            for profile, s in (("BF16", 2), ("Q3_K_M", q)):
+                rows.append({"task_id": f"t{i:02d}", "prefix": prefix, "profile": profile, "successes": s,
+                             "attempts": 4, "replay_valid": True})
+    assert did_test(rows, seed=0)["p_one_sided"] == 0.0502
+
+
 def test_power_rises_with_the_effect():
     out = power(0.7, 0.5, n_tasks=200, seeds=8, effects=(0.0, 0.10), n_sim=200, n_boot=500)
     by_effect = {e["effect"]: e["power"] for e in out["power"]}

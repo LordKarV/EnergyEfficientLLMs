@@ -295,9 +295,14 @@ def select_pairs(runs, score):
             "covariates": COVARIATE_CONVENTION, "tasks": pairs}
 
 
-def _boot_weights(n, n_boot, rng):
-    """Task-bootstrap weights: row b counts how often each task is drawn in draw b, divided by n."""
-    return rng.multinomial(n, np.full(n, 1.0 / n), size=n_boot) / n
+def _boot_counts(n, n_boot, rng):
+    """Task-bootstrap draws: row b counts how often each task is drawn in draw b.
+
+    Callers multiply the counts by integer DiDs (the DiD times a common denominator), so a resampled
+    mean of exactly 0 is the integer 0. Float weights left some at +1e-17, outside "<= 0", which only
+    ever lowered p.
+    """
+    return rng.multinomial(n, np.full(n, 1.0 / n), size=n_boot)
 
 
 def _continuation_cells(rows, profile):
@@ -353,19 +358,21 @@ def did_test(rows, covariates=None, profile=PROBE, n_boot=5000, seed=0, alpha=0.
     kept = sorted(tasks - invalid)
     if not kept:
         raise ValueError("no task has a valid replayed pair")
-    rate = {}
     for t in kept:
         for prefix in ("low", "high"):
             for prof in ("BF16", profile):
-                s, n = cells[t, prefix, prof]
-                if n == 0:
+                if cells[t, prefix, prof][1] == 0:
                     raise ValueError(f"task {t}: no {prof} attempts on the {prefix} prefix")
-                rate[t, prefix, prof] = s / n
-    gap = {(t, prefix): rate[t, prefix, profile] - rate[t, prefix, "BF16"] for t in kept for prefix in ("low", "high")}
-    did = np.array([gap[t, "low"] - gap[t, "high"] for t in kept])
-    means = _boot_weights(len(did), n_boot, np.random.default_rng(seed)) @ did
-    p = float(np.mean(means <= 0))
-    upper = float(np.percentile(means, 95, method="inverted_cdf"))
+    # Exact arithmetic: each DiD times the common denominator of every cell's attempts is an integer.
+    denom = math.lcm(*(cells[t, prefix, prof][1] for t in kept for prefix in ("low", "high")
+                       for prof in ("BF16", profile)))
+    sign = {("low", profile): 1, ("low", "BF16"): -1, ("high", profile): -1, ("high", "BF16"): 1}
+    did_int = np.array([sum(k * cells[t, prefix, prof][0] * (denom // cells[t, prefix, prof][1])
+                            for (prefix, prof), k in sign.items()) for t in kept], dtype=np.int64)
+    did = did_int / denom
+    sums = _boot_counts(len(did), n_boot, np.random.default_rng(seed)) @ did_int
+    p = float(np.mean(sums <= 0))
+    upper = float(np.percentile(sums, 95, method="inverted_cdf") / (len(did) * denom))
     adjusted = None
     if covariates is not None:
         missing = [t for t in kept if t not in covariates]
@@ -373,7 +380,7 @@ def did_test(rows, covariates=None, profile=PROBE, n_boot=5000, seed=0, alpha=0.
             raise ValueError(f"no covariates for tasks {missing[:5]}")
         adjusted = _adjusted(did, [{k: _number(_field(covariates[t], k, f"covariates {t}"), f"covariates {t} {k}",
                                                optional=False) for k in COVARIATES} for t in kept])
-    mean = float(did.mean())
+    mean = float(did_int.sum() / (len(did) * denom))  # exact sign, so "mean != 0" below is too
     adj = adjusted and adjusted["estimate"]
     keeps = adj is not None and mean != 0 and np.sign(adj) == np.sign(mean) and abs(adj) >= 0.5 * abs(mean)
     pass_rule, fail_rule = p < alpha and bool(keeps), upper < min_effect
@@ -408,17 +415,17 @@ def power(p_bf16, p_q3, n_tasks, seeds, effects=(MIN_EFFECT,), n_sim=1000, n_boo
     rng = np.random.default_rng(seed)
     # One set of bootstrap weights for every simulated study; each study's test stays valid
     # and power is unbiased, the shared draws only add a little Monte Carlo correlation.
-    weights = _boot_weights(n_tasks, n_boot, rng)
+    counts = _boot_counts(n_tasks, n_boot, rng)
 
-    def rate(p):
-        return rng.binomial(seeds, np.clip(p, 0, 1)) / seeds
+    def successes(p):
+        return rng.binomial(seeds, np.clip(p, 0, 1))
 
     out = []
     for e in effects:
         j = rng.integers(0, len(b), (n_sim, n_tasks))
         low = np.clip(q[j] + e / 2, e, 1)
-        did = (rate(low) - rate(b[j])) - (rate(low - e) - rate(b[j]))
-        p = ((weights @ did.T) <= 0).mean(axis=0)
+        did_int = (successes(low) - successes(b[j])) - (successes(low - e) - successes(b[j]))  # DiD x seeds
+        p = ((counts @ did_int.T) <= 0).mean(axis=0)
         out.append({"effect": float(e), "power": float((p < alpha).mean())})
     passing = [o["effect"] for o in out if o["power"] >= 0.8]
     return {"n_tasks": n_tasks, "seeds": seeds, "p_bf16": b.tolist(), "p_q3": q.tolist(), "alpha": alpha,
