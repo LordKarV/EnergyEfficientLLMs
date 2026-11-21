@@ -72,6 +72,20 @@ def test_guard_in_simulation_matches_se():
     assert out["power"][0]["power_with_guard"] == pytest.approx(0.8, abs=0.07)
 
 
+def test_mde_with_guard_reports_the_guard_capped_mde():
+    # p = 4/16, constant costs: ratio 0.5 is always significant, but a margin of z_.95 sd passes the guard in about
+    # half the studies at every ratio, so no ratio reaches 80% power with the guard.
+    n, S, p = sum(HELDOUT691_BY_REPO.values()), 3, 0.25
+    margin = math.sqrt(2 * p * (1 - p) / (S * n)) * Z(0.95)
+    out = mde(held(4), [1.0], [1.0], ratios=(0.5, 1.0), n_sim=200, n_boot=300, seed=4, guard_margin=margin)
+    assert out["power"][0]["power"] == 1.0 and out["mde_ratio_80"] == 0.5
+    assert out["mde_ratio_80_with_guard"] is None
+    assert out["guard_pass_rate"] == out["power"][0]["power_with_guard"]
+    assert out["guard_pass_rate"] == pytest.approx(0.5, abs=0.1)
+    plain = mde(held(4), [1.0], [1.0], ratios=(0.5,), n_sim=2, n_boot=100)
+    assert "mde_ratio_80_with_guard" not in plain and "guard_pass_rate" not in plain
+
+
 def test_mde_resamples_and_weights_within_each_repo(monkeypatch):
     # Only coveragepy's tasks resolve (8/16), and it holds 300 of the 500 simulated tasks, against 4 of the 16
     # measured ones: the c3 count, the RR-difference spread and the bootstrap strata all depend on the repo.

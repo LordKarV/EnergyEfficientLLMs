@@ -22,7 +22,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from qtrace.common import read_jsonl
 from qtrace.energy_model import pool_records
-from qtrace.p2_analysis import MDE_RATIOS, mde
+from qtrace.p2_analysis import MDE_POWER, MDE_RATIOS, mde
 
 
 def resolved(rec):
@@ -100,6 +100,11 @@ def main(argv=None):
               + (f", with guard {p['power_with_guard']:.3f}" if "power_with_guard" in p else ""))
     print(f"MDE at 80% power: ratio {out['mde_ratio_80']} (cost: {out['cost']['source']}); se_rr {se['se_rr']:.4f}, "
           f"se_rr_diff {se['se_rr_diff']:.4f} ({se['formula']})")
+    if args.guard_margin is not None:
+        print(f"MDE at 80% power with the guard at margin {args.guard_margin}: ratio {out['mde_ratio_80_with_guard']}")
+        if out["guard_pass_rate"] < MDE_POWER:
+            print(f"  the guard alone passes in {out['guard_pass_rate']:.3f} of simulated studies, so power with the "
+                  "guard stays below 0.8 at every ratio")
     print("wrote", args.out)
 
 

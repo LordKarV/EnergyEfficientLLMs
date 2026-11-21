@@ -688,7 +688,9 @@ def mde(tasks, cost_resolved, cost_failed, ratios=MDE_RATIOS, n_by_repo=HELDOUT6
     power (#12), so the result is deterministic in seed and the curve differs only by the ratio. power counts
     p < alpha; with guard_margin, power_with_guard also needs the guard (lower bound of RR_arm - RR_random >=
     -guard_margin), which is analyze()'s win. mde_ratio_80 is the largest ratio with power >= 0.8 (the smallest
-    detectable reduction, 1 - ratio), None if none.
+    detectable reduction, 1 - ratio), None if none. With guard_margin, mde_ratio_80_with_guard is the same on
+    power_with_guard, and guard_pass_rate is the share of studies whose guard passes. The guard's bound uses only
+    the resolves, so it does not depend on the ratio, and guard_pass_rate caps power_with_guard at every ratio.
     """
     if seeds < 1 or n_sim < 1 or n_boot < 100 or not 0 < alpha < 1:
         raise ValueError(f"need seeds >= 1, n_sim >= 1, n_boot >= 100, 0 < alpha < 1; got {seeds}, {n_sim}, "
@@ -704,7 +706,7 @@ def mde(tasks, cost_resolved, cost_failed, ratios=MDE_RATIOS, n_by_repo=HELDOUT6
     n = len(repos)
     rng = np.random.default_rng(seed)
     W = strat_weights(repos, n_boot, rng)
-    sig, won, rr_diffs = np.zeros(len(ratios)), np.zeros(len(ratios)), []
+    sig, won, rr_diffs, guard_ok = np.zeros(len(ratios)), np.zeros(len(ratios)), [], 0
     for _ in range(n_sim):
         p = np.concatenate([rng.choice(pools[r][:, 0], n_by_repo[r]) for r in pools])
         R = [(rng.random((seeds, n)) < p).astype(float) for _ in range(2)]
@@ -713,12 +715,18 @@ def mde(tasks, cost_resolved, cost_failed, ratios=MDE_RATIOS, n_by_repo=HELDOUT6
         for i, ratio in enumerate(ratios):
             t = _test(W, {"R": R[0], "E": E[0] * ratio}, {"R": R[1], "E": E[1]})
             s = t["p_one_sided"] < alpha
+            g = guard_margin is None or t["rr_diff_lower95_one_sided"] >= -guard_margin
             sig[i] += s
-            won[i] += s and (guard_margin is None or t["rr_diff_lower95_one_sided"] >= -guard_margin)
+            won[i] += s and g
+        guard_ok += g  # the same at every ratio: the bound reads R and W only
     power = [{"ratio": float(r), "power": float(a / n_sim),
               **({} if guard_margin is None else {"power_with_guard": float(b / n_sim)})}
              for r, a, b in zip(ratios, sig, won)]
     passing = [x["ratio"] for x in power if x["power"] >= MDE_POWER]
+    guarded = {}
+    if guard_margin is not None:
+        won80 = [x["ratio"] for x in power if x["power_with_guard"] >= MDE_POWER]
+        guarded = {"mde_ratio_80_with_guard": max(won80) if won80 else None, "guard_pass_rate": guard_ok / n_sim}
     resolves = sum(n_by_repo[r] * pools[r][:, 0].mean() for r in pools)
     se = guard_se(tasks, n_by_repo, seeds)
     se["simulated_sd_rr_diff"] = float(np.std(rr_diffs, ddof=1)) if n_sim > 1 else None
@@ -727,6 +735,6 @@ def mde(tasks, cost_resolved, cost_failed, ratios=MDE_RATIOS, n_by_repo=HELDOUT6
             "cost": {"n_resolved": len(cr), "n_failed": len(cf), "mean_resolved": float(cr.mean()),
                      "mean_failed": float(cf.mean())},
             "alpha": alpha, "n_sim": n_sim, "n_boot": n_boot, "seed": seed, "guard_margin": guard_margin,
-            "power": power, "mde_ratio_80": max(passing) if passing else None, "guard_se": se,
+            "power": power, "mde_ratio_80": max(passing) if passing else None, **guarded, "guard_se": se,
             "simplifications": ["costs drawn independently of the task (conservative)",
                                 "measured s / k used as each task's true rate (slightly optimistic)"]}
