@@ -54,8 +54,10 @@ CONTEXT_BINS = (16384, 32768, 49152)  # residual summary bins over the 64K conte
 # CPU-seconds next to it.
 ENERGY_BOUNDARY = "GPU only"
 PROFILES = ("BF16", "Q8_0", "Q4_K_M", "Q3_K_M", "Q4_K_M_gate8")  # the agreed record format (issue #1)
-# 04 P0a: idle W per profile with no process and with llama-server loaded, before and after the sub-run.
-IDLE_READINGS = ("none_before", "loaded_before", "none_after", "loaded_after")
+# 04 P0a: idle W per profile with no process and with llama-server loaded, before and after the sub-run, in the
+# order they are taken. The harness writes them to outputs/energy/idle_<run_id>.json (owner's agent, PR #13).
+IDLE_READINGS = ("none_before_w", "loaded_before_w", "loaded_after_w", "none_after_w")
+IDLE_FIELDS = (*IDLE_READINGS, "window_s", "settle_s", "t")
 
 
 def _get(d, key, where):
@@ -164,17 +166,32 @@ def fit_attempts(records):
 
 
 def idle_readings(d):
-    """Validated --idle readings: {profile: {IDLE_READINGS key: W}}, every key present and nothing else."""
+    """Validated --idle readings, the harness's outputs/energy/idle_<run_id>.json.
+
+    {profile: {none_before_w, loaded_before_w, loaded_after_w, none_after_w (W), window_s (the averaging
+    window), settle_s (45 in 04), t: {reading: epoch seconds}}}, every key present and nothing else. The t
+    values must be non-decreasing in IDLE_READINGS order, the order the readings are taken.
+    """
     if not isinstance(d, dict):
         raise TypeError(f"idle readings must be an object of profiles, got {type(d).__name__}")
     for p, r in d.items():
         if p not in PROFILES:
             raise ValueError(f"idle readings: unknown profile {p!r}; expected one of {PROFILES}")
-        if not isinstance(r, dict) or set(r) != set(IDLE_READINGS):
+        if not isinstance(r, dict) or set(r) != set(IDLE_FIELDS):
             got = sorted(r) if isinstance(r, dict) else r
-            raise ValueError(f"idle readings for {p}: need exactly {IDLE_READINGS}, got {got!r}")
+            raise ValueError(f"idle readings for {p}: need exactly {IDLE_FIELDS}, got {got!r}")
         for k in IDLE_READINGS:
             _num(r[k], f"idle readings for {p}: {k}")
+        for k in ("window_s", "settle_s"):
+            if _num(r[k], f"idle readings for {p}: {k}") == 0:
+                raise ValueError(f"idle readings for {p}: {k} must be positive")
+        t = r["t"]
+        if not isinstance(t, dict) or set(t) != set(IDLE_READINGS):
+            got = sorted(t) if isinstance(t, dict) else t
+            raise ValueError(f"idle readings for {p}: t needs exactly {IDLE_READINGS}, got {got!r}")
+        ts = [_num(t[k], f"idle readings for {p}: t.{k}") for k in IDLE_READINGS]
+        if ts != sorted(ts):
+            raise ValueError(f"idle readings for {p}: t must run {IDLE_READINGS} in that order, got {ts}")
     return d
 
 

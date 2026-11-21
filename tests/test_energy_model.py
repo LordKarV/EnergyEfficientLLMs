@@ -632,17 +632,17 @@ def test_cli_writes_model_and_estimates(tmp_path):
                           str(tmp_path / "x")], capture_output=True, text=True, check=False)
     assert res.returncode != 0 and "Q4_K_M" in res.stderr
 
-    idle = {"Q4_K_M": {"none_before": 30.0, "loaded_before": 41.5, "none_after": 30.5, "loaded_after": 42.0}}
+    idle = {"Q4_K_M": idle_profile()}
     idle_path = tmp_path / "idle.json"
     idle_path.write_text(json.dumps(idle))
     res = subprocess.run([sys.executable, script, *args, "--idle", str(idle_path)], capture_output=True, text=True,
                          check=False)
     assert res.returncode == 0, res.stderr
     assert json.loads((out / "energy_model.json").read_text())["idle_readings_w"] == idle
-    idle_path.write_text(json.dumps({"Q4_K_M": {"none_before": 30.0}}))
+    idle_path.write_text(json.dumps({"Q4_K_M": {"none_before_w": 30.0}}))
     res = subprocess.run([sys.executable, script, *args, "--idle", str(idle_path)], capture_output=True, text=True,
                          check=False)
-    assert res.returncode != 0 and "loaded_before" in res.stderr
+    assert res.returncode != 0 and "loaded_before_w" in res.stderr
 
 
 def test_every_profile_must_run_the_same_sub_run_tasks():
@@ -658,14 +658,33 @@ def test_every_profile_must_run_the_same_sub_run_tasks():
     fit_attempts(q4 + bf16 + [other])
 
 
-def test_idle_readings_are_four_watts_per_known_profile():
-    ok = {"BF16": dict.fromkeys(("none_before", "loaded_before", "none_after", "loaded_after"), 35.0)}
+def idle_profile(t0=1.7e9):
+    """One profile of outputs/energy/idle_<run_id>.json, the shape the owner's agent set on PR #13."""
+    keys = ("none_before_w", "loaded_before_w", "loaded_after_w", "none_after_w")
+    return {"none_before_w": 30.0, "loaded_before_w": 41.5, "loaded_after_w": 42.0, "none_after_w": 30.5,
+            "window_s": 10.0, "settle_s": 45.0, "t": {k: t0 + 60.0 * i for i, k in enumerate(keys)}}
+
+
+def test_idle_readings_take_the_harness_idle_file_shape():
+    # Owner's agent on PR #13: four readings in W with the _w suffix, window_s, settle_s and an epoch t per reading.
+    ok = {"BF16": idle_profile(), "Q4_K_M": idle_profile(1.8e9)}
     assert energy_model.idle_readings(ok) == ok
     with pytest.raises(TypeError, match="object"):
         energy_model.idle_readings([])
-    for bad, msg in [({"Q4KM": ok["BF16"]}, "unknown profile"),
-                     ({"BF16": {**ok["BF16"], "extra": 1.0}}, "extra"),
-                     ({"BF16": {**ok["BF16"], "none_after": -1.0}}, "none_after"),
-                     ({"BF16": {**ok["BF16"], "loaded_after": None}}, "loaded_after")]:
+    base = idle_profile()
+    no_t = {k: v for k, v in base.items() if k != "t"}
+    old = {"none_before": 30.0, "loaded_before": 41.5, "none_after": 30.5, "loaded_after": 42.0}
+    for bad, msg in [({"Q4KM": base}, "unknown profile"),
+                     ({"BF16": old}, "none_before_w"),
+                     ({"BF16": {**base, "extra": 1.0}}, "extra"),
+                     ({"BF16": no_t}, "'t'"),
+                     ({"BF16": {**base, "none_after_w": -1.0}}, "none_after_w"),
+                     ({"BF16": {**base, "loaded_after_w": None}}, "loaded_after_w"),
+                     ({"BF16": {**base, "window_s": 0.0}}, "window_s"),
+                     ({"BF16": {**base, "settle_s": float("nan")}}, "settle_s"),
+                     ({"BF16": {**base, "t": {**base["t"], "extra": 1.0}}}, "t needs exactly"),
+                     ({"BF16": {**base, "t": {**base["t"], "none_before_w": "now"}}}, "t.none_before_w"),
+                     ({"BF16": {**base, "t": {**base["t"], "loaded_after_w": base["t"]["loaded_before_w"] - 1}}},
+                      "in that order")]:
         with pytest.raises(ValueError, match=msg):
             energy_model.idle_readings(bad)

@@ -18,8 +18,9 @@
           cross-check). Only Q4_K_M rows are used, so a P0c run file holding every llama.cpp profile can be
           passed as is; the other profiles' rows are skipped and counted per profile in
           batched.n_skipped_other_profiles.
---idle:   optional JSON of the idle readings in W, {profile: {none_before, loaded_before, none_after,
-          loaded_after}} (no process and llama-server loaded, before and after the sub-run), copied to
+--idle:   optional outputs/energy/idle_<run_id>.json from the harness: {profile: {none_before_w,
+          loaded_before_w, loaded_after_w, none_after_w (W; no process and llama-server loaded, before and
+          after the sub-run), window_s, settle_s, t: {reading: epoch s}}}, copied to
           energy_model.json["idle_readings_w"] after validation; null when not given.
 
 The --subrun attempts of every profile must cover the same task_ids (04 P0a); the script stops otherwise.
