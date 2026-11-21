@@ -299,6 +299,27 @@ def test_projection_scenarios_64k_x16_and_128k_x8():
     assert "| vllm | BF16 | synthetic 128K x 8 | 250.0 | 2500.0 |" in md
 
 
+def test_64k_x16_tool_time_shares_over_the_containers_alive_at_once():
+    # Owner's agent on PR #7 (answer 3): divide tool time by extras concurrency.containers, assuming 16 (and
+    # saying so) until the harness writes it. 128K x 8 keeps its 8 slots.
+    stats = attempt_stats([rec("vllm", "submitted", 0, 600)])
+    s, rates = stats["vllm"], {"vllm": {"BF16": RATE}}
+    extras = {"rates": rates, "rates_128k_x8": rates, "concurrency": {"containers": 12, "vcpus_per_container": 4}}
+    p = projections(stats, extras)["scenarios"]
+    assert p["64K x 16"]["steps"]["P0b"]["point_hours"] == project_hours(s, RATE, 4800, 12)["hours"]
+    assert p["128K x 8"]["steps"]["P0b"]["point_hours"] == project_hours(s, RATE, 4800, 8)["hours"]
+    md = render_markdown(stats, [], extras, projections(stats, extras))
+    assert "tool time shared over 12 containers (extras concurrency.containers)" in md
+    assumed = projections(stats, {"rates": rates})
+    assert assumed["scenarios"]["64K x 16"]["tool_containers"] == 16
+    assert assumed["scenarios"]["64K x 16"]["steps"]["P0b"]["point_hours"] == project_hours(s, RATE, 4800, 16)["hours"]
+    assert ("tool time shared over 16 containers (assumed until extras concurrency.containers is written)"
+            in render_markdown(stats, [], {"rates": rates}, assumed))
+    for bad in (0, "16", True, None):
+        with pytest.raises(ValueError, match="concurrency.containers"):
+            projections(stats, {"rates": rates, "concurrency": {"containers": bad}})
+
+
 def test_bf16_throughput_ratio_for_the_optional_p0b_rule():
     # Audit gap 6.
     stats = attempt_stats([rec("vllm", "submitted", 0, 600), rec("llama.cpp", "submitted", 0, 600)])

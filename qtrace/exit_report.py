@@ -42,6 +42,9 @@ SAMPLER = {"temperature": 0.6, "top_p": 0.95, "top_k": 20, "min_p": 0.0, "presen
 # 04 asks for projections at 64K x 16 and 128K x 8: scenario -> (extras key of its measured rates, slots).
 # 128K x 8 has no fallback: its rate must be measured, since a scaling from 64K would be a guess.
 SCENARIOS = {"64K x 16": ("rates", 16), "128K x 8": ("rates_128k_x8", 8)}
+# Owner's agent on PR #7 (answer 3): 64K x 16 shares tool time over extras concurrency.containers, the
+# containers alive at once (16 in normal runs), assumed 16 until the harness writes it.
+CONTAINERS_SCENARIO = "64K x 16"
 # PR #11: one BF16 vs Q3_K_M scoring of a 16.5K-token run took about 43 s, both model loads included.
 KL_SCORING = {"machine": "M5 Pro, llama.cpp b1b770d9 Metal (PR #11)", "seconds_per_run": 43.0,
               "tokens_per_run": 16500}
@@ -266,8 +269,21 @@ def _rate(extras, key, runtime, profile, pilot):
     return None, None, None
 
 
-def _scenario(stats, extras, key, slots):
-    """Instance-hours per P0 step at one context x slots shape. Tool time is shared over `slots` containers."""
+def _tool_containers(extras):
+    """(containers, where the number came from) for CONTAINERS_SCENARIO's tool time."""
+    c = extras.get("concurrency")
+    if c is None or (isinstance(c, dict) and "containers" not in c):
+        return SCENARIOS[CONTAINERS_SCENARIO][1], "assumed until extras concurrency.containers is written"
+    n = c.get("containers") if isinstance(c, dict) else None
+    if isinstance(n, bool) or not isinstance(n, int) or n < 1:
+        raise ValueError(f"extras concurrency.containers must be a positive int, got {n!r}")
+    return n, "extras concurrency.containers"
+
+
+def _scenario(stats, extras, key, slots, tool):
+    """Instance-hours per P0 step at one context x slots shape. Tool time is shared over tool = (containers,
+    source) containers."""
+    containers, containers_from = tool
     steps, missing = {}, []
     for step, (runtime, profiles) in P0_STEPS.items():
         if runtime not in stats:
@@ -281,9 +297,9 @@ def _scenario(stats, extras, key, slots):
                 missing.append(f"{step}: no synthetic rate (extras {key}) for {runtime} {profile}{note}")
                 break
             rows[profile] = {"rate_from": rate_from, "rate_source": source,
-                             "point_hours": project_hours(s, rate, point, slots)["hours"],
-                             "upper_hours": project_hours(s, rate, upper, slots)["hours"],
-                             "ideal_cache_hours": project_hours(s, rate, point, slots, realized=False)["hours"]}
+                             "point_hours": project_hours(s, rate, point, containers)["hours"],
+                             "upper_hours": project_hours(s, rate, upper, containers)["hours"],
+                             "ideal_cache_hours": project_hours(s, rate, point, containers, realized=False)["hours"]}
         else:
             steps[step] = {"runtime": runtime, "profiles": rows,
                            **{k: sum(v[k] for v in rows.values())
@@ -294,7 +310,8 @@ def _scenario(stats, extras, key, slots):
         steps["energy_sub_run"] = {"runtime": "llama.cpp", "serial": True, "attempts": SUB_RUN["attempts"],
                                    "point_hours": h / 3600, "upper_hours": h / 3600, "ideal_cache_hours": h / 3600}
     total = {k: sum(v[k] for v in steps.values()) for k in ("point_hours", "upper_hours", "ideal_cache_hours")}
-    return {"slots": slots, "rates_key": key, "steps": steps, "total": total if steps else None, "missing": missing}
+    return {"slots": slots, "rates_key": key, "tool_containers": containers, "tool_containers_from": containers_from,
+            "steps": steps, "total": total if steps else None, "missing": missing}
 
 
 def _bf16_ratio(stats, extras):
@@ -351,7 +368,10 @@ def projections(stats, extras):
     otherwise it is listed under the scenario's "missing".
     """
     _check_rates(extras)
-    return {"scenarios": {name: _scenario(stats, extras, key, slots) for name, (key, slots) in SCENARIOS.items()},
+    tools = {name: (slots, f"the scenario's {slots} slots") for name, (_, slots) in SCENARIOS.items()}
+    tools[CONTAINERS_SCENARIO] = _tool_containers(extras)
+    return {"scenarios": {name: _scenario(stats, extras, key, slots, tools[name])
+                          for name, (key, slots) in SCENARIOS.items()},
             "bf16_throughput_ratio": _bf16_ratio(stats, extras),
             "kl_scoring": kl_hours(stats, extras),
             "not_included": NOT_INCLUDED}
@@ -425,7 +445,8 @@ def _md_projections(projections):
               "bound too (runs that hit 64K would have continued).")]
     for name, sc in projections["scenarios"].items():
         lines += ["", f"### {name}", "", (f"Rates from extras `{sc['rates_key']}`; tool time shared over "
-                  f"{sc['slots']} slots."), "", "| step | runtime | rates | point h | upper h | ideal-cache h |",
+                  f"{sc['tool_containers']} containers ({sc['tool_containers_from']})."), "",
+                  "| step | runtime | rates | point h | upper h | ideal-cache h |",
                   "|---|---|---|---|---|---|"]
         for step, v in sc["steps"].items():
             src = ", ".join(f"{p}: {r['rate_from']} {r['rate_source']}" for p, r in v.get("profiles", {}).items())
