@@ -29,6 +29,7 @@ from qtrace.energy_model import (
     pair_ordering,
     pick_agreement,
     pool_records,
+    profile_report,
 )
 
 # Planted active (idle-subtracted) joules per turn; each term is a visible share of a turn's energy.
@@ -391,7 +392,6 @@ def test_malformed_inputs_fail_loudly():
         (lambda r: r["per_turn"][1].update(input_uncached=-5), "input_uncached"),
         (lambda r: r["per_turn"][1].pop("gen_energy_j"), "gen_energy_j"),
         (lambda r: r["per_turn"][1].update(gen_energy_j=float("nan")), "gen_energy_j"),
-        (lambda r: r["energy"].pop("idle_w_ref"), "idle_w_ref"),
         (lambda r: r.pop("concurrency"), "concurrency"),
         (lambda r: r.pop("end_reason"), "end_reason"),
         (lambda r: r.update(per_turn=[]), "per_turn"),
@@ -429,6 +429,26 @@ def test_malformed_inputs_fail_loudly():
         fit_batched([{"t": 0.0, "counter_j": 1.0, "prompt_tokens_total": 1}] * 2, [])
 
 
+def test_a_broken_target_or_profile_is_reported_and_the_rest_still_fit():
+    # Review of PR #13: the raw fit needs neither idle_w_ref nor gen_s, and one profile's failure is
+    # reported in its entry instead of stopping the run.
+    recs = subrun(PLANT, n_tasks=3)
+    recs[0]["energy"].pop("idle_w_ref")
+    recs[1]["per_turn"][0].pop("gen_s")
+    rep = profile_report(fit_attempts(recs)[0]["Q4_K_M"], n_boot=0)
+    assert "intercept" in rep["raw"]["terms"]
+    err = rep["idle_subtracted"]["error"]
+    assert "idle_w_ref" in err and recs[0]["attempt_id"] in err and recs[1]["attempt_id"] in err
+
+    hot = subrun(PLANT, n_tasks=3)
+    hot[0]["energy"]["idle_w_ref"] = 1e6  # idle reference above the measured draw
+    rep = profile_report(fit_attempts(hot)[0]["Q4_K_M"], n_boot=0)
+    assert "non-positive" in rep["idle_subtracted"]["error"] and "terms" in rep["raw"]
+
+    small = profile_report(fit_attempts(subrun(PLANT, n_tasks=1))[0]["Q4_K_M"], n_boot=0)
+    assert small["n_attempts"] == 2 and all("at least 3" in small[t]["error"] for t in ("raw", "idle_subtracted"))
+
+
 def test_pool_records_drop_and_count_infrastructure_errors():
     kept, n_error = pool_records([pool_rec("a", "t", 1, 1), pool_rec("b", "t", 1, 1, end_reason="error")])
     assert [r["attempt_id"] for r in kept] == ["a"] and n_error == 1
@@ -441,8 +461,9 @@ def test_cli_writes_model_and_estimates(tmp_path):
     concurrent = copy.deepcopy(q4[1])
     concurrent.update(attempt_id="conc", concurrency=16)
     concurrent["energy"] = {"gpu_j": None, "attributable": False, "idle_w_ref": None}
+    q8 = subrun(PLANT, seed=3, n_tasks=1, profile="Q8_0")  # 2 attempts: too few to fit, reported, not fatal
     sub = tmp_path / "sub.jsonl"
-    sub.write_text("".join(json.dumps(r) + "\n" for r in q4 + bf16 + [concurrent]))
+    sub.write_text("".join(json.dumps(r) + "\n" for r in q4 + bf16 + q8 + [concurrent]))
 
     rng = np.random.default_rng(9)
     pool = [make_attempt(rng, f"p{t}-{a}", f"p{t}", PLANT, profile="BF16") for t in range(20) for a in range(4)]
@@ -462,7 +483,9 @@ def test_cli_writes_model_and_estimates(tmp_path):
     res = subprocess.run([sys.executable, script, *args], capture_output=True, text=True, check=False)
     assert res.returncode == 0, res.stderr
     em = json.loads((out / "energy_model.json").read_text())
-    assert em["fewest_joules_fallback"] is False and set(em["profiles"]) == {"Q4_K_M", "BF16"}
+    assert em["fewest_joules_fallback"] is False and set(em["profiles"]) == {"Q4_K_M", "BF16", "Q8_0"}
+    assert "at least 3" in em["profiles"]["Q8_0"]["raw"]["error"]
+    assert "Q8_0" in res.stdout and "at least 3" in res.stdout
     assert em["excluded_subrun_attempts"] == {"concurrency_not_1": 1}
     assert em["profiles"]["Q4_K_M"]["idle_subtracted"]["coef"]["output"] == pytest.approx(2.0, rel=0.05)
     assert em["profiles"]["BF16"]["idle_subtracted"]["coef"]["output"] == pytest.approx(3.0, rel=0.05)

@@ -70,29 +70,35 @@ def turn_features(turn, where="turn"):
 def attempt_arrays(rec):
     """Feature matrix and both targets over the turns of `rec` with a measured gen_energy_j.
 
-    Returns {attempt_id, task_id, profile, X [n, 6], raw [n], idle_subtracted [n], n_unmeasured,
-    server_cached_differs (None when the server count is null)}. Idle-subtracted turn joules may be
+    Returns {attempt_id, task_id, profile, X [n, 6], raw [n], idle_subtracted [n] or None, idle_error,
+    n_unmeasured, server_cached_differs (None when the server count is null)}. The raw target needs
+    only gen_energy_j; a missing or invalid energy.idle_w_ref or gen_s sets idle_subtracted to None and
+    idle_error to the reason, so only the idle-subtracted fit fails. Idle-subtracted turn joules may be
     negative on tiny turns; only attempt sums must be positive (checked in fit_profile).
     """
     aid = _get(rec, "attempt_id", "attempt")
     where = f"attempt {aid!r}"
-    idle_w = _num(_get(_get(rec, "energy", where), "idle_w_ref", where), f"{where}: energy.idle_w_ref")
-    X, raw, idle = [], [], []
+    X, raw, gen_s = [], [], []
     turns = _turns(rec)
     for i, t in enumerate(turns):
         w = f"{where} turn {i}"
         e = _get(t, "gen_energy_j", w)
         if e is None:
             continue
-        e, s = _num(e, f"{w}: gen_energy_j"), _num(_get(t, "gen_s", w), f"{w}: gen_s")
         X.append(turn_features(t, w))
-        raw.append(e)
-        idle.append(e - idle_w * s)
+        raw.append(_num(e, f"{w}: gen_energy_j"))
+        gen_s.append((t.get("gen_s"), f"{w}: gen_s"))
+    idle, idle_error = None, None
+    try:
+        idle_w = _num(_get(rec, "energy", where).get("idle_w_ref"), f"{where}: energy.idle_w_ref")
+        idle = np.array(raw) - idle_w * np.array([_num(v, w) for v, w in gen_s])
+    except ValueError as err:
+        idle_error = str(err)
     tokens = _get(rec, "tokens", where)
     server = tokens.get("server_reported_cached")
     return {"attempt_id": aid, "task_id": _get(rec, "task_id", where), "profile": _get(rec, "profile", where),
             "X": np.array(X, dtype=float).reshape(-1, len(TERMS)), "raw": np.array(raw),
-            "idle_subtracted": np.array(idle), "n_unmeasured": len(turns) - len(raw),
+            "idle_subtracted": idle, "idle_error": idle_error, "n_unmeasured": len(turns) - len(raw),
             "server_cached_differs": None if server is None else server != _get(tokens, "input_cached", where)}
 
 
@@ -228,11 +234,14 @@ def fit_profile(attempts, target="raw", n_boot=2000, seed=0):
     each chosen term), coef_ci95 (percentile bootstrap over attempts, terms held fixed, seeded),
     cv {loao, nested_loao},
     fallback (nested_loao above FALLBACK_MAX_REL_ERR), residuals, pairs (LOAO predictions), n_attempts,
-    n_turns}. Raises if there are fewer than 3 attempts (nested LOAO needs them) or an attempt's measured
-    sum is <= 0.
+    n_turns}. Raises if there are fewer than 3 attempts (nested LOAO needs them), an attempt has no
+    value for the target (idle_error), or an attempt's measured sum is <= 0.
     """
     if target not in TARGETS:
         raise ValueError(f"target must be one of {TARGETS}, got {target!r}")
+    missing = [a["idle_error"] for a in attempts if a[target] is None]
+    if missing:
+        raise ValueError(f"no {target} joules for {len(missing)} attempts: " + "; ".join(missing))
     n = len(attempts)
     if n < 3:
         raise ValueError(f"nested LOAO needs at least 3 attempts per profile, got {n} "
@@ -279,8 +288,19 @@ def fit_profile(attempts, target="raw", n_boot=2000, seed=0):
             "n_attempts": n, "n_turns": int(sum(len(y) for y in ys)), "n_boot": n_boot, "seed": seed}
 
 
+def _fit_or_error(attempts, target, n_boot, seed):
+    try:
+        return fit_profile(attempts, target=target, n_boot=n_boot, seed=seed)
+    except ValueError as err:
+        return {"error": str(err)}
+
+
 def profile_report(attempts, n_boot=2000, seed=0):
-    """One profile's entry in energy_model.json: both targets, the calibration range and the cache-count check."""
+    """One profile's entry in energy_model.json: both targets, the calibration range and the cache-count check.
+
+    A target whose fit fails (too few attempts, missing idle reference, non-positive sums) is reported
+    as {"error": message}, so one broken fit never takes the other target or profile with it.
+    """
     X = np.vstack([a["X"] for a in attempts])
     flags = [a["server_cached_differs"] for a in attempts]
     known = [f for f in flags if f is not None]
@@ -295,7 +315,7 @@ def profile_report(attempts, n_boot=2000, seed=0):
             "server_cache_mismatch": {"n_attempts": len(flags), "n_differ": sum(known),
                                       "n_missing": len(flags) - len(known),
                                       "share_differ": sum(known) / len(known) if known else None},
-            **{t: fit_profile(attempts, target=t, n_boot=n_boot, seed=seed) for t in TARGETS}}
+            **{t: _fit_or_error(attempts, t, n_boot, seed) for t in TARGETS}}
 
 
 def estimate_attempt_joules(rec, model):

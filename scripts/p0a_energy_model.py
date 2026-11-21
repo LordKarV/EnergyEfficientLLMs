@@ -68,12 +68,14 @@ def main():
         raise SystemExit(f"no usable {RANK_PROFILE} sub-run attempts; runs are ranked with its coefficients")
     profiles = {p: profile_report(a, n_boot=args.n_boot, seed=args.seed) for p, a in sorted(by_profile.items())}
     model = profiles[RANK_PROFILE][RANK_TARGET]
+    if "error" in model:
+        raise SystemExit(f"the {RANK_PROFILE} {RANK_TARGET} fit used for ranking failed: {model['error']}")
     pool, n_error = pool_records([r for p in args.pool for r in read_jsonl(p)])
     q4 = {r["attempt_id"]: estimate_attempt_joules(r, model) for r in pool}
     by_q4 = lambda r: q4[r["attempt_id"]]
 
     bf16 = None
-    if "BF16" in profiles:
+    if "BF16" in profiles and "error" not in profiles["BF16"][RANK_TARGET]:
         bf16 = pick_agreement(pool, lambda r: estimate_attempt_joules(r, profiles["BF16"][RANK_TARGET]), by_q4,
                               args.min_candidates)
     batched = None
@@ -111,6 +113,9 @@ def main():
     for p, rep in profiles.items():
         for t in TARGETS:
             r = rep[t]
+            if "error" in r:
+                print(f"{p:8} {t:16} not fitted: {r['error']}")
+                continue
             pairs = f"{r['pairs']['n_correct']}/{r['pairs']['n_pairs']}"
             print(f"{p:8} {t:16} {pct(r['cv']['nested_loao']):>7} {pct(r['cv']['loao']):>7} {pairs:>6}  "
                   + "+".join(r["terms"]))
