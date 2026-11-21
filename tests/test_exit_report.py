@@ -120,6 +120,10 @@ def test_flagged_share_by_profile_and_strict_field():
     del rows[2]["grading"]["test_files_touched"]
     with pytest.raises(KeyError):
         attempt_stats(rows)
+    for bad in (None, 0, 1):  # a 0 would print a 0.0% flagged share instead of stopping
+        rows[2]["grading"]["test_files_touched"] = bad
+        with pytest.raises(TypeError, match="must be a bool"):
+            attempt_stats(rows)
 
 
 @pytest.mark.parametrize("field,value", [("runtime", "vLLM"), ("profile", "Q4_K_M_gates")])

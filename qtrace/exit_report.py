@@ -44,6 +44,14 @@ def attempt_stats(rows):
     return {rt: _stats(rs) for rt, rs in sorted(by_runtime.items())}
 
 
+def _flagged(rec):
+    """grading.test_files_touched, a required bool (as p0d.flagged reads it): missing raises, a null or 0/1 too."""
+    v = rec["grading"]["test_files_touched"]
+    if not isinstance(v, bool):
+        raise TypeError(f"attempt {rec.get('attempt_id')!r}: grading.test_files_touched must be a bool, got {v!r}")
+    return v
+
+
 def _stats(rows):
     n = len(rows)
     span = max(r["energy"]["t_end"] for r in rows) - min(r["energy"]["t_start"] for r in rows)
@@ -54,7 +62,7 @@ def _stats(rows):
     m = len(scored)
     by_profile = defaultdict(list)
     for r in scored:
-        by_profile[r["profile"]].append(r["grading"]["test_files_touched"])  # required bool: missing raises
+        by_profile[r["profile"]].append(_flagged(r))
     turns = sum(r["turns"] for r in rows)
     tok = {k: sum(r["tokens"][k] for r in rows) for k in ("output", "input_uncached", "input_cached")}
     # A missing or null count means the server did not report it (as in #13); the realized split then needs all.
