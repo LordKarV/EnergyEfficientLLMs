@@ -15,8 +15,11 @@
           windows with gen_t_start, gen_t_first_token and gen_t_end (the server counters are a cross-check).
 
 Writes energy_model.json ({"profiles": {...}, "fewest_joules_fallback": bool, ...}) and
-est_joules.jsonl (one {attempt_id, est_joules_q4} per pool attempt, written even under the fallback;
-selection obeys the flag). The fallback reads the nested LOAO error of the raw Q4_K_M fit.
+est_joules.jsonl (one {attempt_id, est_joules_q4, est_gen_joules_q4} per pool attempt, written even under
+the fallback; selection obeys the flag). The fallback reads the nested LOAO error of the raw Q4_K_M fit.
+est_joules_q4 is the provisional whole-attempt estimate used for ranking (generation-window model plus
+the profile's idle_w x tool_seconds); est_gen_joules_q4 is its generation-window part. The pick-agreement
+checks compare whole-attempt estimates, each profile with its own idle_w.
 """
 
 import argparse
@@ -70,13 +73,19 @@ def main():
     model = profiles[RANK_PROFILE][RANK_TARGET]
     if "error" in model:
         raise SystemExit(f"the {RANK_PROFILE} {RANK_TARGET} fit used for ranking failed: {model['error']}")
+    idle_w = profiles[RANK_PROFILE]["idle_w"]
+    if idle_w is None:
+        raise SystemExit(f"no valid energy.idle_w_ref in the {RANK_PROFILE} sub-run; the whole-attempt estimate "
+                         "charges idle_w per tool second")
     pool, n_error = pool_records([r for p in args.pool for r in read_jsonl(p)])
-    q4 = {r["attempt_id"]: estimate_attempt_joules(r, model) for r in pool}
+    q4_gen = {r["attempt_id"]: estimate_attempt_joules(r, model) for r in pool}
+    q4 = {r["attempt_id"]: estimate_attempt_joules(r, model, idle_w=idle_w) for r in pool}
     by_q4 = lambda r: q4[r["attempt_id"]]
 
     bf16 = None
-    if "BF16" in profiles and "error" not in profiles["BF16"][RANK_TARGET]:
-        bf16 = pick_agreement(pool, lambda r: estimate_attempt_joules(r, profiles["BF16"][RANK_TARGET]), by_q4,
+    b = profiles.get("BF16")
+    if b and "error" not in b[RANK_TARGET] and b["idle_w"] is not None:
+        bf16 = pick_agreement(pool, lambda r: estimate_attempt_joules(r, b[RANK_TARGET], idle_w=b["idle_w"]), by_q4,
                               args.min_candidates)
     batched = None
     if args.windows:
@@ -90,7 +99,10 @@ def main():
         batched = {**fit, "agreement_with_c1": agree, "below_85pct": None if share is None else share < AGREEMENT_MIN}
 
     report = {
-        "ranking": {"profile": RANK_PROFILE, "target": RANK_TARGET},
+        "ranking": {"profile": RANK_PROFILE, "target": RANK_TARGET, "quantity": "whole_attempt_raw_joules",
+                    "idle_w": idle_w, "provisional": True,
+                    "rule": "generation-window model + idle_w x tool_seconds; provisional until the owner "
+                            "confirms the endpoint (issue #1, question 2)"},
         "fewest_joules_fallback": model["fallback"],
         "fallback_rule": f"nested LOAO median absolute relative error on attempt joules > {FALLBACK_MAX_REL_ERR} "
                          f"({RANK_PROFILE}, {RANK_TARGET}); fewest_joules then falls back to fewest_turns",
@@ -107,7 +119,7 @@ def main():
     with open(os.path.join(args.out, "energy_model.json"), "w") as f:
         json.dump(report, f, indent=1, allow_nan=False)
     write_jsonl(os.path.join(args.out, "est_joules.jsonl"),
-                [{"attempt_id": aid, "est_joules_q4": j} for aid, j in q4.items()])
+                [{"attempt_id": aid, "est_joules_q4": j, "est_gen_joules_q4": q4_gen[aid]} for aid, j in q4.items()])
 
     print(f"{'profile':8} {'target':16} {'nested':>7} {'loao':>7} {'pairs':>6}  terms")
     for p, rep in profiles.items():

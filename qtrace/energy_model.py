@@ -19,6 +19,14 @@ joules against its summed measured ones). Ties go to fewer terms, then the lower
 pre-registered fewest_joules fallback reads the nested LOAO error, where the term choice is redone
 inside each outer fold, because the plain LOAO error of a chosen term set is optimistic.
 
+Whole-attempt joules (provisional, pending the owner's answer to our question 2 in issue #1): the
+P2 endpoint and the fewest_joules ranking use raw GPU joules over the whole attempt, since a
+single-user local agent keeps the GPU powered while tools run. They are estimated as the
+generation-window model plus idle_w x tool_seconds (estimate_attempt_joules with idle_w), so a run
+that waits on a slow test suite is charged for it. idle_w is per profile: the median of the fitted
+sub-run attempts' energy.idle_w_ref, robust to one bad idle reading. The fit itself stays on raw
+generation windows, where the intercept and the token terms absorb the idle draw while generating.
+
 NNLS is exact without scipy: with k <= 6 terms, the NNLS solution is the least-squares fit on its
 active set, so fitting every column subset and keeping the best one with no negative coefficient
 finds it. Everything runs on per-attempt Gram matrices, so a fold or bootstrap draw is a sum.
@@ -89,7 +97,7 @@ def attempt_arrays(rec):
         X.append(turn_features(t, w))
         raw.append(_num(e, f"{w}: gen_energy_j"))
         gen_s.append((t.get("gen_s"), f"{w}: gen_s"))
-    idle, idle_error = None, None
+    idle, idle_error, idle_w = None, None, None
     try:
         idle_w = _num(_get(rec, "energy", where).get("idle_w_ref"), f"{where}: energy.idle_w_ref")
         idle = np.array(raw) - idle_w * np.array([_num(v, w) for v, w in gen_s])
@@ -99,7 +107,8 @@ def attempt_arrays(rec):
     server = tokens.get("server_reported_cached")
     return {"attempt_id": aid, "task_id": _get(rec, "task_id", where), "profile": _get(rec, "profile", where),
             "X": np.array(X, dtype=float).reshape(-1, len(TERMS)), "raw": np.array(raw),
-            "idle_subtracted": idle, "idle_error": idle_error, "n_unmeasured": len(turns) - len(raw),
+            "idle_subtracted": idle, "idle_error": idle_error, "idle_w_ref": idle_w,
+            "n_unmeasured": len(turns) - len(raw),
             "server_cached_differs": None if server is None else server != _get(tokens, "input_cached", where),
             "turn_cached_differs": [_num(t["server_reported_cached"], f"{where} turn {i}: server_reported_cached")
                                     != t["input_cached"] for i, t in enumerate(turns)
@@ -313,9 +322,14 @@ def profile_report(attempts, n_boot=2000, seed=0):
               for t in ("output", "uncached", "context")}
     n_turns = [len(a["raw"]) for a in attempts]
     per_turn = [f for a in attempts for f in a["turn_cached_differs"]]
+    idle_refs = [a["idle_w_ref"] for a in attempts if a["idle_w_ref"] is not None]
     return {"n_attempts": len(attempts), "n_turns": len(X),
             "n_turns_unmeasured": sum(a["n_unmeasured"] for a in attempts),
             "calibration_range": {**rng_of, "turns_per_attempt": [min(n_turns), max(n_turns)]},
+            # Provisional whole-attempt estimate: W charged per tool second (module docstring).
+            "idle_w": float(np.median(idle_refs)) if idle_refs else None,
+            "idle_w_ref": {"n": len(idle_refs), "min": min(idle_refs, default=None),
+                           "max": max(idle_refs, default=None)},
             # 04: how often llama.cpp's per-request cached-prompt counts differ from the ideal split. The
             # attempt-total comparison stays for records without per-turn server counts.
             "server_cache_mismatch": {"n_attempts": len(flags), "n_differ": sum(known),
@@ -324,22 +338,29 @@ def profile_report(attempts, n_boot=2000, seed=0):
                                       "per_request": {"n_requests": len(per_turn), "n_differ": sum(per_turn),
                                                       "share_differ": sum(per_turn) / len(per_turn) if per_turn
                                                       else None,
-                                                      "n_missing": sum(a["n_turns"] for a in attempts) - len(per_turn)}},
+                                                      "n_missing": sum(a["n_turns"] for a in attempts)
+                                                      - len(per_turn)}},
             **{t: _fit_or_error(attempts, t, n_boot, seed) for t in TARGETS}}
 
 
-def estimate_attempt_joules(rec, model):
-    """Estimated generation-window joules of an attempt: predicted turn joules summed over rec["per_turn"].
+def estimate_attempt_joules(rec, model, idle_w=None):
+    """Estimated joules of an attempt: predicted turn joules summed over rec["per_turn"].
 
     model: a fit_profile report or any {"coef": {term: J per unit}}; terms left out count as 0. Rank
-    runs with energy_model.json["profiles"]["Q4_K_M"]["raw"]. Tool-window energy is not included.
+    runs with energy_model.json["profiles"]["Q4_K_M"]["raw"]. With idle_w None (the default) this is
+    generation windows only; with idle_w (W, the profile's "idle_w") it adds idle_w x rec["tool_seconds"],
+    the provisional whole-attempt estimate.
     """
     unknown = set(model["coef"]) - set(TERMS)
     if unknown:
         raise ValueError(f"unknown energy-model terms {sorted(unknown)}; expected a subset of {TERMS}")
     w = np.array([model["coef"].get(t, 0.0) for t in TERMS])
     aid = rec.get("attempt_id")
-    return float(sum(w @ turn_features(t, f"attempt {aid!r} turn {i}") for i, t in enumerate(_turns(rec))))
+    gen = float(sum(w @ turn_features(t, f"attempt {aid!r} turn {i}") for i, t in enumerate(_turns(rec))))
+    if idle_w is None:
+        return gen
+    where = f"attempt {aid!r}"
+    return gen + _num(idle_w, "idle_w") * _num(_get(rec, "tool_seconds", where), f"{where}: tool_seconds")
 
 
 def pool_records(records):

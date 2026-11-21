@@ -65,7 +65,8 @@ def make_attempt(rng, aid, task, coef, noise=0.01, attempt_noise=0.0, profile="Q
             "tokens": {"output": sum(t["output_tokens"] for t in turns),
                        "input_uncached": sum(t["input_uncached"] for t in turns), "input_cached": tot_cached,
                        "server_reported_cached": tot_cached},
-            "per_turn": turns, "energy": {"gpu_j": None, "attributable": True, "idle_w_ref": IDLE_W}}
+            "per_turn": turns, "tool_seconds": sum(t["tool_s"] for t in turns),
+            "energy": {"gpu_j": None, "attributable": True, "idle_w_ref": IDLE_W}}
 
 
 def subrun(coef, seed=0, n_tasks=15, per_task=2, profile="Q4_K_M", **kw):
@@ -244,6 +245,26 @@ def test_estimate_attempt_joules_sums_predicted_turns():
                                            {"output_tokens": 20, "input_uncached": 50, "input_cached": 110}]}
     model = {"coef": {"output": 2.0, "output_x_context": 0.01, "intercept": 5.0}}
     assert estimate_attempt_joules(rec, model) == pytest.approx((20 + 5) + (40 + 0.01 * 20 * 110 + 5))
+
+
+def test_whole_attempt_estimate_adds_idle_power_over_tool_seconds():
+    rec = {"attempt_id": "x", "tool_seconds": 30.0,
+           "per_turn": [{"output_tokens": 10, "input_uncached": 100, "input_cached": 0}]}
+    model = {"coef": {"output": 2.0, "intercept": 5.0}}
+    assert estimate_attempt_joules(rec, model) == pytest.approx(25.0)  # default: generation windows only
+    assert estimate_attempt_joules(rec, model, idle_w=40.0) == pytest.approx(25.0 + 40.0 * 30.0)
+    with pytest.raises(ValueError, match="tool_seconds"):
+        estimate_attempt_joules({k: v for k, v in rec.items() if k != "tool_seconds"}, model, idle_w=40.0)
+
+
+def test_profile_idle_power_is_the_median_idle_reference():
+    recs = subrun(PLANT, n_tasks=3)
+    for r, w in zip(recs, [38.0, 40.0, 41.0, 42.0, 90.0]):  # one bad reading; the sixth stays at IDLE_W
+        r["energy"]["idle_w_ref"] = w
+    rep = profile_report(fit_attempts(recs)[0]["Q4_K_M"], n_boot=0)
+    assert rep["idle_w"] == pytest.approx((40.0 + 41.0) / 2) and rep["idle_w_ref"] == {"n": 6, "min": 38.0, "max": 90.0}
+    recs[0]["energy"].pop("idle_w_ref")
+    assert profile_report(fit_attempts(recs)[0]["Q4_K_M"], n_boot=0)["idle_w_ref"]["n"] == 5
 
 
 def test_pick_agreement_and_candidate_rules():
@@ -517,11 +538,15 @@ def test_cli_writes_model_and_estimates(tmp_path):
     assert b["below_85pct"] == (b["agreement_with_c1"]["share_same_pick"] < 0.85)
 
     rows = [json.loads(line) for line in (out / "est_joules.jsonl").read_text().splitlines()]
-    assert len(rows) == 79 and set(rows[0]) == {"attempt_id", "est_joules_q4"}
+    assert len(rows) == 79 and set(rows[0]) == {"attempt_id", "est_joules_q4", "est_gen_joules_q4"}
     model = em["profiles"]["Q4_K_M"]["raw"]
+    assert em["ranking"]["provisional"] is True and em["ranking"]["idle_w"] == em["profiles"]["Q4_K_M"]["idle_w"]
+    assert em["profiles"]["Q4_K_M"]["idle_w"] == IDLE_W
     by_id = {r["attempt_id"]: r for r in pool}
-    assert all(r["est_joules_q4"] == pytest.approx(estimate_attempt_joules(by_id[r["attempt_id"]], model))
-               for r in rows)
+    for r in rows:
+        rec = by_id[r["attempt_id"]]
+        assert r["est_gen_joules_q4"] == pytest.approx(estimate_attempt_joules(rec, model))
+        assert r["est_joules_q4"] == pytest.approx(r["est_gen_joules_q4"] + IDLE_W * rec["tool_seconds"])
 
     bf16_only = tmp_path / "bf16.jsonl"
     bf16_only.write_text("".join(json.dumps(r) + "\n" for r in bf16))
