@@ -271,7 +271,7 @@ def test_lora_dropout_above_zero_fails():
         fq.apply(get_peft_model(tiny_qwen35(), config), tiny_table())
 
 
-def test_script_trains_random_fq_and_saves_plain_merged_weights(tmp_path):
+def test_script_trains_random_fq_and_saves_plain_merged_weights(tmp_path, monkeypatch):
     from transformers import AutoModelForCausalLM
 
     cfg_path, ckpt = write_setup(tmp_path)
@@ -280,8 +280,13 @@ def test_script_trains_random_fq_and_saves_plain_merged_weights(tmp_path):
     cfg = yaml.safe_load(cfg_path.read_text())
     cfg["fake_quant"] = {"enabled": True, "table": str(tmp_path / "table.json")}
     cfg_path.write_text(yaml.safe_dump(cfg))
-    load_script().main(["--config", str(cfg_path), "--arm", "random", "--seed", "0", "--allow-slow-kernels",
-                        "--device", "cpu"])
+    script, order = load_script(), []
+    real_idle, real_apply = script.idle_reading, script.fake_quant.apply
+    monkeypatch.setattr(script, "idle_reading", lambda: order.append("idle") or real_idle())
+    monkeypatch.setattr(script.fake_quant, "apply", lambda *a: order.append("fq") or real_apply(*a))
+    script.main(["--config", str(cfg_path), "--arm", "random", "--seed", "0", "--allow-slow-kernels",
+                 "--device", "cpu"])
+    assert order == ["idle", "fq", "idle"]  # the loaded-idle reading sees the fake-quantized model, before step 1
     run = tmp_path / "runs" / "random_fq_seed0"
     meta = json.loads((run / "train_meta.json").read_text())
     assert meta["arm"] == "random" and meta["fake_quant"]["table"] == str(tmp_path / "table.json")
@@ -292,7 +297,7 @@ def test_script_trains_random_fq_and_saves_plain_merged_weights(tmp_path):
     # the same training-cost record (owner answer on #15): whole run primary, training loop secondary
     cost = meta["training_cost"]
     assert cost["primary"] == "whole_run" and cost["gpu_index"] == 0 and "null_reason" in cost
-    assert {"idle_watts", "idle_seconds"} <= set(cost)
+    assert set(cost["idle"]) == {"none_w", "loaded_w", "settle_s", "window_s"}
     for window in ("whole_run", "train_loop"):
         assert set(cost[window]) == {"wall_seconds", "gpu_hours", "gpu_joules", "gpu_joules_idle_subtracted"}
     assert cost["whole_run"]["wall_seconds"] > cost["train_loop"]["wall_seconds"] > 0
