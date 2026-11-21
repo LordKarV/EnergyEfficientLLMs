@@ -152,7 +152,38 @@ def flagged_share(rows):
     return {p: k[p] / n[p] for p in sorted(n)}
 
 
-def p0b_report(rows, inrepo_size, pool_total=3887, heldout_total=691, min_candidates=4, design=16):
+def _by_repo(tasks, min_candidates):
+    """repo -> task count, tasks with at least `min_candidates` successes, successes and attempts."""
+    out = defaultdict(lambda: {"n_tasks": 0, "n_ge4": 0, "successes": 0, "attempts": 0})
+    for s, k, repo in tasks.values():
+        d = out[repo]
+        d["n_tasks"] += 1
+        d["n_ge4"] += int(s >= min_candidates)
+        d["successes"] += s
+        d["attempts"] += k
+    return dict(out)
+
+
+def mixed_share_subsampled(counts, group=8, n_sub=5000, seed=0):
+    """Share of tasks whose group of `group` attempts mixes successes and failures (docs/03 S2 gate).
+
+    counts: [(successes, attempts)] per task. Each draw takes `group` of a task's attempts without
+    replacement, for every task at once; the mean and 95% interval are over draws. Tasks with fewer
+    attempts than `group` are left out and counted.
+    """
+    usable = [(s, k) for s, k in counts if k >= group]
+    out = {"group_size": group, "n_tasks": len(usable), "tasks_below_group_size": len(counts) - len(usable),
+           "n_sub": n_sub, "seed": seed, "mean": None, "ci95": None}
+    if not usable:
+        return out
+    s, k = np.array(usable).T
+    x = np.random.default_rng(seed).hypergeometric(s, k - s, group, size=(n_sub, len(usable)))
+    share = ((x > 0) & (x < group)).mean(axis=1)
+    return {**out, "mean": float(share.mean()), "ci95": [float(v) for v in np.percentile(share, [2.5, 97.5])]}
+
+
+def p0b_report(rows, inrepo_size, pool_total=3887, heldout_total=691, min_candidates=4, design=16, group=8,
+               n_sub=5000, seed=0):
     """Pool size, RL-usable share and the three P0b criteria, from the P0b run's BF16 attempts.
 
     Pool successes count unflagged runs only, because flagged runs can never be selection candidates.
@@ -172,10 +203,6 @@ def p0b_report(rows, inrepo_size, pool_total=3887, heldout_total=691, min_candid
     ge1 = sum(1 for s, _, _ in pool.values() if s >= 1)
     ge4 = sum(1 for s, _, _ in pool.values() if s >= min_candidates)
     mixed = sum(1 for s, k, _ in pool.values() if 0 < s < k)
-    by_repo = defaultdict(lambda: {"n_tasks": 0, "n_ge4": 0})
-    for s, _, repo in pool.values():
-        by_repo[repo]["n_tasks"] += 1
-        by_repo[repo]["n_ge4"] += int(s >= min_candidates)
     share = ge4 / ge1 if ge1 else 0.0
     projected = (ge4 / n) * (pool_total - inrepo_size) if n else 0.0
     held_pass1 = float(np.mean([s / k for s, k, _ in held.values()])) if held else None
@@ -183,10 +210,12 @@ def p0b_report(rows, inrepo_size, pool_total=3887, heldout_total=691, min_candid
     held_pass1_ex = float(np.mean([s / k for s, k, _ in held_ex.values()])) if held_ex else None
     short = sorted(t for t, (_, k, _) in {**pool, **held}.items() if k < design)
     return {
-        "pool": {"n_tasks": n, "n_ge1": ge1, "n_ge4": ge4, "by_repo": dict(by_repo),
+        "pool": {"n_tasks": n, "n_ge1": ge1, "n_ge4": ge4, "by_repo": _by_repo(pool, min_candidates),
                  "flagged_successes_excluded": sum(1 for r in rows if r["list"] == "pool200"
                                                    and r["profile"] == "BF16" and r["resolved"] and flagged(r))},
         "per_task": {t: {"successes": s, "attempts": k, "repo": repo} for t, (s, k, repo) in sorted(pool.items())},
+        "heldout_per_task": {t: {"successes": s, "attempts": k, "repo": repo} for t, (s, k, repo) in sorted(held.items())},
+        "heldout_by_repo": _by_repo(held, min_candidates),
         "tasks_below_design_attempts": short,
         "criteria": {"share_ge4_among_solvable": share},
         "projected_pool": projected,
@@ -194,6 +223,7 @@ def p0b_report(rows, inrepo_size, pool_total=3887, heldout_total=691, min_candid
         "heldout_mean_pass1_excluding_flagged": held_pass1_ex,
         "heldout_expected_resolves": None if held_pass1 is None else held_pass1 * heldout_total,
         "rl_share_mixed": mixed / n if n else 0.0,
+        "rl_share_mixed_g8": mixed_share_subsampled([(s, k) for s, k, _ in pool.values()], group, n_sub, seed),
         "pass": {"c1": share > 0.5, "c2": projected >= 500,
                  "c3": "not computed" if held_pass1 is None else held_pass1 * heldout_total >= 100},
         "mde_note": "simulated minimum detectable effect not computed here; added with the P2 analysis",

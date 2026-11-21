@@ -259,3 +259,35 @@ def test_cli_reports_flagged_and_infra_timeout_variants(tmp_path):
     q4 = g["P0c"]["Q4_K_M"]
     assert q4["excluding_flagged"]["L_total"] > q4["L_total"]  # dropping flagged Q4 successes widens the gap
     assert q4["sensitivity_excluding_infra_timeout"]["L_total"] == q4["L_total"]
+
+
+def test_p0b_tables_per_repo_heldout_per_task_and_mixed_share_at_group_8():
+    # Audit item "Complete the P0b report tables": docs/04 P0b report and docs/03 S2 gate input.
+    rows = []
+    for i, (k, repo) in enumerate([(0, "pandas"), (16, "pandas"), (1, "flask"), (8, "flask")]):
+        rows += [rec(f"p{i}", "BF16", a < k, lst="pool200", runtime="vllm", repo=repo) for a in range(16)]
+    for i, (k, repo) in enumerate([(4, "sympy"), (2, "sympy"), (8, "astropy")]):
+        rows += [rec(f"h{i}", "BF16", a < k, lst="heldout100", runtime="vllm", repo=repo) for a in range(16)]
+    r = p0b_report(rows, inrepo_size=300, n_sub=4000, seed=1)
+    assert r["pool"]["by_repo"]["flask"] == {"n_tasks": 2, "n_ge4": 1, "successes": 9, "attempts": 32}
+    assert r["heldout_by_repo"]["sympy"] == {"n_tasks": 2, "n_ge4": 1, "successes": 6, "attempts": 32}
+    assert r["heldout_per_task"]["h2"] == {"successes": 8, "attempts": 16, "repo": "astropy"}
+    g8 = r["rl_share_mixed_g8"]
+    # P(mixed) per task when drawing 8 of 16: 0, 0, 1/2 (the one success drawn), 1 - 2 / C(16, 8).
+    assert abs(g8["mean"] - (0.5 + 1 - 2 / 12870) / 4) < 0.01 and g8["group_size"] == 8
+    assert g8["ci95"][0] <= g8["mean"] <= g8["ci95"][1] and g8["n_tasks"] == 4
+    assert g8 == p0b_report(rows, inrepo_size=300, n_sub=4000, seed=1)["rl_share_mixed_g8"]
+    flat = p0b_report([x for x in rows if x["task_id"] in ("p0", "p1")], inrepo_size=300, n_sub=100)
+    assert flat["rl_share_mixed_g8"]["mean"] == 0.0 and flat["rl_share_mixed_g8"]["ci95"] == [0.0, 0.0]
+    short = p0b_report([x for x in rows if x["list"] == "pool200"][:16 * 3 + 5], inrepo_size=300, n_sub=100)
+    assert short["rl_share_mixed_g8"]["n_tasks"] == 3 and short["rl_share_mixed_g8"]["tasks_below_group_size"] == 1
+
+
+def test_cli_p0b_tables_use_the_run_seed_and_draw_count(tmp_path):
+    rows = [rec(f"{lst[0]}{i}", "BF16", a < 3, lst=lst, runtime="vllm", run_id="p0b")
+            for lst in ("pool200", "heldout100") for i in range(3) for a in range(16)]
+    g = _cli(tmp_path, rows, {"P0b": ["p0b"]}, "--seed", "7")["P0b"]
+    assert g["rl_share_mixed_g8"]["n_sub"] == 50 and g["rl_share_mixed_g8"]["seed"] == 7
+    assert set(g["heldout_per_task"]) == {"h0", "h1", "h2"}
+    assert "heldout_per_task" not in g["sensitivity_excluding_infra_timeout"]
+    assert g["sensitivity_excluding_infra_timeout"]["rl_share_mixed_g8"] == g["rl_share_mixed_g8"]

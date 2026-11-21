@@ -65,11 +65,14 @@ def main():
 
     if "P0b" in manifest:
         sel, dropped = gate_rows(rows, manifest["P0b"], None)
-        sens = p0b_report(no_timeouts(sel), inrepo_size=args.inrepo_size, min_candidates=args.min_candidates)
-        gates["P0b"] = {**p0b_report(sel, inrepo_size=args.inrepo_size, min_candidates=args.min_candidates),
+        kw = {"inrepo_size": args.inrepo_size, "min_candidates": args.min_candidates, "n_sub": args.n_boot,
+              "seed": args.seed}
+        sens = p0b_report(no_timeouts(sel), **kw)
+        gates["P0b"] = {**p0b_report(sel, **kw),
                         "flagged_share": flagged_share(sel),
-                        "sensitivity_excluding_infra_timeout": {k: v for k, v in sens.items()
-                                                                if k not in ("per_task", "tasks_below_design_attempts")},
+                        "sensitivity_excluding_infra_timeout": {
+                            k: v for k, v in sens.items()
+                            if k not in ("per_task", "heldout_per_task", "tasks_below_design_attempts")},
                         "dropped": dropped, "design_mismatches": design_mismatches(sel, DESIGN["P0b"])}
     if "P0a" in manifest:
         sel, dropped = gate_rows(rows, manifest["P0a"], "heldout100")
