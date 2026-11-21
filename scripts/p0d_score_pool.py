@@ -2,7 +2,8 @@
 
     python scripts/p0d_score_pool.py outputs/attempts/*.jsonl --manifest outputs/p0/manifest.json \
         --kl-score bin/kl_score --gguf-p bf16.gguf --gguf-q3 q3_k_m.gguf --gguf-q4 q4_k_m.gguf \
-        [--lists pool200] [--batch 25] [--positions-dir outputs/p0d/positions] [--llama-commit b1b770d9]
+        [--lists pool200] [--batch 25] [--positions-dir outputs/p0d/positions] [--llama-commit b1b770d9] \
+        [--machine ec2-g6e.16xlarge]
 
 Every resolved BF16 attempt on --lists whose run_id is one of the --manifest's P0b runs is scored
 (the manifest of scripts/p0_analyze.py); P0c's BF16 runs on pool200 are a different draw. An attempt
@@ -19,8 +20,9 @@ pairs already written. A torn last line left by a crash is cut off and that run 
 So the scoring hours are stated, not rebuilt (docs/04, P0 step 3), every call also appends one line
 to <out stem>.batches.jsonl: probe, attempt ids, token count, wall seconds, GPU joules (EnergyMeter:
 NVIDIA only, idle draw included, else null), the helper's runtime settings, the platform, the
-sha256 of the helper and both GGUFs, n_batch and --llama-commit. Restarts and machine moves append
-to the same file, so each line describes its own call. With --positions-dir, each (attempt, probe)
+sha256 of the helper and both GGUFs, n_batch, --llama-commit and the optional free-text --machine
+label as given ("machine_label"); no hostname is recorded (PR #11 review). Restarts and machine
+moves append to the same file, so each line describes its own call. With --positions-dir, each (attempt, probe)
 also gets <attempt_id>.<probe>.npz holding idx and the per-position kl, flip, entropy_p, nll_p and
 nll_q, written before its row, so the S2 entropy threshold and any re-analysis need no rescoring.
 """
@@ -154,7 +156,7 @@ def batches_path(out):
 
 
 def score_pool(attempt_paths, binary, gguf_p, probes, lists, out, batch=25, n_batch=512, *, run_ids,
-               positions_dir=None, llama_commit=None):
+               positions_dir=None, llama_commit=None, machine=None):
     """Score every pool run of the P0b run_ids under each probe ({probe name: GGUF path}), appending to out."""
     bad = sorted(set(lists) & set(HELD_OUT_LISTS))
     if bad:
@@ -187,7 +189,7 @@ def score_pool(attempt_paths, binary, gguf_p, probes, lists, out, batch=25, n_ba
                 "probe": probe, "attempt_ids": [r["attempt_id"] for r, _ in chunk],
                 "n_tokens": sum(e["input_ids"].shape[-1] for e in episodes), "seconds": meter.seconds,
                 "joules": meter.joules, "runtime": stats[0].get("runtime"), "platform": platform.platform(),
-                "n_batch": n_batch, "llama_commit": llama_commit,
+                "n_batch": n_batch, "llama_commit": llama_commit, "machine_label": machine,
                 "sha256": {"kl_score": hashes[binary], "gguf_p": hashes[gguf_p], "gguf_q": hashes[gguf_q]}}])
             scored += len(chunk)
             seconds += meter.seconds
@@ -211,6 +213,7 @@ def main(argv=None):
     ap.add_argument("--out", default="outputs/p0d/scores.jsonl")
     ap.add_argument("--positions-dir", help="write each run's per-position values here as <attempt_id>.<probe>.npz")
     ap.add_argument("--llama-commit", help="the llama.cpp commit kl_score was built against, recorded per batch")
+    ap.add_argument("--machine", help="free-text machine label, e.g. mac-48gb; recorded per batch as given")
     args = ap.parse_args(argv)
     with open(args.manifest) as f:
         p0b = json.load(f).get("P0b")
@@ -218,7 +221,8 @@ def main(argv=None):
         ap.error(f"{args.manifest} names no P0b run ids")
     report = score_pool(args.attempts, args.kl_score, args.gguf_p, {"Q3_K_M": args.gguf_q3, "Q4_K_M": args.gguf_q4},
                         args.lists, args.out, batch=args.batch, n_batch=args.n_batch,
-                        run_ids=set(p0b), positions_dir=args.positions_dir, llama_commit=args.llama_commit)
+                        run_ids=set(p0b), positions_dir=args.positions_dir, llama_commit=args.llama_commit,
+                        machine=args.machine)
     print(json.dumps(report))
 
 

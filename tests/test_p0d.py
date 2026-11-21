@@ -781,12 +781,14 @@ def test_scorer_logs_each_batch_and_writes_positions(pool_dir, tmp_path, monkeyp
     mod = load_script("p0d_score_pool")
     out, pos = tmp_path / "p0d" / "scores.jsonl", tmp_path / "positions"
     monkeypatch.setattr(mod, "score_trajectories_gguf", fake_scorer([]))
-    report = run_scorer(mod, pool_dir, out, batch=5, positions_dir=str(pos), llama_commit="b1b770d9")
+    report = run_scorer(mod, pool_dir, out, batch=5, positions_dir=str(pos), llama_commit="b1b770d9",
+                        machine="mac-48gb")
     log = read_jsonl(tmp_path / "p0d" / "scores.batches.jsonl")
     assert [(b["probe"], len(b["attempt_ids"])) for b in log] == [("Q3_K_M", 5), ("Q3_K_M", 2), ("Q4_K_M", 5),
                                                                   ("Q4_K_M", 2)]
     assert log[0]["attempt_ids"] == [f"ok{i}" for i in range(5)] and log[0]["n_tokens"] == 5 * 60
     assert log[0]["runtime"] == {"devices": ["CPU"]} and log[0]["llama_commit"] == "b1b770d9"
+    assert {b["machine_label"] for b in log} == {"mac-48gb"}
     assert log[0]["n_batch"] == 512 and log[0]["platform"] and log[0]["joules"] is None  # no NVIDIA GPU here
     assert log[2]["sha256"] == {k: hashlib.sha256(name.encode()).hexdigest()
                                 for k, name in (("kl_score", "kl_score"), ("gguf_p", "bf16.gguf"), ("gguf_q", "q4.gguf"))}
