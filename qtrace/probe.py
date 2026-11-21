@@ -25,10 +25,12 @@ def kernel_status():
     return {name: importlib.util.find_spec(name) is not None for name in ("fla", "causal_conv1d")}
 
 
-def attach_lora(model, include_gates=False, r=16, alpha=32, grad_ckpt=True):
+def attach_lora(model, include_gates=False, r=16, alpha=32, grad_ckpt=True, targets=None):
+    """LoRA on `targets` (default: attention, MLP and the DeltaNet mixers), plus the gates if include_gates."""
     from peft import LoraConfig, get_peft_model
 
-    targets = ATTENTION_TARGETS + MLP_TARGETS + DELTANET_TARGETS + (GATE_TARGETS if include_gates else [])
+    targets = list(ATTENTION_TARGETS + MLP_TARGETS + DELTANET_TARGETS if targets is None else targets)
+    targets += GATE_TARGETS if include_gates else []
     if grad_ckpt:
         # transformers 5.x renamed the method and its kwargs; keep older installs working.
         if hasattr(model, "activation_checkpointing_enable"):
@@ -60,8 +62,11 @@ def _ce_sum(hidden, targets, head):
     return F.cross_entropy(head(hidden).float(), targets, reduction="sum")
 
 
-def chunked_ce_loss(model, input_ids, sup_mask, chunk=2048):
-    """Mean cross-entropy over supervised tokens, with logits built per chunk and recomputed in backward.
+def chunked_ce_loss(model, input_ids, sup_mask, chunk=2048, reduction="mean"):
+    """Cross-entropy over supervised tokens, with logits built per chunk and recomputed in backward.
+
+    reduction "mean" averages over the supervised tokens; "sum" returns the total, which SFT divides by
+    a fixed constant (docs/04, Training).
 
     Logit memory is O(chunk x vocab) instead of O(length x vocab): at 64K x 248,320 the full tensor is
     about 30 GiB in bf16 and twice that once the loss upcasts it. Matches the transformers loss with
@@ -76,7 +81,7 @@ def chunked_ce_loss(model, input_ids, sup_mask, chunk=2048):
     for s in range(0, len(idx), chunk):
         total = total + checkpoint(_ce_sum, hidden[idx[s:s + chunk]], targets[s:s + chunk], base.lm_head,
                                    use_reentrant=False)
-    return total / max(len(idx), 1)
+    return total if reduction == "sum" else total / max(len(idx), 1)
 
 
 def _sync(device):
