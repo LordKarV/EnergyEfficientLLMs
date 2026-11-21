@@ -1,12 +1,14 @@
 """Fit the P0a per-turn energy model (docs/04) and estimate Q4_K_M joules for every pool attempt.
 
     python scripts/p0a_energy_model.py --subrun outputs/attempts/sub-*.jsonl \
-        --pool outputs/attempts/p0b-*.jsonl \
+        --pool outputs/attempts/p0b-*.jsonl [--lists pool200] \
         [--windows outputs/p0a/q4_metrics.jsonl --window-attempts outputs/attempts/p0a-q4-*.jsonl] --out outputs/p0a
 
 --subrun: attempt files holding the energy sub-run; only concurrency-1 attributable attempts are fitted,
           per profile, and Q4_K_M must be among them.
---pool:   candidate pool attempt files (P0b); held-out lists or repos fail. end_reason "error" is dropped.
+--pool:   candidate pool attempt files (P0b). Rows on lists other than --lists (default pool200), such as
+          P0b's heldout100 attempts, are skipped and counted; a held-out repo under a pool list fails.
+          end_reason "error" is dropped.
           Every attempt gets an estimate; the pick-agreement checks use the arms' candidates (resolved,
           unflagged BF16 runs) on tasks with at least --min-candidates of them (4; the P0b fallback is 2).
 --windows: the Q4_K_M block's 1 s llama-server metrics log, cumulative values
@@ -35,6 +37,7 @@ from qtrace.energy_model import (
     AGREEMENT_MIN,
     FALLBACK_MAX_REL_ERR,
     MIN_CANDIDATES,
+    POOL_LISTS,
     RANK_PROFILE,
     RANK_TARGET,
     TARGETS,
@@ -61,6 +64,7 @@ def main():
     ap.add_argument("--window-attempts", nargs="+")
     ap.add_argument("--out", default="outputs/p0a")
     ap.add_argument("--min-candidates", type=int, default=MIN_CANDIDATES)
+    ap.add_argument("--lists", nargs="+", default=list(POOL_LISTS), help="pool lists to estimate")
     ap.add_argument("--n-boot", type=int, default=2000)
     ap.add_argument("--seed", type=int, default=20261119)
     args = ap.parse_args()
@@ -78,7 +82,7 @@ def main():
     if idle_w is None:
         raise SystemExit(f"no valid energy.idle_w_ref in the {RANK_PROFILE} sub-run; the whole-attempt estimate "
                          "charges idle_w per tool second")
-    pool, n_error = pool_records([r for p in args.pool for r in read_jsonl(p)])
+    pool, n_error, skipped = pool_records([r for p in args.pool for r in read_jsonl(p)], lists=args.lists)
     q4_gen = {r["attempt_id"]: estimate_attempt_joules(r, model) for r in pool}
     q4 = {r["attempt_id"]: estimate_attempt_joules(r, model, idle_w=idle_w) for r in pool}
     by_q4_gen = lambda r: q4_gen[r["attempt_id"]]
@@ -111,7 +115,8 @@ def main():
         "terms_available": list(TERMS),
         "profiles": profiles,
         "excluded_subrun_attempts": excluded,
-        "pool": {"n_attempts": len(pool), "n_dropped_error": n_error},
+        "pool": {"n_attempts": len(pool), "n_dropped_error": n_error, "lists": args.lists,
+                 "n_skipped_other_lists": skipped},
         "bf16_vs_q4": bf16,
         "batched": batched,
         "n_boot": args.n_boot, "seed": args.seed,

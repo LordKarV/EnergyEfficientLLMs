@@ -47,6 +47,7 @@ AGREEMENT_MIN = 0.85  # 04: batched vs concurrency-1 picks below this name their
 MAX_SHARE_WITHOUT_FIRST_TOKEN = 0.01  # owner review of PR #13: flag a block above about 1% of such turns
 MIN_CANDIDATES = 4  # 03 Method step 1: pool tasks have at least 4 successful BF16 runs; the P0b fallback is 2
 HELDOUT_LISTS = ("heldout100", "verified100", "inrepo_test")
+POOL_LISTS = ("pool200",)  # the default of p0a_energy_model.py --lists, as in p0d_score_pool.py
 HELDOUT_REPOS = ("scrapy", "pyramid", "datalad", "coveragepy")
 CONTEXT_BINS = (16384, 32768, 49152)  # residual summary bins over the 64K context
 
@@ -364,23 +365,33 @@ def estimate_attempt_joules(rec, model, idle_w=None):
     return gen + _num(idle_w, "idle_w") * _num(_get(rec, "tool_seconds", where), f"{where}: tool_seconds")
 
 
-def pool_records(records):
-    """Pool attempts to estimate, with infrastructure errors dropped and counted.
+def pool_records(records, lists=POOL_LISTS):
+    """Pool attempts to estimate, with other lists skipped and infrastructure errors dropped, both counted.
 
-    Fails on an empty pool, duplicate attempt ids, missing fields, and any held-out list or repo
-    (held-out tasks never enter a pool). Returns (kept records, number of end_reason "error" dropped).
+    The P0b run file also holds the heldout100 attempts (04: one vLLM block covers both lists), so rows
+    whose list is not one of `lists` are skipped and counted per list. Fails on an empty pool, duplicate
+    attempt ids, missing fields, a held-out list among `lists`, and a held-out repo under a pool list
+    (held-out tasks never enter a pool). Returns (kept records, number of end_reason "error" dropped,
+    {list: rows skipped}).
     """
+    bad = sorted(set(lists) & set(HELDOUT_LISTS))
+    if bad:
+        raise ValueError(f"{bad} are held-out lists and never enter a pool")
     if not records:
         raise ValueError("the pool is empty")
-    kept, seen, n_error = [], set(), 0
+    kept, seen, n_error, skipped = [], set(), 0, defaultdict(int)
     for r in records:
         aid = _get(r, "attempt_id", "pool record")
         where = f"pool attempt {aid!r}"
         if aid in seen:
             raise ValueError(f"duplicate attempt_id {aid!r} in the pool files")
         seen.add(aid)
-        lst, repo = _get(r, "list", where), _get(r, "repo", where)
-        if lst in HELDOUT_LISTS or repo in HELDOUT_REPOS:
+        lst = _get(r, "list", where)
+        if lst not in lists:
+            skipped[lst] += 1
+            continue
+        repo = _get(r, "repo", where)
+        if repo in HELDOUT_REPOS:
             raise ValueError(f"{where} is from list {lst!r}, repo {repo!r}: held-out tasks never enter a pool")
         for k in ("task_id", "profile", "turns", "end_reason"):
             _get(r, k, where)
@@ -390,7 +401,9 @@ def pool_records(records):
             n_error += 1
         else:
             kept.append(r)
-    return kept, n_error
+    if not kept and not n_error:
+        raise ValueError(f"no pool attempt on {list(lists)}; skipped {dict(skipped)}")
+    return kept, n_error, dict(sorted(skipped.items()))
 
 
 def _avg_ranks(x):
@@ -414,7 +427,8 @@ def pick_agreement(records, est_a, est_b, min_candidates=MIN_CANDIDATES):
     """How often two energy estimators pick the same cheapest run per task, and their mean within-task Spearman.
 
     Candidates are the runs the P1 arms pick from: BF16 runs (records from pool_records) that resolved
-    and whose grader did not flag test-file edits (an absent flag is false), grouped by task. Tasks with
+    and whose grader did not flag test-file edits (grading.test_files_touched, a required field read
+    strictly), grouped by task. Tasks with
     fewer than min_candidates are skipped; fewer candidates agree more often by chance, so a looser
     pool would bias the 85% check toward agreement. A pick breaks ties by fewer turns, then by
     attempt id (deterministic here; the arms break remaining ties with their seed). Spearman uses
@@ -424,7 +438,7 @@ def pick_agreement(records, est_a, est_b, min_candidates=MIN_CANDIDATES):
         raise ValueError(f"min_candidates must be an integer >= 2, got {min_candidates!r}")
     by_task = defaultdict(list)
     for r in records:
-        if r["profile"] == "BF16" and r["resolved"] and not (r.get("grading") or {}).get("test_files_touched"):
+        if r["profile"] == "BF16" and r["resolved"] and not r["grading"]["test_files_touched"]:
             by_task[r["task_id"]].append(r)
     same, rhos = [], []
     for c in by_task.values():

@@ -62,6 +62,7 @@ def make_attempt(rng, aid, task, coef, noise=0.01, attempt_noise=0.0, profile="Q
     tot_cached = sum(t["input_cached"] for t in turns)
     return {"attempt_id": aid, "run_id": "sub", "task_id": task, "list": "pool200", "repo": "pandas",
             "profile": profile, "concurrency": 1, "resolved": True, "end_reason": "submitted", "turns": len(turns),
+            "grading": {"test_files_touched": False},
             "tokens": {"output": sum(t["output_tokens"] for t in turns),
                        "input_uncached": sum(t["input_uncached"] for t in turns), "input_cached": tot_cached,
                        "server_reported_cached": tot_cached},
@@ -84,7 +85,7 @@ def fitted(records, target="idle_subtracted", n_boot=200, seed=0):
 def pool_rec(aid, task, out, unc, resolved=True, turns=1, lst="pool200", repo="pandas", end_reason="submitted",
              profile="BF16"):
     return {"attempt_id": aid, "task_id": task, "list": lst, "repo": repo, "profile": profile, "resolved": resolved,
-            "end_reason": end_reason, "turns": turns,
+            "end_reason": end_reason, "turns": turns, "grading": {"test_files_touched": False},
             "per_turn": [{"output_tokens": out, "input_uncached": unc, "input_cached": 0}]}
 
 
@@ -460,8 +461,10 @@ def test_malformed_inputs_fail_loudly():
 
     with pytest.raises(ValueError, match="empty"):
         pool_records([])
-    with pytest.raises(ValueError, match="held-out"):
-        pool_records([pool_rec("p", "t", 1, 1, lst="heldout100")])
+    with pytest.raises(ValueError, match="held-out lists"):
+        pool_records([pool_rec("p", "t", 1, 1)], lists=["pool200", "heldout100"])
+    with pytest.raises(ValueError, match="no pool attempt"):
+        pool_records([pool_rec("p", "t", 1, 1, lst="heldout100", repo="scrapy")])
     with pytest.raises(ValueError, match="held-out"):
         pool_records([pool_rec("p", "t", 1, 1, repo="scrapy")])
     with pytest.raises(ValueError, match="duplicate"):
@@ -515,8 +518,26 @@ def test_cache_check_compares_per_request_counts_where_present():
 
 
 def test_pool_records_drop_and_count_infrastructure_errors():
-    kept, n_error = pool_records([pool_rec("a", "t", 1, 1), pool_rec("b", "t", 1, 1, end_reason="error")])
-    assert [r["attempt_id"] for r in kept] == ["a"] and n_error == 1
+    kept, n_error, skipped = pool_records([pool_rec("a", "t", 1, 1), pool_rec("b", "t", 1, 1, end_reason="error")])
+    assert [r["attempt_id"] for r in kept] == ["a"] and n_error == 1 and skipped == {}
+
+
+def test_pool_records_skip_and_count_the_p0b_heldout_rows():
+    # 04: the P0b main run covers pool200 and heldout100 in one block, so its file holds both lists.
+    rows = [pool_rec("a", "t", 1, 1), pool_rec("h1", "h", 1, 1, lst="heldout100", repo="scrapy"),
+            pool_rec("h2", "h", 1, 1, lst="heldout100", repo="datalad", end_reason="error")]
+    kept, n_error, skipped = pool_records(rows)
+    assert [r["attempt_id"] for r in kept] == ["a"] and n_error == 0 and skipped == {"heldout100": 2}
+    with pytest.raises(ValueError, match="held-out tasks never enter a pool"):
+        pool_records(rows + [pool_rec("bad", "x", 1, 1, repo="pyramid")])  # a held-out repo under pool200
+
+
+def test_pick_agreement_reads_the_tripwire_strictly():
+    pool = [pool_rec("a1", "A", 100, 900), pool_rec("a2", "A", 200, 800)]
+    del pool[1]["grading"]["test_files_touched"]
+    by_out = lambda r: estimate_attempt_joules(r, {"coef": {"output": 1.0}})
+    with pytest.raises(KeyError):
+        pick_agreement(pool, by_out, by_out, min_candidates=2)
 
 
 def test_cli_writes_model_and_estimates(tmp_path):
@@ -536,8 +557,10 @@ def test_cli_writes_model_and_estimates(tmp_path):
     pool[1]["end_reason"] = "error"
     for r, s in zip(pool, np.random.default_rng(10).uniform(0, 1e5, len(pool))):
         r["tool_seconds"] = float(s)  # large and uneven within tasks, so whole-attempt ranks follow tool time
+    heldout = [{**make_attempt(rng, f"h{a}", "h0", PLANT, profile="BF16"), "list": "heldout100", "repo": "scrapy"}
+               for a in range(3)]  # the P0b run file also holds heldout100: skipped and counted
     pool_path = tmp_path / "pool.jsonl"
-    pool_path.write_text("".join(json.dumps(r) + "\n" for r in pool))
+    pool_path.write_text("".join(json.dumps(r) + "\n" for r in pool + heldout))
     samples, block = concurrent_block(rng, n_slots=8, seconds=300, decode_j=2.5, noise_j=0.5)
     win_path, block_path = tmp_path / "metrics.jsonl", tmp_path / "block.jsonl"
     win_path.write_text("".join(json.dumps(w) + "\n" for w in samples))
@@ -560,7 +583,8 @@ def test_cli_writes_model_and_estimates(tmp_path):
     assert {k: cache[k] for k in ("n_attempts", "n_differ", "n_missing", "share_differ")} == {
         "n_attempts": 30, "n_differ": 1, "n_missing": 0, "share_differ": pytest.approx(1 / 30)}
     assert cache["per_request"]["n_requests"] == 0 and cache["per_request"]["share_differ"] is None
-    assert em["pool"] == {"n_attempts": 79, "n_dropped_error": 1}
+    assert em["pool"] == {"n_attempts": 79, "n_dropped_error": 1, "lists": ["pool200"],
+                          "n_skipped_other_lists": {"heldout100": 3}}
     # p0 keeps 2 candidates (one failure, one error), below min_candidates 4.
     assert em["bf16_vs_q4"]["n_tasks"] == 19 and em["bf16_vs_q4"]["min_candidates"] == 4
     assert em["bf16_vs_q4"]["share_same_pick"] is not None
