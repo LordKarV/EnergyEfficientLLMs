@@ -168,7 +168,7 @@ def candidates(attempts, pool_lists, min_candidates, scores, joules, score_name)
     """Group the pool's candidate runs by task, with their scores and joule estimates joined.
 
     A candidate is a BF16 attempt in a pool list that did not end in an infrastructure error, resolved,
-    and has no test-file flag (an absent grading.test_files_touched counts as false). Returns
+    and has no test-file flag (grading.test_files_touched is a required bool; absent is an error). Returns
     (task -> candidates, report); the report counts infrastructure errors and flagged successes per pool
     list and gives each dropped task's candidate count (0 if none resolved).
     """
@@ -190,7 +190,10 @@ def candidates(attempts, pool_lists, min_candidates, scores, joules, score_name)
             raise ValueError(f"attempt {aid!r}: resolved must be true or false, got {resolved!r}")
         if not resolved:
             continue
-        if need(r, "grading").get("test_files_touched"):
+        touched = need(r, "grading", "test_files_touched")  # required in every record; absent never means unflagged
+        if touched is not True and touched is not False:
+            raise ValueError(f"attempt {aid!r}: grading.test_files_touched must be true or false, got {touched!r}")
+        if touched:
             flagged[r["list"]] += 1
             continue
         by_task[task].append(candidate(r, scores.get(aid), joules.get(aid), score_name))

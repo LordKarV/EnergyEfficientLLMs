@@ -17,7 +17,7 @@ from qtrace.p1_select import ARMS, STABILITY_ARMS, avg_ranks, halves, overlap, p
 
 MAL = ("misnested_tag", "wrong_name", "text_after_call", "truncated_call", "no_call_no_answer")
 RUN = {"task": "t", "turns": 5, "out": 100, "kl": 0.1, "ent": 1.0, "j": 1000.0, "mal": None, "resolved": True,
-       "profile": "BF16", "lst": "pool200", "touched": None, "end": "submitted"}
+       "profile": "BF16", "lst": "pool200", "touched": False, "end": "submitted"}
 _ids = iter(range(10**9))
 
 
@@ -209,11 +209,18 @@ def test_flagged_success_is_never_a_candidate_and_is_counted_per_list():
             {"task": "t2", "lst": "pool_x", **best, "touched": True}]
     picks, summary = go(runs, pool_lists=["pool200", "pool_x"], seeds=(0, 1, 2))
     assert summary["pool"]["flagged_excluded"] == {"pool200": 1, "pool_x": 2}
-    assert summary["pool"]["n_candidates"] == 4  # an absent test_files_touched counts as unflagged
+    assert summary["pool"]["n_candidates"] == 4
     # The flagged runs are the only ones with 1 turn and would win every arm if they were candidates.
     for arm in picks:
         for seed in picks[arm]:
             assert all(r["turns"] != 1 for r in picks[arm][seed]), arm
+
+
+@pytest.mark.parametrize("touched", [None, 0, "false"])
+def test_test_files_touched_is_read_strictly(touched):
+    # An absent or non-bool flag must not read as "not flagged": that would switch the tripwire off.
+    with pytest.raises(ValueError, match="test_files_touched"):
+        go([{"task": "t"}, {"task": "t", "touched": touched}])
 
 
 def test_unresolved_other_profiles_and_unlisted_lists_are_not_candidates():
