@@ -330,16 +330,34 @@ def test_noise_floor_is_exact_with_the_whole_vocabulary_and_a_lower_bound_with_t
 
 
 def test_runtime_criterion_flags_each_failure():
+    # Each case breaks exactly one criterion, so a comparison hard-wired to True fails its case.
     check = load_check_script()
     n = 1000
-    hf = {"nll": np.full(n, 2.0), "entropy": np.full(n, 1.0), "argmax": np.arange(n), "kl_floor": np.full(n, 1e-4),
+    pos = np.arange(n)
+    alt = np.where(pos % 2, 1.0, -1.0)  # alternating signs keep the run mean
+    few = np.where(pos < 20, alt, 0.0)  # 2% of positions, above p99's 1%
+    one = (pos == 0).astype(float)
+    hf = {"nll": np.full(n, 0.5), "entropy": np.full(n, 0.5), "argmax": pos, "kl_floor": np.full(n, 1e-4),
           "tail_mass_hf": np.zeros(n)}
-    gguf = {"nll_p": hf["nll"] + 1e-3, "entropy_p": hf["entropy"].copy(), "topk_ids": np.arange(n)[:, None]}
+    gguf = {"nll_p": hf["nll"] + 1e-3, "entropy_p": hf["entropy"].copy(), "topk_ids": pos[:, None]}
     ok = check.judge(gguf, hf, q4_kl_mean=0.019)
     assert ok["all_pass"] and ok["noise_floor_over_q4_kl_mean"] == pytest.approx(1e-4 / 0.019)
-    gguf["nll_p"] = gguf["nll_p"] + np.where(np.arange(n) < 20, 0.5, 0)  # 2% of positions off by 0.5
-    assert {k for k, v in check.judge(gguf, hf, 0.019)["pass"].items() if not v} == {"abs_dnll_p99"}
-    assert not check.judge(gguf, hf, q4_kl_mean=1e-4)["pass"]["noise_floor_over_q4_kl_mean"]
+    cases = {
+        "abs_dnll_median": {"nll_p": hf["nll"] + 0.02 * alt},
+        "abs_dnll_p99": {"nll_p": hf["nll"] + 0.5 * few},
+        "abs_dnll_max": {"nll_p": hf["nll"] + 2.0 * one},  # moves the mean by 0.4%
+        "abs_dentropy_median": {"entropy_p": hf["entropy"] + 0.02 * alt},
+        "abs_dentropy_p99": {"entropy_p": hf["entropy"] + 0.5 * few},
+        "abs_dentropy_max": {"entropy_p": hf["entropy"] + 2.0 * one},
+        "rel_mean_change_nll": {"nll_p": hf["nll"] + 0.008},  # 1.6% of the mean, 0.008 per position
+        "rel_mean_change_entropy": {"entropy_p": hf["entropy"] + 0.008},
+        "top1_agreement": {"topk_ids": (pos + (pos < 30))[:, None]},  # 3% disagree
+    }
+    for key, change in cases.items():
+        assert {k for k, v in check.judge({**gguf, **change}, hf, 0.019)["pass"].items() if not v} == {key}, key
+    low_signal = check.judge(gguf, hf, q4_kl_mean=1e-4)["pass"]
+    assert {k for k, v in low_signal.items() if not v} == {"noise_floor_over_q4_kl_mean"}
+    assert set(cases) | {"noise_floor_over_q4_kl_mean"} == set(ok["pass"])
 
 
 def test_check_script_runs_on_the_tiny_models(tiny, tmp_path):
