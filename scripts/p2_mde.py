@@ -7,9 +7,11 @@
 Per-task pass rates come from the heldout100 rows at --profile (P0b's BF16 by default; Q4_K_M for P0a's runs,
 whose file is then passed too). Those rows must all come from one runtime: P0a also runs BF16 on heldout100, on
 llama.cpp, so passing P0a's file with --profile BF16 fails rather than pooling its attempts into P0b's vLLM
-counts (docs/04 P0b criterion 3 reads P0b's 16 attempts per task). Costs come from the pool200 rows at --pool-profile, split by outcome: each
-attempt's est_joules_q4 from est_joules.jsonl when --est-joules is given, else its processed tokens (output plus
-every input token), which the output names. An attempt is resolved when resolved is true and end_reason is
+counts (docs/04 P0b criterion 3 reads P0b's 16 attempts per task). Costs come from the pool200 rows at
+--pool-profile, per pool task and split by outcome: each attempt's est_joules_q4 from est_joules.jsonl when
+--est-joules is given, else its processed tokens (output plus every input token), which the output names. The
+primary draws each simulated task's costs from one pool task's own attempts (matched to tasks);
+sensitivity_independent_costs draws them from all pool attempts regardless of the task. An attempt is resolved when resolved is true and end_reason is
 "submitted", as P2 counts it; end_reason "error" rows are left out.
 """
 
@@ -48,17 +50,20 @@ def heldout_tasks(rows, profile, lst="heldout100"):
 
 
 def pool_costs(rows, profile, est_joules=None):
+    """Per pool task (sorted by task_id), its attempts' costs by outcome: [{"resolved": [...], "failed": [...]}]."""
     kept, _, _ = pool_records(rows)
     kept = [r for r in kept if r["profile"] == profile]
     if est_joules is not None:
         missing = [r["attempt_id"] for r in kept if r["attempt_id"] not in est_joules]
         if missing:
             raise ValueError(f"{len(missing)} pool attempts have no est_joules row, e.g. {missing[:3]}")
-    cost = {True: [], False: []}
+    by_task = {}
     for r in kept:
-        cost[resolved(r)].append(est_joules[r["attempt_id"]] if est_joules is not None
-                                 else sum(r["tokens"][k] for k in ("output", "input_uncached", "input_cached")))
-    return cost[True], cost[False]
+        c = by_task.setdefault(r["task_id"], {"resolved": [], "failed": []})
+        c["resolved" if resolved(r) else "failed"].append(
+            est_joules[r["attempt_id"]] if est_joules is not None
+            else sum(r["tokens"][k] for k in ("output", "input_uncached", "input_cached")))
+    return [by_task[t] for t in sorted(by_task)]
 
 
 def main(argv=None):
@@ -81,12 +86,15 @@ def main(argv=None):
     est = None if args.est_joules is None else {e["attempt_id"]: e["est_joules_q4"] for e in read_jsonl(args.est_joules)}
     try:
         tasks = heldout_tasks(rows, args.profile)
-        cr, cf = pool_costs(rows, args.pool_profile, est)
-        out = mde(tasks, cr, cf, ratios=args.ratios, seeds=args.seeds, n_sim=args.n_sim, n_boot=args.n_boot,
-                  alpha=args.alpha, seed=args.seed, guard_margin=args.guard_margin)
+        costs = pool_costs(rows, args.pool_profile, est)
+        kw = {"ratios": args.ratios, "seeds": args.seeds, "n_sim": args.n_sim, "n_boot": args.n_boot,
+              "alpha": args.alpha, "seed": args.seed, "guard_margin": args.guard_margin}
+        out = mde(tasks, costs, **kw)
+        out["sensitivity_independent_costs"] = mde(tasks, costs, matched=False, **kw)
     except (ValueError, KeyError) as e:
         raise SystemExit(f"p2_mde: {e!r}") from e
-    out["cost"]["source"] = "est_joules_q4" if est is not None else "processed_tokens"
+    for o in (out, out["sensitivity_independent_costs"]):
+        o["cost"]["source"] = "est_joules_q4" if est is not None else "processed_tokens"
     out["inputs"] = {"attempts": args.attempts, "est_joules": args.est_joules, "profile": args.profile,
                      "pool_profile": args.pool_profile}
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
@@ -98,7 +106,11 @@ def main(argv=None):
     for p in out["power"]:
         print(f"  true JPR ratio {p['ratio']:.3f}: power {p['power']:.3f}"
               + (f", with guard {p['power_with_guard']:.3f}" if "power_with_guard" in p else ""))
-    print(f"MDE at 80% power: ratio {out['mde_ratio_80']} (cost: {out['cost']['source']}); se_rr {se['se_rr']:.4f}, "
+    sens = out["sensitivity_independent_costs"]
+    print(f"independent costs (sensitivity): MDE at 80% power ratio {sens['mde_ratio_80']}"
+          + (f", with the guard {sens['mde_ratio_80_with_guard']}" if args.guard_margin is not None else ""))
+    print(f"MDE at 80% power: ratio {out['mde_ratio_80']} (cost: {out['cost']['source']}, matched to tasks over "
+          f"{out['cost']['n_pool_tasks']} pool tasks); se_rr {se['se_rr']:.4f}, "
           f"se_rr_diff {se['se_rr_diff']:.4f} ({se['formula']})")
     print(f"guard margin = k x se_rr_diff = k x {se['margin_se']:.4f} (the guard bounds the paired difference; "
           "k is the owner's decision)")

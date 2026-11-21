@@ -671,21 +671,59 @@ def guard_se(tasks, n_by_repo=HELDOUT691_BY_REPO, seeds=3):
                        "s (k - s) / (k (k - 1)) over the measured tasks"}
 
 
-def mde(tasks, cost_resolved, cost_failed, ratios=MDE_RATIOS, n_by_repo=HELDOUT691_BY_REPO, seeds=3, n_sim=500,
-        n_boot=1000, alpha=0.05, seed=0, guard_margin=None):
+def _cost_table(cost_tasks, matched):
+    """Per outcome (True resolved, False failed), flat costs with each pool task's start and count, for drawing
+    one cost per attempt from a given pool task's own attempts. A pool task with attempts of one outcome only
+    supplies its costs for both. matched=False pools every attempt into one task: the independent draw."""
+    for j, ct in enumerate(cost_tasks):
+        c = [np.asarray(ct[o], dtype=float) for o in ("resolved", "failed")]
+        if any(x.ndim != 1 for x in c) or not sum(map(len, c)):
+            raise ValueError(f"pool task {j} has no attempts; each pool task needs at least one cost")
+        if any(not np.isfinite(x).all() or (x <= 0).any() for x in c):
+            raise ValueError(f"pool task {j}: costs must be positive finite per-attempt values")
+    allc = {o: np.concatenate([np.asarray(ct[o], dtype=float) for ct in cost_tasks]) for o in ("resolved", "failed")}
+    for o, c in allc.items():
+        if not len(c):
+            raise ValueError(f"no {o} pool attempt: the costs need at least one resolved and one failed attempt")
+    tasks = cost_tasks if matched else [allc]
+    table = {}
+    for outcome, own, other in ((True, "resolved", "failed"), (False, "failed", "resolved")):
+        lists = [np.asarray(ct[own] if len(ct[own]) else ct[other], dtype=float) for ct in tasks]
+        counts = np.array([len(x) for x in lists])
+        table[outcome] = (np.concatenate(lists), np.concatenate([[0], np.cumsum(counts)[:-1]]), counts)
+    summary = {"draw": "matched" if matched else "independent", "n_pool_tasks": len(cost_tasks),
+               "n_pool_tasks_one_outcome": sum(not len(ct["resolved"]) or not len(ct["failed"]) for ct in cost_tasks),
+               "n_resolved": len(allc["resolved"]), "n_failed": len(allc["failed"]),
+               "mean_resolved": float(allc["resolved"].mean()), "mean_failed": float(allc["failed"].mean())}
+    return table, summary
+
+
+def _draw_costs(table, u, R, rng):
+    """One cost per attempt in R [S, n], each simulated task j drawing from pool task u[j]'s own attempts."""
+    def draw(outcome):
+        vals, start, counts = table[outcome]
+        return vals[start[u] + (rng.random(R.shape) * counts[u]).astype(int)]
+    return np.where(R > 0, draw(True), draw(False))
+
+
+def mde(tasks, cost_tasks, ratios=MDE_RATIOS, n_by_repo=HELDOUT691_BY_REPO, seeds=3, n_sim=500, n_boot=1000,
+        alpha=0.05, seed=0, guard_margin=None, matched=True):
     """Simulated power of the frozen primary test at each true JPR ratio, and the minimum detectable effect.
 
     The test is contrast()'s: _test on strat_weights draws (tasks resampled within repo, shared by both arms),
     each task averaged over the seed models, p < alpha on T = log(JPR_arm / JPR_random). Each simulated study
     draws n_by_repo[repo] tasks per held-out repo with replacement from that repo's measured tasks (tasks as in
-    guard_se: P0b heldout100 BF16, or P0a Q4_K_M) and gives each arm seeds x 1 attempt per task, resolving with
-    the task's s / k, the same rate for both arms. An attempt costs a draw from cost_resolved or cost_failed (per
-    pool attempt estimated joules or processed tokens, by outcome), times the ratio for the headline arm, so the
-    true JPR ratio is the ratio and the true resolve-rate difference 0.
+    guard_se: P0b heldout100 BF16 at k = 16) and gives each arm seeds x 1 attempt per task, resolving with the
+    task's s / k, the same rate for both arms. cost_tasks is one {"resolved": [...], "failed": [...]} per pool
+    task (per attempt estimated joules or processed tokens, by outcome). With matched (the primary, owner's agent
+    on PR #17, answer 3), each simulated task is paired with one pool task drawn at random, and both arms' attempts
+    on it draw their costs from that pool task's own attempts of the same outcome, so the test's pairing by task
+    carries the task-level cost spread as the real design does. matched=False draws every cost from all pool
+    attempts of the outcome, independently of the task: the conservative sensitivity. The headline arm's costs
+    are times the ratio, so the true JPR ratio is the ratio and the true resolve-rate difference 0.
 
-    Simplifications, both stated in the output: costs are drawn without regard to the task, so the task-level
-    cost spread the paired draws would cancel is missing (conservative); s / k is used as the true rate, which
-    understates p (1 - p) by a factor (k - 1) / k (slightly optimistic, more so for k = 3 than 16).
+    Simplification, stated in the output: s / k is used as the true rate, which understates p (1 - p) by a
+    factor (k - 1) / k (slightly optimistic, more so for k = 3 than 16).
 
     One set of bootstrap weights serves every study and every ratio reuses a study's draws, as in qtrace/p0d.py
     power (#12), so the result is deterministic in seed and the curve differs only by the ratio. power counts
@@ -701,10 +739,8 @@ def mde(tasks, cost_resolved, cost_failed, ratios=MDE_RATIOS, n_by_repo=HELDOUT6
     if not ratios or any(not 0 < r for r in ratios):
         raise ValueError(f"ratios are true JPR ratios arm / random, each > 0; got {ratios}")
     pools = _pass_rates(tasks, n_by_repo)
-    cr, cf = (np.asarray(c, dtype=float) for c in (cost_resolved, cost_failed))
-    for name, c in (("cost_resolved", cr), ("cost_failed", cf)):
-        if c.ndim != 1 or not len(c) or not np.isfinite(c).all() or (c <= 0).any():
-            raise ValueError(f"{name} must be a non-empty list of positive finite per-attempt costs")
+    table, cost = _cost_table(cost_tasks, matched)
+    n_pool = len(table[True][1])
     repos = np.repeat(list(pools), [n_by_repo[r] for r in pools])
     n = len(repos)
     rng = np.random.default_rng(seed)
@@ -713,7 +749,8 @@ def mde(tasks, cost_resolved, cost_failed, ratios=MDE_RATIOS, n_by_repo=HELDOUT6
     for _ in range(n_sim):
         p = np.concatenate([rng.choice(pools[r][:, 0], n_by_repo[r]) for r in pools])
         R = [(rng.random((seeds, n)) < p).astype(float) for _ in range(2)]
-        E = [np.where(r > 0, rng.choice(cr, r.shape), rng.choice(cf, r.shape)) for r in R]
+        u = rng.integers(n_pool, size=n)  # the pool task each simulated task takes its costs from, for both arms
+        E = [_draw_costs(table, u, r, rng) for r in R]
         rr_diffs.append(float((R[0].mean(0) - R[1].mean(0)).sum() / n))
         for i, ratio in enumerate(ratios):
             t = _test(W, {"R": R[0], "E": E[0] * ratio}, {"R": R[1], "E": E[1]})
@@ -735,9 +772,9 @@ def mde(tasks, cost_resolved, cost_failed, ratios=MDE_RATIOS, n_by_repo=HELDOUT6
     se["simulated_sd_rr_diff"] = float(np.std(rr_diffs, ddof=1)) if n_sim > 1 else None
     return {"n_tasks": n, "n_by_repo": dict(n_by_repo), "seeds": seeds, "n_measured_tasks": len(tasks),
             "mean_pass1": float(resolves / n), "expected_resolves_per_arm_seed": float(resolves),
-            "cost": {"n_resolved": len(cr), "n_failed": len(cf), "mean_resolved": float(cr.mean()),
-                     "mean_failed": float(cf.mean())},
+            "cost": cost,
             "alpha": alpha, "n_sim": n_sim, "n_boot": n_boot, "seed": seed, "guard_margin": guard_margin,
             "power": power, "mde_ratio_80": max(passing) if passing else None, **guarded, "guard_se": se,
-            "simplifications": ["costs drawn independently of the task (conservative)",
+            "simplifications": [("costs matched to tasks: each simulated task takes one pool task's own attempts"
+                                 if matched else "costs drawn independently of the task (conservative)"),
                                 "measured s / k used as each task's true rate (slightly optimistic)"]}
