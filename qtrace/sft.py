@@ -9,6 +9,7 @@ gives every arm the same count because every arm has one run per task.
 """
 
 import collections
+import glob
 import itertools
 import os
 import random
@@ -22,6 +23,11 @@ from qtrace.probe import GATE_TARGETS, attach_lora, chunked_ce_loss
 ARM_FIELDS = ("arm", "seed", "task_id", "attempt_id", "episode_path")
 EPISODE_ARRAYS = ("input_ids", "model_mask", "turn_spans")
 GRAD_CLIP = 1.0
+# The Qwen3.5 checkpoint's only non-bf16 text tensors (F32, 24 of each in the 4B). A bf16 load rounds them; the
+# saved merge takes them back from the checkpoint so it matches a straight GGUF conversion (issue #1).
+F32_RESTORED = ("linear_attn.norm.weight", "linear_attn.A_log")
+TEXT_PREFIX = "model.language_model."  # the multimodal checkpoint's text tower; Qwen3_5ForCausalLM names it model.
+NON_TEXT_PREFIXES = ("model.visual.", "mtp.")
 
 
 def load_arm(path, arm, seed):
@@ -171,18 +177,52 @@ def attach(model, train_cfg, seed):
     return model
 
 
-def save_merged(model, out_dir):
+def save_merged(model, out_dir, base_path):
     """Fold W <- W + scaling * B @ A in float32 on the CPU and save the plain model in F32 to out_dir.
 
     A bf16 merge rounds away the part of the update below half a bf16 step, about half of it at
     ||dW||/||W|| = 1e-3 (issue #1, the owner's round trip), and every GGUF profile built from that file
     inherits the loss. In f32 each saved weight is exactly W.float() + scaling * B.float() @ A.float().
     The LoRA model is moved to the CPU in f32 in place (the GPU never holds an f32 copy); config.json
-    records dtype float32. About 16 GB on disk for the 4B. Returns the merged model.
+    records dtype float32. About 16 GB on disk for the 4B. The checkpoint's F32 tensors (base_f32_tensors of
+    base_path, the folder or HF id the model was loaded from) replace their bf16-rounded copies; training still
+    saw the rounded ones. Returns the merged model.
     """
     merged = model.to(device="cpu", dtype=torch.float32).merge_and_unload()
+    with torch.no_grad():
+        for name, tensor in base_f32_tensors(base_path).items():
+            merged.get_parameter(name).copy_(tensor)
     merged.save_pretrained(out_dir)
     return merged
+
+
+def base_f32_tensors(base_path):
+    """The checkpoint's F32_RESTORED tensors as float32, keyed as in the text-only Qwen3_5ForCausalLM state dict.
+
+    Text tensors are all but the vision tower and the MTP head. Raises ValueError unless the F32_RESTORED tensors
+    are exactly the checkpoint's non-bf16 text tensors and all F32: a checkpoint with other wide tensors must
+    fail here rather than be saved half-restored.
+    """
+    from huggingface_hub import snapshot_download
+    from safetensors import safe_open
+
+    folder = base_path if os.path.isdir(base_path) else snapshot_download(base_path, allow_patterns=["*.safetensors"])
+    restored, wide = {}, {}
+    for file in sorted(glob.glob(os.path.join(folder, "*.safetensors"))):
+        with safe_open(file, "pt") as f:
+            for key in f.keys():  # noqa: SIM118, a safe_open handle is not iterable
+                if key.startswith(NON_TEXT_PREFIXES):
+                    continue
+                name = "model." + key.removeprefix(TEXT_PREFIX) if key.startswith(TEXT_PREFIX) else key
+                dtype = f.get_slice(key).get_dtype()
+                if dtype != "BF16":
+                    wide[name] = dtype
+                if name.endswith(F32_RESTORED):
+                    restored[name] = f.get_tensor(key)
+    if set(wide) != set(restored) or set(wide.values()) != {"F32"}:
+        raise ValueError(f"{folder}: non-bf16 text tensors {sorted(wide.items())[:5]} ({len(wide)}) must be exactly "
+                         f"the F32 {F32_RESTORED} tensors ({len(restored)})")
+    return restored
 
 
 def episode_loss(model, example, loss_norm, chunk=2048):

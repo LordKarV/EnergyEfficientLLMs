@@ -24,6 +24,22 @@ TARGETS = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down
 TRAIN = {"targets": TARGETS, "include_gates": False, "lora_r": 4, "lora_alpha": 8}
 
 
+def save_ckpt(path, seed=0):
+    """tiny_qwen35 saved the way Qwen/Qwen3.5 stores itself: bf16, the F32_RESTORED tensors F32 off the bf16 grid.
+
+    Returns the saved state dict.
+    """
+    from safetensors.torch import load_file, save_file
+
+    tiny_qwen35(seed).to(torch.bfloat16).save_pretrained(path)
+    file = os.path.join(path, "model.safetensors")
+    g = torch.Generator().manual_seed(seed)
+    state = {k: torch.rand(v.shape, generator=g) + 0.5 if k.endswith(sft.F32_RESTORED) else v
+             for k, v in load_file(file).items()}
+    save_file(state, file, metadata={"format": "pt"})
+    return state
+
+
 def make_episode(seed, turn_lens, prompt=12, tool=6, vocab=300):
     """A stored episode in the agreed format: prompt, then per turn a model-written span and a tool response."""
     rng = np.random.default_rng(seed)
@@ -251,8 +267,11 @@ def test_save_merged_writes_the_exact_f32_merge_not_the_bf16_one(tmp_path):
     import copy
 
     from safetensors.torch import load_file
+    from transformers import AutoModelForCausalLM
 
-    model = sft.attach(tiny_qwen35().to(torch.bfloat16), TRAIN, 0)  # bf16 base, as trained on the GPU
+    ckpt = save_ckpt(tmp_path / "ckpt")
+    model = AutoModelForCausalLM.from_pretrained(tmp_path / "ckpt", dtype=torch.bfloat16)  # as trained on the GPU
+    model = sft.attach(model, TRAIN, 0)
     plant_update(model, 1e-3)  # a small update: about half of it is below half a bf16 step
     expected, lora = {}, set()
     for name, mod in model.named_modules():
@@ -262,9 +281,12 @@ def test_save_merged_writes_the_exact_f32_merge_not_the_bf16_one(tmp_path):
             expected[key] = mod.base_layer.weight.float() + mod.scaling["default"] * (b @ a)
             lora.add(key)
     expected.update({k: v.float() for k, v in model.get_base_model().state_dict().items() if k not in expected})
+    wide = {k: v for k, v in ckpt.items() if v.dtype == torch.float32}
+    assert len(wide) == 2 * 3 and all(not torch.equal(expected[k], v) for k, v in wide.items())  # rounded by the load
+    expected.update(wide)  # restored from the checkpoint, not the rounded copies
     bf16_merge = copy.deepcopy(model).merge_and_unload().state_dict()
 
-    sft.save_merged(model, tmp_path / "merged")
+    sft.save_merged(model, tmp_path / "merged", str(tmp_path / "ckpt"))
     saved = load_file(tmp_path / "merged" / "model.safetensors")
     assert {v.dtype for v in saved.values()} == {torch.float32}
     assert json.loads((tmp_path / "merged" / "config.json").read_text())["dtype"] == "float32"
@@ -272,6 +294,24 @@ def test_save_merged_writes_the_exact_f32_merge_not_the_bf16_one(tmp_path):
     assert all(torch.equal(saved[k], expected[k]) for k in saved)  # bit-exact in f32
     differ = [k for k in lora if not torch.equal(saved[k], bf16_merge[k].float())]
     assert sorted(differ) == sorted(lora)
+
+
+def test_base_f32_tensors_maps_the_multimodal_names_and_refuses_other_wide_tensors(tmp_path):
+    from safetensors.torch import save_file
+
+    ckpt = save_ckpt(tmp_path / "ckpt")
+    wide = {k: v for k, v in ckpt.items() if v.dtype == torch.float32}
+    # the released checkpoint's layout: text tower under model.language_model., F32 vision and MTP tensors beside it
+    file = tmp_path / "ckpt" / "model.safetensors"
+    multimodal = {k.replace("model.", "model.language_model.", 1): v for k, v in ckpt.items()}
+    extra = {"model.visual.merger.norm.weight": torch.ones(4), "mtp.fc.weight": torch.ones(4, 4)}
+    save_file({**multimodal, **extra}, file, metadata={"format": "pt"})
+    restored = sft.base_f32_tensors(str(tmp_path / "ckpt"))
+    assert set(restored) == set(wide) and all(torch.equal(restored[k], v) for k, v in wide.items())
+
+    save_file({**ckpt, "model.norm.weight": ckpt["model.norm.weight"].float()}, file, metadata={"format": "pt"})
+    with pytest.raises(ValueError, match="must be exactly"):
+        sft.base_f32_tensors(str(tmp_path / "ckpt"))
 
 
 def load_script():
@@ -287,7 +327,7 @@ def write_setup(tmp_path):
     from transformers import PreTrainedTokenizerFast
 
     ckpt = tmp_path / "ckpt"
-    tiny_qwen35().save_pretrained(ckpt)
+    save_ckpt(ckpt)
     tok = Tokenizer(models.WordLevel({"<unk>": 0, "a": 1}, unk_token="<unk>"))
     PreTrainedTokenizerFast(tokenizer_object=tok, unk_token="<unk>").save_pretrained(ckpt)
     write_arm(tmp_path, "fewest_turns", 0, [[6, 9], [12], [5, 5, 5], [20]])

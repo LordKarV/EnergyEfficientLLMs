@@ -131,7 +131,7 @@ def main(argv=None):
     update_size = lora_update_size(model)
     # Fold W <- W + BA in f32 and save the plain model: quantization (GGUF) must see the deployed weights.
     merged_dir = os.path.join(run_dir, "merged")
-    sft.save_merged(model, merged_dir)
+    sft.save_merged(model, merged_dir, model_path)
     tokenizer.save_pretrained(merged_dir)
     run_meter.__exit__(None, None, None)
     on_gpu = device != "cpu"
