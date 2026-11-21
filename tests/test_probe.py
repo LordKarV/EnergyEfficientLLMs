@@ -8,6 +8,7 @@ import sys
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
+import numpy as np
 import pytest
 import torch
 
@@ -141,15 +142,19 @@ def test_script_records_kernels_in_use_in_every_row(tmp_path, monkeypatch):
 
 
 def plant_update(model, rel, seed=0):
-    """Set every LoRA B so each module's scaling * B @ A has ||.||_F / ||W||_F = rel (the owner's plant, issue #1)."""
+    """Set every LoRA B so each module's scaling * B @ A has ||.||_F / ||W||_F = rel (the owner's plant, issue #1).
+
+    rel is one size for every module, or a function of the module name.
+    """
     g = torch.Generator().manual_seed(seed)
     with torch.no_grad():
-        for mod in model.modules():
+        for name, mod in model.named_modules():
             if "default" not in getattr(mod, "lora_A", {}):
                 continue
             a, b, s = mod.lora_A["default"].weight, mod.lora_B["default"].weight, mod.scaling["default"]
             bn = torch.randn(b.shape, generator=g)
-            c = rel * mod.base_layer.weight.float().norm() / (s * (bn @ a.float())).norm()
+            size = rel(name) if callable(rel) else rel
+            c = size * mod.base_layer.weight.float().norm() / (s * (bn @ a.float())).norm()
             b.copy_((bn * c).to(b.dtype))
 
 
@@ -179,6 +184,54 @@ def test_lora_update_size_carried_share_is_near_0_below_half_a_bf16_step_and_nea
     assert small["carried_bf16"] < 0.05 and 0.4 < mid["carried_bf16"] < 0.65 and large["carried_bf16"] > 0.99
     assert all(t["carried_bf16"] < 0.1 for t in small["by_type"].values())
     assert all(t["carried_bf16"] > 0.98 for t in large["by_type"].values())
+
+
+def carried_terms(model, suffix="", reference="bf16"):
+    """(<kept, dW>, ||dW||^2) per adapted module, kept = bf16(W + dW) - ref with ref = bf16(W) or W itself."""
+    terms = []
+    with torch.no_grad():
+        for name, mod in model.named_modules():
+            if "default" not in getattr(mod, "lora_A", {}) or not name.endswith(suffix):
+                continue
+            w = mod.base_layer.weight.float()
+            dw = mod.scaling["default"] * (mod.lora_B["default"].weight.float() @ mod.lora_A["default"].weight.float())
+            ref = w.bfloat16().float() if reference == "bf16" else w
+            kept = (w + dw).bfloat16().float() - ref
+            terms.append((float((kept * dw).sum()), float((dw * dw).sum())))
+    return terms
+
+
+def test_lora_update_size_percentiles_and_carried_share_weigh_modules_of_different_size():
+    torch.manual_seed(0)
+    model = attach_lora(tiny_qwen35().to(torch.bfloat16), include_gates=False, grad_ckpt=False)
+    sizes = [1e-5, 1e-3, 3e-3, 1e-1]  # one per layer's down_proj, across the bf16 rounding edge
+
+    def size_of(name):
+        return sizes[int(name.split("layers.")[1].split(".")[0])] if name.endswith("down_proj") else 1e-3
+
+    plant_update(model, size_of)
+    down = lora_update_size(model)["by_type"]["down_proj"]
+    p10, p50, p90 = np.percentile(sizes, [10, 50, 90])
+    assert down["modules"] == 4
+    assert down["rel_p10"] == pytest.approx(p10, rel=1e-2) and down["rel_median"] == pytest.approx(p50, rel=1e-2)
+    assert down["rel_p90"] == pytest.approx(p90, rel=1e-2)
+    terms = carried_terms(model, "down_proj")
+    ratio_of_sums = sum(n for n, _ in terms) / sum(d for _, d in terms)
+    mean_of_ratios = float(np.mean([n / d for n, d in terms]))
+    assert down["carried_bf16"] == pytest.approx(ratio_of_sums, rel=1e-6)
+    assert abs(ratio_of_sums - mean_of_ratios) > 0.2  # the 1e-1 module dominates the sum
+
+
+def test_lora_update_size_carried_share_uses_bf16_w_as_reference_on_an_f32_base():
+    # An f32 W lies off the bf16 grid, so a small dW still moves some elements across a rounding edge and
+    # the share comes out near 1 on average. Against W itself the rounding error of W swamps a 1e-6 update.
+    torch.manual_seed(0)
+    model = attach_lora(tiny_qwen35(), include_gates=False, grad_ckpt=False)
+    plant_update(model, 1e-6)
+    carried = lora_update_size(model)["carried_bf16"]
+    bf16_ref, w_ref = (carried_terms(model, reference=r) for r in ("bf16", "w"))
+    assert carried == pytest.approx(sum(n for n, _ in bf16_ref) / sum(d for _, d in bf16_ref), rel=1e-6)
+    assert abs(carried - sum(n for n, _ in w_ref) / sum(d for _, d in w_ref)) > 1
 
 
 def test_script_reports_the_update_size_after_each_row(tmp_path, monkeypatch):
