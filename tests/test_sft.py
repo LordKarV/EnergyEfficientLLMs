@@ -320,3 +320,40 @@ def test_kernel_guard_refuses_slow_kernels_without_the_flag(tmp_path, monkeypatc
     with pytest.raises(SystemExit, match="allow-slow-kernels"):
         script.main(["--config", str(cfg_path), "--arm", "fewest_turns", "--seed", "0", "--device", "cpu"])
     assert not (tmp_path / "runs").exists()
+
+
+def test_train_meta_records_the_training_loop_cost(tmp_path, monkeypatch):
+    cfg_path, _ = write_setup(tmp_path)
+    script = load_script()
+    spans = []
+
+    class FakeMeter:
+        """Stands in for the NVML meter and notes which steps ran inside its block."""
+
+        def __enter__(self):
+            spans.append("enter")
+            self.joules, self.seconds = None, None
+            return self
+
+        def __exit__(self, *exc):
+            spans.append("exit")
+            self.joules, self.seconds = 5400.0, 7.2
+            return False
+
+    real_train = script.sft.train
+    monkeypatch.setattr(script, "EnergyMeter", FakeMeter)
+    monkeypatch.setattr(script.sft, "train", lambda *a, **k: spans.append("train") or real_train(*a, **k))
+    script.main(["--config", str(cfg_path), "--arm", "fewest_turns", "--seed", "0", "--allow-slow-kernels",
+                 "--device", "cpu"])
+    meta = json.loads((tmp_path / "runs" / "fewest_turns_seed0" / "train_meta.json").read_text())
+    assert spans == ["enter", "train", "exit"]
+    assert meta["wall_seconds"] == 7.2 and meta["gpu_joules"] == 5400.0 and meta["gpu_hours"] is None
+
+
+def test_train_meta_cost_off_cuda_is_wall_time_and_null_joules(tmp_path, monkeypatch):
+    cfg_path, _ = write_setup(tmp_path)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    load_script().main(["--config", str(cfg_path), "--arm", "fewest_turns", "--seed", "0", "--allow-slow-kernels",
+                        "--device", "cpu"])
+    meta = json.loads((tmp_path / "runs" / "fewest_turns_seed0" / "train_meta.json").read_text())
+    assert meta["wall_seconds"] > 0 and meta["gpu_joules"] is None and meta["gpu_hours"] is None
