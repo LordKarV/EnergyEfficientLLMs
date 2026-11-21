@@ -13,9 +13,13 @@ qtrace/fake_quant.py) the run is named <arm>_fq, so --arm random writes outputs/
 Training runs in bf16 on a GPU; the merge and the saved model are F32 (merged_dtype), so no part of the update is
 rounded away before the GGUF conversion. train_meta.json also has update_size (qtrace.probe.lora_update_size),
 measured on the trained adapter before the merge.
-Training cost (docs/03, Metrics): wall_seconds, gpu_hours and gpu_joules cover the training loop only (not
-model load, merge or save). gpu_joules is the NVML energy counter of GPU 0 (qtrace.energy.EnergyMeter), raw,
-idle draw included and GPU only; it is null when torch sees no CUDA device. gpu_hours is null on CPU.
+Training cost (docs/03, Metrics; owner answer on #15): train_meta.json's training_cost has two metered windows,
+whole_run (model load + train + merge + save, the primary, since break-even counts everything needed to produce
+the deployed model) and train_loop (sft.train alone, secondary). Each has wall_seconds, gpu_hours (null on CPU),
+gpu_joules (the NVML energy counter of GPU gpu_index, qtrace.energy.EnergyMeter, raw, idle draw included, GPU only)
+and gpu_joules_idle_subtracted (gpu_joules minus idle_watts times wall_seconds). idle_watts is read once before
+the run (qtrace.energy.measure_idle_watts over idle_seconds). Without a CUDA device NVML is not read: the joules
+and idle_watts are null and null_reason says why.
 """
 
 import argparse
@@ -29,9 +33,21 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from qtrace import fake_quant, sft
 from qtrace.common import load_config
-from qtrace.energy import EnergyMeter
+from qtrace.energy import EnergyMeter, measure_idle_watts
 from qtrace.models import pick_device
 from qtrace.probe import kernel_paths, kernel_status, lora_update_size
+
+GPU_INDEX = 0  # the g6e.16xlarge has one GPU (owner answer on #15); recorded so the record says which was metered
+IDLE_SECONDS = 10.0
+NO_NVML = "torch sees no CUDA device, so the NVML energy counter was not read"
+
+
+def window_cost(meter, idle_watts, on_gpu):
+    """One metered window's wall time, GPU-hours and GPU joules, raw and idle-subtracted."""
+    raw = meter.joules
+    return {"wall_seconds": meter.seconds, "gpu_hours": meter.seconds / 3600 if on_gpu else None, "gpu_joules": raw,
+            "gpu_joules_idle_subtracted": None if raw is None or idle_watts is None
+            else raw - idle_watts * meter.seconds}
 
 
 def check_kernels(allow_slow):
@@ -81,6 +97,10 @@ def main(argv=None):
 
     device = args.device or pick_device()
     dtype = torch.float32 if device == "cpu" else torch.bfloat16
+    idle_watts = measure_idle_watts(IDLE_SECONDS, GPU_INDEX)  # before the model is loaded, so the GPU is idle
+    # Whole-run window, closed after the save. Not a with-block: it would re-indent the whole run; on an exception
+    # no train_meta.json is written, so an unclosed meter loses nothing.
+    run_meter = EnergyMeter(GPU_INDEX).__enter__()
     tokenizer = AutoTokenizer.from_pretrained(model_path)
     model = AutoModelForCausalLM.from_pretrained(model_path, dtype=dtype).to(device)
     kernels["attn_implementation"] = model.config._attn_implementation
@@ -99,7 +119,7 @@ def main(argv=None):
             print(f"step {rec['step']:5d}  loss {rec['loss']:.4f}  per token {rec['loss_per_token']:.4f}  "
                   f"tokens {rec['supervised_tokens']}  grad {rec['grad_norm']:.3f}")
 
-        with EnergyMeter() as meter:
+        with EnergyMeter(GPU_INDEX) as meter:
             records = sft.train(model, examples, plan, tr["learning_rate"], warmup, tr["loss_norm"], tr["chunk"],
                                 log)
 
@@ -110,6 +130,8 @@ def main(argv=None):
     merged_dir = os.path.join(run_dir, "merged")
     sft.save_merged(model, merged_dir)
     tokenizer.save_pretrained(merged_dir)
+    run_meter.__exit__(None, None, None)
+    on_gpu = device != "cpu"
     meta = {
         "arm": args.arm, "seed": args.seed, "arm_file": arm_file, "examples": len(examples), "steps": len(plan),
         "epochs": tr["epochs"], "episodes_per_step": tr["episodes_per_step"],
@@ -122,8 +144,12 @@ def main(argv=None):
         "targets": list(tr["targets"]), "include_gates": tr["include_gates"], "lora_r": tr["lora_r"],
         "lora_alpha": tr["lora_alpha"], "kernels": kernels, "model": model_path, "device": device,
         "dtype": str(dtype), "merged": merged_dir, "merged_dtype": "float32", "update_size": update_size,
-        "fake_quant": fq_summary, "wall_seconds": meter.seconds,
-        "gpu_hours": None if device == "cpu" else meter.seconds / 3600, "gpu_joules": meter.joules,
+        "fake_quant": fq_summary,
+        "training_cost": {
+            "primary": "whole_run", "gpu_index": GPU_INDEX, "idle_watts": idle_watts, "idle_seconds": IDLE_SECONDS,
+            "null_reason": None if run_meter.joules is not None else NO_NVML,
+            "whole_run": window_cost(run_meter, idle_watts, on_gpu),
+            "train_loop": window_cost(meter, idle_watts, on_gpu)},
     }
     with open(os.path.join(run_dir, "train_meta.json"), "w") as f:
         json.dump(meta, f, indent=2)
