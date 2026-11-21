@@ -289,6 +289,13 @@ def test_script_trains_random_fq_and_saves_plain_merged_weights(tmp_path):
     # the same F32 save and update-size record as every other arm (issue #1)
     assert meta["merged_dtype"] == "float32" and set(meta["update_size"]["by_type"]) == set(TRAIN["targets"])
     assert 0 < meta["update_size"]["carried_bf16"] <= 1.05
+    # the same training-cost record (owner answer on #15): whole run primary, training loop secondary
+    cost = meta["training_cost"]
+    assert cost["primary"] == "whole_run" and cost["gpu_index"] == 0 and "null_reason" in cost
+    assert {"idle_watts", "idle_seconds"} <= set(cost)
+    for window in ("whole_run", "train_loop"):
+        assert set(cost[window]) == {"wall_seconds", "gpu_hours", "gpu_joules", "gpu_joules_idle_subtracted"}
+    assert cost["whole_run"]["wall_seconds"] > cost["train_loop"]["wall_seconds"] > 0
     base = AutoModelForCausalLM.from_pretrained(ckpt).state_dict()
     merged = AutoModelForCausalLM.from_pretrained(run / "merged").state_dict()
     assert json.loads((run / "merged" / "config.json").read_text())["dtype"] == "float32"
