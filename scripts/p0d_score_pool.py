@@ -1,12 +1,13 @@
 """P0d step 1: score the pool's successful BF16 runs against the Q3_K_M and Q4_K_M probes (docs/04, P0d).
 
-    python scripts/p0d_score_pool.py outputs/attempts/<P0b run>.jsonl ... --kl-score bin/kl_score \
-        --gguf-p bf16.gguf --gguf-q3 q3_k_m.gguf --gguf-q4 q4_k_m.gguf [--lists pool200] [--batch 25]
+    python scripts/p0d_score_pool.py outputs/attempts/*.jsonl --manifest outputs/p0/manifest.json \
+        --kl-score bin/kl_score --gguf-p bf16.gguf --gguf-q3 q3_k_m.gguf --gguf-q4 q4_k_m.gguf \
+        [--lists pool200] [--batch 25]
 
-Every resolved BF16 attempt on --lists in the files given is scored, so pass only P0b's attempts
-files (P0c's llama.cpp BF16 runs are a different draw). A run flagged by the test-file tripwire is
-skipped and counted, because it can never be a selection candidate (docs/04, "Test-file tripwire").
-Held-out lists are refused.
+Every resolved BF16 attempt on --lists whose run_id is one of the --manifest's P0b runs is scored
+(the manifest of scripts/p0_analyze.py); P0c's BF16 runs on pool200 are a different draw. A run
+flagged by the test-file tripwire is skipped and counted, because it can never be a selection
+candidate (docs/04, "Test-file tripwire"). Held-out lists are refused.
 
 Each (attempt, probe) becomes one row of --out: attempt_id, task_id, probe, gguf_p, gguf_q and the
 keys of qtrace.kl.score_stats. One helper call scores --batch episodes, so each load of the two GGUF
@@ -31,16 +32,16 @@ from qtrace.p0d import HELD_OUT_LISTS, flagged
 EPISODE_KEYS = ("input_ids", "model_mask", "tool_call_positions", "command_spans", "turn_spans")
 
 
-def pool_runs(attempt_paths, lists):
+def pool_runs(attempt_paths, lists, run_ids):
     """(record, absolute episode path) for each run to score, and the flagged count excluded."""
     runs, seen, n_flagged = [], set(), 0
     for path in attempt_paths:
         base = os.path.dirname(os.path.abspath(path))
         for r in read_jsonl(path):
-            missing = [k for k in ("attempt_id", "task_id", "list", "profile", "resolved") if k not in r]
+            missing = [k for k in ("attempt_id", "run_id", "task_id", "list", "profile", "resolved") if k not in r]
             if missing:
                 raise ValueError(f"{path}: attempt {r.get('attempt_id')!r} lacks {missing}")
-            if r["profile"] != "BF16" or not r["resolved"] or r["list"] not in lists:
+            if r["run_id"] not in run_ids or r["profile"] != "BF16" or not r["resolved"] or r["list"] not in lists:
                 continue
             if flagged(r):
                 n_flagged += 1
@@ -119,12 +120,12 @@ def resume(out, gguf_p, probes):
     return done
 
 
-def score_pool(attempt_paths, binary, gguf_p, probes, lists, out, batch=25, n_batch=512):
-    """Score every pool run under each probe ({probe name: GGUF path}), appending rows to out."""
+def score_pool(attempt_paths, binary, gguf_p, probes, lists, out, batch=25, n_batch=512, *, run_ids):
+    """Score every pool run of the P0b run_ids under each probe ({probe name: GGUF path}), appending to out."""
     bad = sorted(set(lists) & set(HELD_OUT_LISTS))
     if bad:
         raise ValueError(f"{bad} are held-out lists and never enter a pool")
-    runs, n_flagged = pool_runs(attempt_paths, lists)
+    runs, n_flagged = pool_runs(attempt_paths, lists, run_ids)
     done = resume(out, gguf_p, probes)
     print(f"{len(runs)} pool runs, {n_flagged} flagged by the test-file tripwire excluded, "
           f"{len(done)} rows already in {out}")
@@ -145,6 +146,7 @@ def score_pool(attempt_paths, binary, gguf_p, probes, lists, out, batch=25, n_ba
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("attempts", nargs="+")
+    ap.add_argument("--manifest", required=True, help="scripts/p0_analyze.py's manifest; its P0b run ids are scored")
     ap.add_argument("--kl-score", required=True, help="the kl_score helper binary (qtrace/kl_gguf.py)")
     ap.add_argument("--gguf-p", required=True, help="BF16 GGUF")
     ap.add_argument("--gguf-q3", required=True)
@@ -154,8 +156,13 @@ def main(argv=None):
     ap.add_argument("--n-batch", type=int, default=512, help="llama.cpp batch size")
     ap.add_argument("--out", default="outputs/p0d/scores.jsonl")
     args = ap.parse_args(argv)
+    with open(args.manifest) as f:
+        p0b = json.load(f).get("P0b")
+    if not p0b:
+        ap.error(f"{args.manifest} names no P0b run ids")
     report = score_pool(args.attempts, args.kl_score, args.gguf_p, {"Q3_K_M": args.gguf_q3, "Q4_K_M": args.gguf_q4},
-                        args.lists, args.out, batch=args.batch, n_batch=args.n_batch)
+                        args.lists, args.out, batch=args.batch, n_batch=args.n_batch,
+                        run_ids=set(p0b))
     print(json.dumps(report))
 
 

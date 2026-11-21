@@ -1,10 +1,12 @@
 """P0d steps 2-3: choose the stability score, pick the replay pairs and, given continuation results, run
 the DiD test (docs/04, P0d).
 
-    python scripts/p0d_analyze.py outputs/attempts/<P0b run>.jsonl ... --scores outputs/p0d/scores.jsonl \
-        [--est-joules outputs/p0a/est_joules.jsonl] [--power-rates BF16 Q3]
+    python scripts/p0d_analyze.py outputs/attempts/*.jsonl --manifest outputs/p0/manifest.json \
+        --scores outputs/p0d/scores.jsonl [--est-joules outputs/p0a/est_joules.jsonl] [--power-rates BF16 Q3]
     python scripts/p0d_analyze.py --continuations FILE
 
+The manifest is scripts/p0_analyze.py's ({"P0b": ["run-..."], "P0a": [...], "P0c": [...]}); only
+attempts whose run_id is one of its P0b runs are read, so P0c's BF16 runs on pool200 never enter.
 The first form writes outputs/p0d/score_choice.json: the chosen score (or null), every candidate's
 numbers, the replay pairs under the chosen score and, with --power-rates, the simulated power of the
 DiD test at 4 and 8 seeds per prefix. --power-rates are the expected BF16 and Q3_K_M continuation
@@ -64,6 +66,7 @@ def write_json(path, obj):
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("attempts", nargs="*")
+    ap.add_argument("--manifest", help="scripts/p0_analyze.py's manifest; its P0b run ids pick the pool attempts")
     ap.add_argument("--scores", default="outputs/p0d/scores.jsonl")
     ap.add_argument("--lists", nargs="+", default=list(POOL_LISTS), help="the pool lists p0d_score_pool.py scored")
     ap.add_argument("--est-joules", help="outputs/p0a/est_joules.jsonl; omit until P0a's energy model exists")
@@ -80,15 +83,21 @@ def main(argv=None):
         if args.attempts:
             ap.error("--continuations reads the pairs frozen in --out-dir/score_choice.json; pass no attempts files")
         return did_step(args)
-    if not args.attempts:
-        ap.error("attempts files are required to choose the score")
+    if not args.attempts or not args.manifest:
+        ap.error("attempts files and --manifest are required to choose the score")
+    with open(args.manifest) as f:
+        manifest = json.load(f)
+    if not manifest.get("P0b"):
+        ap.error(f"{args.manifest} names no P0b run ids")
 
     attempts = [r for path in args.attempts for r in read_jsonl(path)]
     joules = read_jsonl(args.est_joules) if args.est_joules else None
-    runs, info = join_runs(attempts, read_jsonl(args.scores), joules, lists=args.lists)
+    runs, info = join_runs(attempts, read_jsonl(args.scores), joules, lists=args.lists,
+                           run_ids=set(manifest["P0b"]))
     choice = choose_score(runs, have_joules=joules is not None, missing_q3=info["n_eligible_without_q3"])
     pairs = select_pairs(runs, choice["chosen"]) if choice["chosen"] else None
-    out = {**choice, "inputs": {**info, "scores": args.scores, "est_joules": args.est_joules}, "pairs": pairs}
+    out = {**choice, "inputs": {**info, "manifest": args.manifest, "scores": args.scores,
+                                "est_joules": args.est_joules}, "pairs": pairs}
     if args.power_rates and pairs and pairs["n_tasks"] >= 2:
         out["power"] = [power(*args.power_rates, n_tasks=pairs["n_tasks"], seeds=s, effects=POWER_EFFECTS,
                               n_boot=args.n_boot, seed=args.seed, drop_rate=args.replay_drop_rate,

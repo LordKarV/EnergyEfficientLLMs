@@ -108,10 +108,13 @@ def _scores(row, what):
     return {c: _number(_field(row, c, what), f"{what} {c}") for c in CANDIDATES}
 
 
-def join_runs(attempts, scores, est_joules=None, lists=POOL_LISTS):
+def join_runs(attempts, scores, est_joules=None, lists=POOL_LISTS, *, run_ids):
     """One record per scored pool run, joining attempt fields, both probes' scores and estimated joules.
 
-    Runs are the attempts with a Q3_K_M score row. Each must be a resolved BF16 attempt on one of
+    run_ids: the manifest's P0b run ids (scripts/p0_analyze.py's --manifest). Only attempts of those
+    runs are considered, for the runs and for every count below: P0c's BF16 attempts on pool200 are
+    another draw, and a score row for an attempt outside the set raises ValueError. Runs are the
+    attempts with a Q3_K_M score row. Each must be a resolved BF16 attempt on one of
     `lists` (the scorer's --lists); anything else (an unknown attempt, another profile, a failure,
     another list, a duplicate row, a non-finite number) raises ValueError, since it means the scorer
     read the wrong files. A run the test-file tripwire flagged can never be a selection candidate and
@@ -126,13 +129,16 @@ def join_runs(attempts, scores, est_joules=None, lists=POOL_LISTS):
     bad = sorted(set(lists) & set(HELD_OUT_LISTS))
     if bad:
         raise ValueError(f"{bad} are held-out lists and never enter a pool")
-    by_id, flagged_by_list, eligible = {}, defaultdict(int), set()
+    by_id, flagged_by_list, eligible, other_runs = {}, defaultdict(int), set(), {}
     for a in attempts:
         aid = _field(a, "attempt_id", "attempt")
-        if aid in by_id:
+        if aid in by_id or aid in other_runs:
             raise ValueError(f"duplicate attempt_id {aid!r} in the attempts files")
-        by_id[aid] = a
         what = f"attempt {aid}"
+        if _field(a, "run_id", what) not in run_ids:
+            other_runs[aid] = a["run_id"]
+            continue
+        by_id[aid] = a
         if _field(a, "profile", what) == "BF16" and _field(a, "resolved", what) and _field(a, "list", what) in lists:
             if flagged(a):
                 flagged_by_list[a["list"]] += 1
@@ -158,6 +164,9 @@ def join_runs(attempts, scores, est_joules=None, lists=POOL_LISTS):
         if probe != PROBE:
             continue
         what = f"attempt {aid}"
+        if aid in other_runs:
+            raise ValueError(f"{what}: scored, but its run {other_runs[aid]!r} is not a P0b run of the manifest "
+                             f"{sorted(run_ids)}")
         if aid not in by_id:
             raise ValueError(f"{what}: scored but not in the attempts files")
         a = by_id[aid]
@@ -199,7 +208,7 @@ def join_runs(attempts, scores, est_joules=None, lists=POOL_LISTS):
     info = {"n_runs": len(runs), "n_tasks": len({r["task_id"] for r in runs}),
             "flagged_excluded": dict(sorted(flagged_by_list.items())),
             "q4_rows_without_q3": sum(1 for aid, p in rows if p == AGREEMENT_PROBE and aid not in q3_ids),
-            "lists": list(lists), "n_eligible_without_q3": len(eligible - q3_ids),
+            "lists": list(lists), "run_ids": sorted(run_ids), "n_eligible_without_q3": len(eligible - q3_ids),
             "n_runs_without_q4": sum(1 for r in runs if r["q4"] is None),
             "n_runs_without_halves": sum(1 for r in runs if r["even"] is None or r["odd"] is None),
             "est_joules_given": est_joules is not None,

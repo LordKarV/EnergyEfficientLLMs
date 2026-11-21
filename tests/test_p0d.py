@@ -32,6 +32,7 @@ from qtrace.p0d import (
     within_task,
 )
 
+P0B = {"p0b"}  # the P0b run ids of the manifest; attempt() writes run_id "p0b"
 MALFORMED = ("misnested_tag", "wrong_name", "text_after_call", "truncated_call", "no_call_no_answer")
 
 
@@ -43,12 +44,12 @@ def load_script(name):
 
 
 def attempt(aid, task, turns=10, output=3000, malformed=0, lst="pool200", profile="BF16", resolved=True,
-            touched=False, episode_path=None):
+            touched=False, episode_path=None, run_id="p0b"):
     """An attempt record in the agreed format, with only the fields P0d reads filled in realistically."""
     grading = {"fail_to_pass_ok": 1, "fail_to_pass_total": 1, "pass_to_pass_ok": 5, "pass_to_pass_total": 5}
     if touched:
         grading["test_files_touched"] = True
-    return {"attempt_id": aid, "run_id": "p0b", "task_id": task, "list": lst, "repo": "pandas", "profile": profile,
+    return {"attempt_id": aid, "run_id": run_id, "task_id": task, "list": lst, "repo": "pandas", "profile": profile,
             "runtime": "vllm", "seed": 0, "resolved": resolved, "grading": grading, "end_reason": "submitted",
             "turns": turns, "tool_calls": turns, "repairs": 0,
             "malformed": {k: (malformed if k == "wrong_name" else 0) for k in MALFORMED},
@@ -135,7 +136,7 @@ def test_split_half_corrects_the_mean_of_per_task_rhos():
             attempts.append(attempt(aid, task))
             h = {"even": {c: float(even[k]) for c in CANDIDATES}, "odd": {c: float(odd[k]) for c in CANDIDATES}}
             scores.append(score_row(aid, task, "Q3_K_M", {c: float(k) for c in CANDIDATES}, h, 1.0))
-    runs, _ = join_runs(attempts, scores)
+    runs, _ = join_runs(attempts, scores, run_ids=P0B)
     split = choose_score(runs, missing_q3=0)["candidates"]["kl_mean"]["split_half"]
     assert split["rho"]["mean"] == 0.75 and split["rho"]["n_tasks"] == 2
     assert abs(split["spearman_brown_mean"] - 1.5 / 1.75) < 1e-12
@@ -153,7 +154,7 @@ def test_within_task_minimum_runs_and_constant_tasks():
 
 def test_rule_chooses_first_passing_candidate():
     attempts, scores, joules = make_pool()
-    runs, info = join_runs(attempts, scores, joules)
+    runs, info = join_runs(attempts, scores, joules, run_ids=P0B)
     out = choose_score(runs, missing_q3=0)
     c = out["candidates"]
     assert c["kl_decision"]["failed"] == ["entropy_bf16"]  # tracks entropy, otherwise fine
@@ -166,20 +167,20 @@ def test_rule_chooses_first_passing_candidate():
 
 def test_rule_order_prefers_the_primary_score():
     attempts, scores, joules = make_pool(roles={c: "trait" for c in CANDIDATES})
-    out = choose_score(join_runs(attempts, scores, joules)[0], missing_q3=0)
+    out = choose_score(join_runs(attempts, scores, joules, run_ids=P0B)[0], missing_q3=0)
     assert all(out["candidates"][c]["pass"] for c in CANDIDATES) and out["chosen"] == "kl_decision"
 
 
 def test_no_passing_candidate_answers_h3_negatively():
     roles = {"kl_decision": "entropy", "kl_command": "noise", "kl_mean": "noise"}
     attempts, scores, joules = make_pool(roles=roles)
-    out = choose_score(join_runs(attempts, scores, joules)[0], missing_q3=0)
+    out = choose_score(join_runs(attempts, scores, joules, run_ids=P0B)[0], missing_q3=0)
     assert out["chosen"] is None and out["decided"] and "H3" in out["verdict"]
 
 
 def test_missing_joules_leaves_the_rule_undecided():
     attempts, scores, _ = make_pool(roles={c: "trait" for c in CANDIDATES})
-    out = choose_score(join_runs(attempts, scores)[0], have_joules=False, missing_q3=0)
+    out = choose_score(join_runs(attempts, scores, run_ids=P0B)[0], have_joules=False, missing_q3=0)
     first = out["candidates"]["kl_decision"]
     assert first["checks"]["est_joules_q4"] is None and first["not_run"] == ["est_joules_q4"]
     assert first["pass"] is False and "not_run" in first["against"]["est_joules_q4"]
@@ -188,7 +189,7 @@ def test_missing_joules_leaves_the_rule_undecided():
 
 def test_a_definite_failure_needs_no_joules():
     attempts, scores, _ = make_pool()
-    out = choose_score(join_runs(attempts, scores)[0], have_joules=False, missing_q3=0)
+    out = choose_score(join_runs(attempts, scores, run_ids=P0B)[0], have_joules=False, missing_q3=0)
     assert out["candidates"]["kl_decision"]["failed"] == ["entropy_bf16"]
     assert out["chosen"] is None and not out["decided"] and "kl_mean" in out["verdict"]  # kl_mean undecided
 
@@ -197,11 +198,12 @@ def test_partial_q4_or_joules_coverage_leaves_the_rule_undecided():
     # Mid-run state: the scorer writes every Q3_K_M row before any Q4_K_M row, so Q4 rows cover 3 of 40 tasks.
     attempts, scores, joules = make_pool()
     partial = [s for s in scores if s["probe"] == "Q3_K_M" or s["task_id"] in {"task0", "task1", "task2"}]
-    runs, info = join_runs(attempts, partial, joules)
+    runs, info = join_runs(attempts, partial, joules, run_ids=P0B)
     out = choose_score(runs, missing_q3=0)
     assert info["n_runs_without_q4"] == 222 and out["candidates"]["kl_mean"]["not_run"] == ["probe_agreement"]
     assert out["chosen"] is None and not out["decided"] and "probe_agreement" in out["verdict"]
-    runs, info = join_runs(attempts, scores, [j for j in joules if j["attempt_id"].startswith(("task0-", "task1-"))])
+    runs, info = join_runs(attempts, scores, [j for j in joules if j["attempt_id"].startswith(("task0-", "task1-"))],
+                           run_ids=P0B)
     out = choose_score(runs, missing_q3=0)
     assert info["n_runs_without_est_joules"] == 228 and out["candidates"]["kl_mean"]["not_run"] == ["est_joules_q4"]
     assert out["chosen"] is None and not out["decided"]
@@ -212,7 +214,7 @@ def test_partial_halves_coverage_leaves_split_half_not_run():
     attempts, scores, joules = make_pool()
     keep = {"task0", "task1", "task2"}
     partial = [s if s["task_id"] in keep else {k: v for k, v in s.items() if k != "halves"} for s in scores]
-    runs, info = join_runs(attempts, partial, joules)
+    runs, info = join_runs(attempts, partial, joules, run_ids=P0B)
     out = choose_score(runs, missing_q3=0)
     assert info["n_runs_without_halves"] == 222
     assert out["candidates"]["kl_mean"]["checks"]["split_half"] is None
@@ -224,7 +226,7 @@ def test_missing_q3_rows_leave_the_rule_undecided():
     # 240 eligible attempts, Q3_K_M rows for 120 of them: the rule must not decide on the scored half.
     attempts, scores, joules = make_pool()
     scored = {f"task{t}" for t in range(20)}
-    runs, info = join_runs(attempts, [s for s in scores if s["task_id"] in scored], joules)
+    runs, info = join_runs(attempts, [s for s in scores if s["task_id"] in scored], joules, run_ids=P0B)
     assert info["n_eligible_without_q3"] == 120
     out = choose_score(runs, missing_q3=info["n_eligible_without_q3"])
     assert out["chosen"] is None and not out["decided"] and "120" in out["verdict"]
@@ -235,20 +237,32 @@ def test_choose_score_requires_the_missing_q3_count():
     # Owner review of PR #12: a caller that leaves the count out must not get a decision by default.
     attempts, scores, joules = make_pool(n_tasks=4, runs=3)
     with pytest.raises(TypeError, match="missing_q3"):
-        choose_score(join_runs(attempts, scores, joules)[0])
+        choose_score(join_runs(attempts, scores, joules, run_ids=P0B)[0])
 
 
 def test_runs_on_other_lists_are_not_missing_and_never_scored():
     attempts, scores, joules = make_pool(n_tasks=4, runs=3)
     other = attempt("other", "task0", lst="pool_extra")
-    _, info = join_runs(attempts + [other], scores, joules)
+    _, info = join_runs(attempts + [other], scores, joules, run_ids=P0B)
     assert info["n_eligible_without_q3"] == 0
-    _, info = join_runs(attempts + [other], scores, joules, lists=("pool200", "pool_extra"))
+    _, info = join_runs(attempts + [other], scores, joules, lists=("pool200", "pool_extra"), run_ids=P0B)
     assert info["n_eligible_without_q3"] == 1
     row = score_row("other", "task0", "Q3_K_M", {c: 1.0 for c in CANDIDATES},
                     {"even": {c: 1.0 for c in CANDIDATES}, "odd": {c: 1.0 for c in CANDIDATES}}, 1.0)
     with pytest.raises(ValueError, match="pool lists"):
-        join_runs(attempts + [other], scores + [row], joules)
+        join_runs(attempts + [other], scores + [row], joules, run_ids=P0B)
+
+
+def test_join_keeps_only_the_p0b_runs_of_the_manifest():
+    # Owner review of PR #12: P0c's BF16 attempts on pool200 are another draw and are told apart by run_id.
+    attempts, scores, joules = make_pool(n_tasks=4, runs=3)
+    p0c = [attempt("c0", "task0", run_id="p0c"), attempt("c1", "task1", run_id="p0c", touched=True)]
+    _, info = join_runs(attempts + p0c, scores, joules, run_ids=P0B)
+    assert info["n_runs"] == 12 and info["n_eligible_without_q3"] == 0 and info["flagged_excluded"] == {}
+    row = score_row("c0", "task0", "Q3_K_M", {c: 1.0 for c in CANDIDATES},
+                    {"even": {c: 1.0 for c in CANDIDATES}, "odd": {c: 1.0 for c in CANDIDATES}}, 1.0)
+    with pytest.raises(ValueError, match="not a P0b run"):
+        join_runs(attempts + p0c, scores + [row], joules, run_ids=P0B)
 
 
 def boundary_pool(field, values):
@@ -265,7 +279,7 @@ def boundary_pool(field, values):
         scores.append(score_row(aid, "t", "Q3_K_M", rank, {"even": rank, "odd": odd}, entropy))
         scores.append(score_row(aid, "t", "Q4_K_M", planted if field == "Q4_K_M" else rank,
                                 {"even": rank, "odd": rank}, entropy))
-    return join_runs(attempts, scores, joules)[0]
+    return join_runs(attempts, scores, joules, run_ids=P0B)[0]
 
 
 @pytest.mark.parametrize("field, values, check, rho, passes", [
@@ -327,7 +341,7 @@ def test_confound_threshold_tolerates_a_mean_a_few_ulps_past_0_8(monkeypatch, me
 def test_tasks_below_three_runs_count_for_pairs_but_not_for_the_rule():
     a1, s1, j1 = make_pool(n_tasks=10, runs=6)
     a2, s2, j2 = make_pool(n_tasks=5, runs=2, seed=1, task_prefix="pair")
-    runs, _ = join_runs(a1 + a2, s1 + s2, j1 + j2)
+    runs, _ = join_runs(a1 + a2, s1 + s2, j1 + j2, run_ids=P0B)
     turns = choose_score(runs, missing_q3=0)["candidates"]["kl_mean"]["against"]["turns"]
     assert turns["n_tasks"] == 10 and turns["n_tasks_too_few_runs"] == 5
     assert select_pairs(runs, "kl_mean")["n_tasks"] == 15
@@ -342,7 +356,7 @@ def test_flagged_runs_are_excluded_and_counted():
     # The scorer writes no rows for flagged runs, so the count has to come from the attempt records.
     attempts += [attempt("unscored", "task1", touched=True), attempt("failed", "task1", touched=True, resolved=False),
                  attempt("held", "h0", lst="heldout100", touched=True)]
-    runs, info = join_runs(attempts, scores, joules)
+    runs, info = join_runs(attempts, scores, joules, run_ids=P0B)
     assert info["flagged_excluded"] == {"pool200": 2} and len(runs) == 8
     assert "task0-r0" not in {r["attempt_id"] for r in runs}
 
@@ -356,29 +370,30 @@ def test_join_rejects_runs_that_cannot_be_pool_candidates(change, message):
     attempts, scores, _ = make_pool(n_tasks=2, runs=3)
     attempts = [{**attempts[0], **change}] + attempts[1:]
     with pytest.raises(ValueError, match=message):
-        join_runs(attempts, scores)
+        join_runs(attempts, scores, run_ids=P0B)
 
 
 def test_join_rejects_unknown_attempts_duplicates_and_bad_numbers():
     attempts, scores, _ = make_pool(n_tasks=2, runs=3)
     with pytest.raises(ValueError, match="not in the attempts"):
-        join_runs(attempts[1:], scores)
+        join_runs(attempts[1:], scores, run_ids=P0B)
     with pytest.raises(ValueError, match="duplicate"):
-        join_runs(attempts, scores + scores[:1])
+        join_runs(attempts, scores + scores[:1], run_ids=P0B)
     with pytest.raises(ValueError, match="kl_mean"):
-        join_runs(attempts, [{**scores[0], "kl_mean": float("nan")}] + scores[1:])
+        join_runs(attempts, [{**scores[0], "kl_mean": float("nan")}] + scores[1:], run_ids=P0B)
     with pytest.raises(ValueError, match="turns"):
-        join_runs([{k: v for k, v in attempts[0].items() if k != "turns"}] + attempts[1:], scores)
+        join_runs([{k: v for k, v in attempts[0].items() if k != "turns"}] + attempts[1:], scores, run_ids=P0B)
     with pytest.raises(ValueError, match="turns"):
-        join_runs([{**attempts[0], "turns": None}] + attempts[1:], scores)
+        join_runs([{**attempts[0], "turns": None}] + attempts[1:], scores, run_ids=P0B)
     with pytest.raises(ValueError, match="entropy_mean"):
-        join_runs(attempts, [{**scores[0], "entropy_mean": None}] + scores[1:])
+        join_runs(attempts, [{**scores[0], "entropy_mean": None}] + scores[1:], run_ids=P0B)
     with pytest.raises(ValueError, match="entropy_decision"):
-        join_runs(attempts, [{**scores[0], "entropy_decision": None}] + scores[1:])
+        join_runs(attempts, [{**scores[0], "entropy_decision": None}] + scores[1:], run_ids=P0B)
     with pytest.raises(ValueError, match="entropy_decision"):
-        join_runs(attempts, [{k: v for k, v in scores[0].items() if k != "entropy_decision"}] + scores[1:])
+        join_runs(attempts, [{k: v for k, v in scores[0].items() if k != "entropy_decision"}] + scores[1:],
+                  run_ids=P0B)
     empty = {**scores[0], "entropy_mean": None, "entropy_decision": None, **dict.fromkeys(CANDIDATES)}
-    join_runs(attempts, [empty] + scores[1:])  # an empty run nulls every mean
+    join_runs(attempts, [empty] + scores[1:], run_ids=P0B)  # an empty run nulls every mean
 
 
 # Replay pairs.
@@ -392,7 +407,7 @@ def test_pairs_take_lowest_and_highest_with_attempt_id_tie_break():
             attempts.append(attempt(aid, task, turns=10 + i, malformed=i))
             vals = {c: s for c in CANDIDATES}
             scores.append(score_row(aid, task, "Q3_K_M", vals, {"even": vals, "odd": vals}, 1.0 + i, 3.0 * i))
-    p = select_pairs(join_runs(attempts, scores)[0], "kl_decision")
+    p = select_pairs(join_runs(attempts, scores, run_ids=P0B)[0], "kl_decision")
     by_task = {t["task_id"]: t for t in p["tasks"]}
     assert p["n_tasks"] == 2 and p["n_tasks_one_run"] == 1
     assert (by_task["x"]["low"], by_task["x"]["high"]) == ("x-a", "x-c")
@@ -623,7 +638,8 @@ def pool_dir(tmp_path):
     d.mkdir()
     recs = [attempt(f"ok{i}", f"t{i % 3}") for i in range(7)]
     recs += [attempt("flag", "t0", touched=True), attempt("fail", "t0", resolved=False),
-             attempt("q4", "t0", profile="Q4_K_M"), attempt("held", "h0", lst="heldout100")]
+             attempt("q4", "t0", profile="Q4_K_M"), attempt("held", "h0", lst="heldout100"),
+             attempt("p0c", "t0", run_id="p0c")]  # a P0c BF16 run on pool200: not in the manifest's P0b
     for r in recs:
         write_episode(d / f"{r['attempt_id']}.npz")
     with open(d / "run.jsonl", "w") as f:
@@ -643,7 +659,8 @@ def fake_scorer(calls, fail_on=None):
 
 def run_scorer(mod, d, out, batch=3):
     return mod.score_pool([str(d / "run.jsonl")], "kl_score", "bf16.gguf",
-                          {"Q3_K_M": "q3.gguf", "Q4_K_M": "q4.gguf"}, ["pool200"], str(out), batch=batch)
+                          {"Q3_K_M": "q3.gguf", "Q4_K_M": "q4.gguf"}, ["pool200"], str(out), batch=batch,
+                          run_ids=P0B)
 
 
 def test_scorer_filters_batches_and_resumes(pool_dir, tmp_path, monkeypatch):
@@ -686,7 +703,7 @@ def test_scorer_cuts_a_torn_line_and_refuses_other_ggufs(pool_dir, tmp_path, mon
     assert report["scored"] == 0 and len(read_jsonl(out)) == 14
     with pytest.raises(ValueError, match="different GGUF"):
         mod.score_pool([str(pool_dir / "run.jsonl")], "kl_score", "bf16.gguf",
-                       {"Q3_K_M": "other_q3.gguf", "Q4_K_M": "q4.gguf"}, ["pool200"], str(out))
+                       {"Q3_K_M": "other_q3.gguf", "Q4_K_M": "q4.gguf"}, ["pool200"], str(out), run_ids=P0B)
 
 
 def test_scorer_refuses_an_out_file_that_is_not_a_scores_file(tmp_path):
@@ -703,7 +720,7 @@ def test_scorer_rejects_held_out_lists(pool_dir, tmp_path):
     mod = load_script("p0d_score_pool")
     with pytest.raises(ValueError, match="held-out"):
         mod.score_pool([str(pool_dir / "run.jsonl")], "kl_score", "bf16.gguf", {"Q3_K_M": "q3.gguf"},
-                       ["pool200", "heldout100"], str(tmp_path / "s.jsonl"))
+                       ["pool200", "heldout100"], str(tmp_path / "s.jsonl"), run_ids=P0B)
 
 
 def test_scorer_rejects_malformed_episodes(tmp_path):
@@ -737,16 +754,25 @@ def test_scorer_feeds_the_real_score_stats(pool_dir, tmp_path, monkeypatch):
 
 # The analysis script end to end.
 
-def test_analyze_writes_score_choice_and_did(tmp_path):
-    attempts, scores, joules = make_pool(n_tasks=30)
-    attempts.append(attempt("flagged", "task0", touched=True))  # no score row, as the scorer skips it
-    paths = {}
+def write_inputs(tmp_path, attempts, scores, joules):
+    """The analysis inputs as files, with a manifest in p0_analyze.py's format naming the P0b run."""
+    paths = {"manifest": tmp_path / "manifest.json"}
+    paths["manifest"].write_text(json.dumps({"P0b": sorted(P0B), "P0c": ["p0c"]}))
     for name, rows in (("attempts", attempts), ("scores", scores), ("joules", joules)):
         paths[name] = tmp_path / f"{name}.jsonl"
         paths[name].write_text("".join(json.dumps(r) + "\n" for r in rows))
+    return paths
+
+
+def test_analyze_writes_score_choice_and_did(tmp_path):
+    attempts, scores, joules = make_pool(n_tasks=30)
+    attempts.append(attempt("flagged", "task0", touched=True))  # no score row, as the scorer skips it
+    attempts.append(attempt("p0c-run", "task0", run_id="p0c"))  # P0c's draw: never scored, never missing
+    paths = write_inputs(tmp_path, attempts, scores, joules)
     out_dir = tmp_path / "p0d"
     mod = load_script("p0d_analyze")
-    mod.main([str(paths["attempts"]), "--scores", str(paths["scores"]), "--est-joules", str(paths["joules"]),
+    mod.main([str(paths["attempts"]), "--manifest", str(paths["manifest"]), "--scores", str(paths["scores"]),
+              "--est-joules", str(paths["joules"]),
               "--out-dir", str(out_dir), "--power-rates", "0.9,0.5", "0.8,0.3", "--replay-drop-rate", "0.1",
               "--n-boot", "300"])
     choice = json.loads((out_dir / "score_choice.json").read_text())
@@ -779,12 +805,9 @@ def test_analyze_rerun_removes_a_stale_did_and_says_why_there_are_no_pairs(tmp_p
     mod = load_script("p0d_analyze")
 
     def run(roles, with_joules):
-        attempts, scores, joules = make_pool(n_tasks=10, roles=roles)
-        paths = {}
-        for name, rows in (("attempts", attempts), ("scores", scores), ("joules", joules)):
-            paths[name] = tmp_path / f"{name}.jsonl"
-            paths[name].write_text("".join(json.dumps(r) + "\n" for r in rows))
-        mod.main([str(paths["attempts"]), "--scores", str(paths["scores"]), "--out-dir", str(out_dir)] +
+        paths = write_inputs(tmp_path, *make_pool(n_tasks=10, roles=roles))
+        mod.main([str(paths["attempts"]), "--manifest", str(paths["manifest"]), "--scores", str(paths["scores"]),
+                  "--out-dir", str(out_dir)] +
                  (["--est-joules", str(paths["joules"])] if with_joules else []))
         with pytest.raises(SystemExit) as stop:
             mod.main(["--out-dir", str(out_dir), "--continuations", str(paths["attempts"])])
@@ -805,7 +828,7 @@ def test_scorer_with_real_gguf(pool_dir, tmp_path):
     mod = load_script("p0d_score_pool")
     out = tmp_path / "scores.jsonl"
     mod.score_pool([str(pool_dir / "run.jsonl")], BIN, P, {"Q3_K_M": Q, "Q4_K_M": Q}, ["pool200"], str(out),
-                   batch=25)
+                   batch=25, run_ids=P0B)
     rows = read_jsonl(out)
     assert len(rows) == 14 and all(r["kl_mean"] > 0 and r["n_scored"] == 35 for r in rows)
     q3 = {r["attempt_id"]: r["kl_mean"] for r in rows if r["probe"] == "Q3_K_M"}
