@@ -4,6 +4,7 @@ import copy
 import os
 import sys
 
+import pytest
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -71,6 +72,18 @@ def test_chunked_matches_full_logits_for_any_chunk_size():
         out = compare(p.lm_head, hp, q.lm_head, hq, targets, chunk=chunk)
         assert torch.allclose(out["kl"], kl_ref, atol=1e-5)
         assert torch.allclose(out["nll_p"], nll_ref, atol=1e-5)
+
+
+def test_numpy_episode_scores_like_torch():
+    # The episode store saves .npz arrays: input_ids [n] and a bool model_mask [n].
+    model_p = tiny_qwen35()
+    model_q = copy.deepcopy(model_p)
+    quantize_model_rtn(model_q, bits=3, group_size=32)
+    ids, mask = episode()
+    want = score_trajectory(model_p, model_q, ids, mask, command_spans=[(20, 30)])
+    assert score_trajectory(model_p, model_q, ids[0].numpy(), mask.numpy(), command_spans=[(20, 30)]) == want
+    with pytest.raises(ValueError, match=r"input_ids must be \[n\] or \[1, n\]"):
+        score_trajectory(model_p, model_q, ids.repeat(2, 1), mask)
 
 
 def test_quantized_copy_disagrees():

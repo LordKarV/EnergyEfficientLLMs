@@ -144,8 +144,13 @@ def score_trajectory(model_p, model_q, input_ids, model_mask, tool_call_position
 
     command_spans are the command values (also used for kl_command); turn_spans are the assistant
     turns in order, split into even and odd halves for split-half reliability. Spans are
-    (start, end), end exclusive.
+    (start, end), end exclusive. input_ids ([n] or [1, n]) and model_mask may be numpy arrays, as in
+    the episode store's .npz files.
     """
+    input_ids, model_mask = torch.as_tensor(input_ids), torch.as_tensor(model_mask)
+    input_ids = input_ids[None] if input_ids.ndim == 1 else input_ids
+    if input_ids.ndim != 2 or input_ids.shape[0] != 1:
+        raise ValueError(f"input_ids must be [n] or [1, n], not {tuple(input_ids.shape)}")
     idx = logit_index(model_mask)
     targets = input_ids[0, (idx + 1).to(input_ids.device)]
     stats = compare(model_p.lm_head, hidden_at(model_p, input_ids, idx),
