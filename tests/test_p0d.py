@@ -786,8 +786,9 @@ def test_scorer_feeds_the_real_score_stats(pool_dir, tmp_path, monkeypatch):
     """compare_gguf replaced, so score_trajectories_gguf and score_stats run on the loaded episodes."""
     from qtrace import kl_gguf
 
-    def fake_compare(binary, gguf_p, gguf_q, runs, n_batch=512):
-        return [{k: torch.linspace(0.1, 1.0, len(idx)) for k in kl_gguf.FIELDS} for _, idx in runs]
+    def fake_compare(binary, gguf_p, gguf_q, runs, n_batch=512, cpu=False):
+        return [{**{k: torch.linspace(0.1, 1.0, len(idx)) for k in kl_gguf.FIELDS}, "runtime": {"devices": ["CPU"]}}
+                for _, idx in runs]
 
     mod = load_script("p0d_score_pool")
     monkeypatch.setattr(kl_gguf, "compare_gguf", fake_compare)
@@ -796,6 +797,7 @@ def test_scorer_feeds_the_real_score_stats(pool_dir, tmp_path, monkeypatch):
     r = read_jsonl(out)[0]
     assert r["n_scored"] == 35 and r["n_command"] == 9 and set(r["halves"]) == {"even", "odd"}
     assert r["halves"]["even"]["n_scored"] == 15 and r["kl_decision"] is not None
+    assert r["runtime"] == {"devices": ["CPU"]}  # the helper's settings are kept with the scores
 
 
 # The analysis script end to end.
