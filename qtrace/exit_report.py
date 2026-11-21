@@ -37,6 +37,7 @@ WALL_CAP_FACTOR = 3  # 04: the infra cap is about 3x the pilot's 99th-percentile
 # so a within-runtime profile comparison never runs under two caps.
 CAP_PROFILE = "BF16"
 # 04 (Model and decoding): pinned per request in both runtimes and logged; server defaults are never relied on.
+# record.sampler holds exactly these keys, 04's names (owner's agent on PR #7, answer 6).
 SAMPLER = {"temperature": 0.6, "top_p": 0.95, "top_k": 20, "min_p": 0.0, "presence_penalty": 0.0,
            "repetition_penalty": 1.0}
 # 04 asks for projections at 64K x 16 and 128K x 8: scenario -> (extras key of its measured rates, slots).
@@ -150,7 +151,8 @@ def _pilot_rates(rows):
 def _sampler_ok(sampler):
     def ok(v, want):
         return isinstance(v, (int, float)) and not isinstance(v, bool) and abs(v - want) <= 1e-9
-    return isinstance(sampler, dict) and all(ok(sampler.get(k), v) for k, v in SAMPLER.items())
+    return isinstance(sampler, dict) and set(sampler) == set(SAMPLER) and all(ok(sampler[k], v)
+                                                                              for k, v in SAMPLER.items())
 
 
 def _sampler_check(rows):

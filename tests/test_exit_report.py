@@ -421,3 +421,13 @@ def test_sampler_and_seed_check():
     assert c["ok"] is False and c["n_mismatch"] == 3 and c["n_seed_missing"] == 1
     assert c["examples"] == [rows[i]["attempt_id"] for i in (1, 2, 4, 3)]  # mismatches first, then seeds
     assert "| vllm | 3 **FAIL** | 1 **FAIL** |" in render_markdown(attempt_stats(rows), [], {}, {})
+
+
+def test_sampler_keys_are_exactly_the_six_pinned_names():
+    # Owner's agent on PR #7 (answer 6): record.sampler keys are exactly temperature, top_p, top_k, min_p,
+    # presence_penalty, repetition_penalty. An extra key (a server-side knob, or another name for one) fails.
+    rows = [rec("vllm", "submitted", i, 600) for i in range(3)]
+    rows[1]["sampler"] = {**SAMPLER, "frequency_penalty": 0.0}
+    rows[2]["sampler"] = {**{k: v for k, v in SAMPLER.items() if k != "repetition_penalty"}, "repeat_penalty": 1.0}
+    c = attempt_stats(rows)["vllm"]["sampler_check"]
+    assert c["n_mismatch"] == 2 and c["examples"] == [rows[1]["attempt_id"], rows[2]["attempt_id"]]
