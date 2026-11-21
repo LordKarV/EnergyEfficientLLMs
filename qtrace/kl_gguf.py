@@ -97,15 +97,23 @@ def compare_gguf(binary, gguf_p, gguf_q, runs, n_batch=512, cpu=False, top_k=0):
     return stats
 
 
-def score_trajectories_gguf(binary, gguf_p, gguf_q, episodes, n_batch=512, entropy_threshold=None, cpu=False):
+def score_trajectories_gguf(binary, gguf_p, gguf_q, episodes, n_batch=512, entropy_threshold=None, cpu=False,
+                            positions=False):
     """kl.score_trajectory() for each episode, with GGUF models, plus the helper's "runtime" settings.
 
     Each episode is a dict of score_trajectory's episode arguments: input_ids and model_mask (torch
     tensors or numpy arrays), plus optionally tool_call_positions, command_spans and turn_spans.
+    positions=True adds "positions": the logit positions idx and the per-position FIELDS as numpy
+    arrays, so a threshold or a re-analysis needs no second scoring pass.
     """
     idxs = [logit_index(torch.as_tensor(e["model_mask"])) for e in episodes]
     stats = compare_gguf(binary, gguf_p, gguf_q, [(e["input_ids"], i) for e, i in zip(episodes, idxs)], n_batch,
                          cpu=cpu)
-    return [{**score_stats(s, i, e.get("tool_call_positions", ()), e.get("command_spans", ()), entropy_threshold,
-                           e.get("turn_spans", ())), "runtime": s["runtime"]}
-            for s, i, e in zip(stats, idxs, episodes)]
+    out = []
+    for s, i, e in zip(stats, idxs, episodes):
+        row = {**score_stats(s, i, e.get("tool_call_positions", ()), e.get("command_spans", ()), entropy_threshold,
+                             e.get("turn_spans", ())), "runtime": s["runtime"]}
+        if positions:
+            row["positions"] = {"idx": i.numpy().astype(np.int32), **{k: s[k].numpy() for k in FIELDS}}
+        out.append(row)
+    return out

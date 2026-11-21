@@ -667,7 +667,10 @@ def write_episode(path, n=60):
 
 
 @pytest.fixture
-def pool_dir(tmp_path):
+def pool_dir(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)  # run_scorer names the helper and GGUFs relative to here; the scorer hashes them
+    for name in ("kl_score", "bf16.gguf", "q3.gguf", "q4.gguf", "other_q3.gguf"):
+        (tmp_path / name).write_bytes(name.encode())
     d = tmp_path / "attempts"
     d.mkdir()
     recs = [attempt(f"ok{i}", f"t{i % 3}") for i in range(7)]
@@ -682,19 +685,21 @@ def pool_dir(tmp_path):
 
 
 def fake_scorer(calls, fail_on=None):
-    def score(binary, gguf_p, gguf_q, episodes, n_batch=512, entropy_threshold=None):
+    def score(binary, gguf_p, gguf_q, episodes, n_batch=512, entropy_threshold=None, positions=False):
         calls.append((os.path.basename(gguf_q), len(episodes)))
         if fail_on is not None and len(calls) == fail_on:
             raise RuntimeError("helper crashed")
         return [{"n_scored": int(e["model_mask"].sum()), "kl_mean": 0.1, "kl_decision": 0.2, "kl_command": 0.3,
-                 "turn_spans": e["turn_spans"]} for e in episodes]
+                 "turn_spans": e["turn_spans"], "runtime": {"devices": ["CPU"]},
+                 **({"positions": {"idx": np.arange(3), "kl": np.ones(3)}} if positions else {})}
+                for e in episodes]
     return score
 
 
-def run_scorer(mod, d, out, batch=3):
+def run_scorer(mod, d, out, batch=3, **kw):
     return mod.score_pool([str(d / "run.jsonl")], "kl_score", "bf16.gguf",
                           {"Q3_K_M": "q3.gguf", "Q4_K_M": "q4.gguf"}, ["pool200"], str(out), batch=batch,
-                          run_ids=P0B)
+                          run_ids=P0B, **kw)
 
 
 def test_scorer_filters_batches_and_resumes(pool_dir, tmp_path, monkeypatch):
@@ -721,6 +726,29 @@ def test_scorer_filters_batches_and_resumes(pool_dir, tmp_path, monkeypatch):
 
     calls.clear()
     assert run_scorer(mod, pool_dir, out)["scored"] == 0 and calls == []
+
+
+def test_scorer_logs_each_batch_and_writes_positions(pool_dir, tmp_path, monkeypatch):
+    import hashlib
+
+    mod = load_script("p0d_score_pool")
+    out, pos = tmp_path / "p0d" / "scores.jsonl", tmp_path / "positions"
+    monkeypatch.setattr(mod, "score_trajectories_gguf", fake_scorer([]))
+    report = run_scorer(mod, pool_dir, out, batch=5, positions_dir=str(pos), llama_commit="b1b770d9")
+    log = read_jsonl(tmp_path / "p0d" / "scores.batches.jsonl")
+    assert [(b["probe"], len(b["attempt_ids"])) for b in log] == [("Q3_K_M", 5), ("Q3_K_M", 2), ("Q4_K_M", 5),
+                                                                  ("Q4_K_M", 2)]
+    assert log[0]["attempt_ids"] == [f"ok{i}" for i in range(5)] and log[0]["n_tokens"] == 5 * 60
+    assert log[0]["runtime"] == {"devices": ["CPU"]} and log[0]["llama_commit"] == "b1b770d9"
+    assert log[0]["n_batch"] == 512 and log[0]["platform"] and log[0]["joules"] is None  # no NVIDIA GPU here
+    assert log[2]["sha256"] == {k: hashlib.sha256(name.encode()).hexdigest()
+                                for k, name in (("kl_score", "kl_score"), ("gguf_p", "bf16.gguf"), ("gguf_q", "q4.gguf"))}
+    assert report["seconds"] == pytest.approx(sum(b["seconds"] for b in log)) and report["joules"] is None
+    assert sorted(os.listdir(pos)) == sorted(f"ok{i}.{p}.npz" for i in range(7) for p in ("Q3_K_M", "Q4_K_M"))
+    assert np.load(pos / "ok0.Q3_K_M.npz")["kl"].tolist() == [1, 1, 1]
+    assert all("positions" not in r for r in read_jsonl(out))
+    run_scorer(mod, pool_dir, out)  # nothing left to score: no batch is logged
+    assert len(read_jsonl(tmp_path / "p0d" / "scores.batches.jsonl")) == 4
 
 
 def test_scorer_skips_and_counts_infrastructure_errors(tmp_path):
@@ -776,7 +804,8 @@ def test_scorer_rejects_malformed_episodes(tmp_path):
     good = dict(np.load(path))
     for change, message in (({"model_mask": good["model_mask"][:-1]}, "model_mask"),
                             ({"turn_spans": np.array([[10, 99]], dtype=np.int32)}, "turn_spans"),
-                            ({"tool_call_positions": np.array([60], dtype=np.int32)}, "tool_call_positions")):
+                            ({"tool_call_positions": np.array([60], dtype=np.int32)}, "tool_call_positions"),
+                            ({"tool_call_positions": np.array([30], dtype=np.int32)}, "outside model_mask")):
         np.savez(path, **{**good, **change})
         with pytest.raises(ValueError, match=message):
             mod.load_episode(path)
@@ -793,9 +822,13 @@ def test_scorer_feeds_the_real_score_stats(pool_dir, tmp_path, monkeypatch):
     mod = load_script("p0d_score_pool")
     monkeypatch.setattr(kl_gguf, "compare_gguf", fake_compare)
     out = tmp_path / "scores.jsonl"
-    run_scorer(mod, pool_dir, out)
+    run_scorer(mod, pool_dir, out, positions_dir=str(tmp_path / "pos"))
     r = read_jsonl(out)[0]
     assert r["n_scored"] == 35 and r["n_command"] == 9 and set(r["halves"]) == {"even", "odd"}
+    with np.load(tmp_path / "pos" / "ok0.Q3_K_M.npz") as z:
+        assert sorted(z.files) == sorted(("idx",) + kl_gguf.FIELDS) and z["idx"].dtype == np.int32
+        assert z["idx"].tolist() == list(range(9, 24)) + list(range(34, 54))  # logit t - 1 of each written t
+        assert np.allclose(z["entropy_p"], np.linspace(0.1, 1.0, 35))
     assert r["halves"]["even"]["n_scored"] == 15 and r["kl_decision"] is not None
     assert r["runtime"] == {"devices": ["CPU"]}  # the helper's settings are kept with the scores
 

@@ -2,7 +2,7 @@
 
     python scripts/p0d_score_pool.py outputs/attempts/*.jsonl --manifest outputs/p0/manifest.json \
         --kl-score bin/kl_score --gguf-p bf16.gguf --gguf-q3 q3_k_m.gguf --gguf-q4 q4_k_m.gguf \
-        [--lists pool200] [--batch 25]
+        [--lists pool200] [--batch 25] [--positions-dir outputs/p0d/positions] [--llama-commit b1b770d9]
 
 Every resolved BF16 attempt on --lists whose run_id is one of the --manifest's P0b runs is scored
 (the manifest of scripts/p0_analyze.py); P0c's BF16 runs on pool200 are a different draw. An attempt
@@ -11,14 +11,25 @@ is skipped and counted, as qtrace.p1_select.candidates drops it. A run flagged b
 candidate (docs/04, "Test-file tripwire"). Held-out lists are refused.
 
 Each (attempt, probe) becomes one row of --out: attempt_id, task_id, probe, gguf_p, gguf_q and the
-keys of qtrace.kl.score_stats. One helper call scores --batch episodes, so each load of the two GGUF
-files is shared by many runs, and the rows are appended after every call. A restart skips the pairs
-already written. A torn last line left by a crash is cut off and that run is scored again.
+keys of qtrace.kl.score_stats, plus "runtime", the helper's backend settings (devices, n_batch,
+KV-cache types, flash attention). One helper call scores --batch episodes, so each load of the two
+GGUF files is shared by many runs, and the rows are appended after every call. A restart skips the
+pairs already written. A torn last line left by a crash is cut off and that run is scored again.
+
+So the scoring hours are stated, not rebuilt (docs/04, P0 step 3), every call also appends one line
+to <out stem>.batches.jsonl: probe, attempt ids, token count, wall seconds, GPU joules (EnergyMeter:
+NVIDIA only, idle draw included, else null), the helper's runtime settings, the platform, the
+sha256 of the helper and both GGUFs, n_batch and --llama-commit. Restarts and machine moves append
+to the same file, so each line describes its own call. With --positions-dir, each (attempt, probe)
+also gets <attempt_id>.<probe>.npz holding idx and the per-position kl, flip, entropy_p, nll_p and
+nll_q, written before its row, so the S2 entropy threshold and any re-analysis need no rescoring.
 """
 
 import argparse
+import hashlib
 import json
 import os
+import platform
 import sys
 
 import numpy as np
@@ -27,6 +38,7 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from qtrace.common import append_jsonl, read_jsonl
+from qtrace.energy import EnergyMeter
 from qtrace.kl_gguf import score_trajectories_gguf
 from qtrace.p0d import HELD_OUT_LISTS, flagged
 
@@ -81,6 +93,8 @@ def load_episode(path):
         calls = z["tool_call_positions"].reshape(-1)
         if ((calls < 0) | (calls >= len(ids))).any():
             raise ValueError(f"{path}: tool_call_positions outside the episode")
+        if not mask[calls].all():  # a decision point must be a scored, model-written token
+            raise ValueError(f"{path}: tool_call_positions outside model_mask")
         return {"input_ids": torch.from_numpy(ids.astype(np.int64)).reshape(1, -1),
                 "model_mask": torch.from_numpy(mask.copy()), "tool_call_positions": calls.tolist(), **spans}
 
@@ -127,7 +141,20 @@ def resume(out, gguf_p, probes):
     return done
 
 
-def score_pool(attempt_paths, binary, gguf_p, probes, lists, out, batch=25, n_batch=512, *, run_ids):
+def sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1 << 24), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def batches_path(out):
+    return os.path.splitext(out)[0] + ".batches.jsonl"
+
+
+def score_pool(attempt_paths, binary, gguf_p, probes, lists, out, batch=25, n_batch=512, *, run_ids,
+               positions_dir=None, llama_commit=None):
     """Score every pool run of the P0b run_ids under each probe ({probe name: GGUF path}), appending to out."""
     bad = sorted(set(lists) & set(HELD_OUT_LISTS))
     if bad:
@@ -136,19 +163,38 @@ def score_pool(attempt_paths, binary, gguf_p, probes, lists, out, batch=25, n_ba
     done = resume(out, gguf_p, probes)
     print(f"{len(runs)} pool runs, {n_flagged} flagged by the test-file tripwire excluded, "
           f"{n_error} infrastructure errors excluded, {len(done)} rows already in {out}")
-    scored = 0
+    if positions_dir:
+        os.makedirs(positions_dir, exist_ok=True)
+    hashes = {}  # computed once, only for files a call uses
+    scored, seconds, joules = 0, 0.0, None
     for probe, gguf_q in probes.items():
         todo = [(r, ep) for r, ep in runs if (r["attempt_id"], probe) not in done]
         for s in range(0, len(todo), batch):
             chunk = todo[s:s + batch]
-            stats = score_trajectories_gguf(binary, gguf_p, gguf_q, [load_episode(ep) for _, ep in chunk],
-                                            n_batch=n_batch)
+            for f in (binary, gguf_p, gguf_q):
+                hashes[f] = hashes.get(f) or sha256(f)
+            episodes = [load_episode(ep) for _, ep in chunk]
+            with EnergyMeter() as meter:
+                stats = score_trajectories_gguf(binary, gguf_p, gguf_q, episodes, n_batch=n_batch,
+                                                positions=bool(positions_dir))
+            if positions_dir:
+                for (r, _), st in zip(chunk, stats):
+                    np.savez(os.path.join(positions_dir, f"{r['attempt_id']}.{probe}.npz"), **st["positions"])
+            stats = [{k: v for k, v in st.items() if k != "positions"} for st in stats]
             append_jsonl(out, [{"attempt_id": r["attempt_id"], "task_id": r["task_id"], "probe": probe,
                                 "gguf_p": gguf_p, "gguf_q": gguf_q, **st} for (r, _), st in zip(chunk, stats)])
+            append_jsonl(batches_path(out), [{
+                "probe": probe, "attempt_ids": [r["attempt_id"] for r, _ in chunk],
+                "n_tokens": sum(e["input_ids"].shape[-1] for e in episodes), "seconds": meter.seconds,
+                "joules": meter.joules, "runtime": stats[0].get("runtime"), "platform": platform.platform(),
+                "n_batch": n_batch, "llama_commit": llama_commit,
+                "sha256": {"kl_score": hashes[binary], "gguf_p": hashes[gguf_p], "gguf_q": hashes[gguf_q]}}])
             scored += len(chunk)
-            print(f"{probe}: {s + len(chunk)}/{len(todo)}")
+            seconds += meter.seconds
+            joules = None if meter.joules is None else (joules or 0.0) + meter.joules
+            print(f"{probe}: {s + len(chunk)}/{len(todo)}, {meter.seconds:.0f} s")
     return {"kept": len(runs), "flagged_excluded": n_flagged, "infra_error_excluded": n_error,
-            "already_scored": len(done), "scored": scored}
+            "already_scored": len(done), "scored": scored, "seconds": seconds, "joules": joules}
 
 
 def main(argv=None):
@@ -163,6 +209,8 @@ def main(argv=None):
     ap.add_argument("--batch", type=int, default=25, help="episodes per helper call (one model load each)")
     ap.add_argument("--n-batch", type=int, default=512, help="llama.cpp batch size")
     ap.add_argument("--out", default="outputs/p0d/scores.jsonl")
+    ap.add_argument("--positions-dir", help="write each run's per-position values here as <attempt_id>.<probe>.npz")
+    ap.add_argument("--llama-commit", help="the llama.cpp commit kl_score was built against, recorded per batch")
     args = ap.parse_args(argv)
     with open(args.manifest) as f:
         p0b = json.load(f).get("P0b")
@@ -170,7 +218,7 @@ def main(argv=None):
         ap.error(f"{args.manifest} names no P0b run ids")
     report = score_pool(args.attempts, args.kl_score, args.gguf_p, {"Q3_K_M": args.gguf_q3, "Q4_K_M": args.gguf_q4},
                         args.lists, args.out, batch=args.batch, n_batch=args.n_batch,
-                        run_ids=set(p0b))
+                        run_ids=set(p0b), positions_dir=args.positions_dir, llama_commit=args.llama_commit)
     print(json.dumps(report))
 
 
