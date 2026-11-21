@@ -505,6 +505,8 @@ def test_cli_writes_model_and_estimates(tmp_path):
     pool = [make_attempt(rng, f"p{t}-{a}", f"p{t}", PLANT, profile="BF16") for t in range(20) for a in range(4)]
     pool[0]["resolved"] = False
     pool[1]["end_reason"] = "error"
+    for r, s in zip(pool, np.random.default_rng(10).uniform(0, 1e5, len(pool))):
+        r["tool_seconds"] = float(s)  # large and uneven within tasks, so whole-attempt ranks follow tool time
     pool_path = tmp_path / "pool.jsonl"
     pool_path.write_text("".join(json.dumps(r) + "\n" for r in pool))
     samples, block = concurrent_block(rng, n_slots=8, seconds=300, decode_j=2.5, noise_j=0.5)
@@ -536,6 +538,12 @@ def test_cli_writes_model_and_estimates(tmp_path):
     b = em["batched"]
     assert b["coef"]["decode"] == pytest.approx(2.5, rel=0.02) and b["n_windows"] == 300
     assert b["below_85pct"] == (b["agreement_with_c1"]["share_same_pick"] < 0.85)
+    # The agreement checks compare coefficient sets (docs/04), so both sides are generation-window estimates;
+    # a shared idle_w x tool_seconds term would pull both rankings toward the fewest tool seconds.
+    kept = pool_records(pool)[0]
+    gen = lambda p: (lambda r: estimate_attempt_joules(r, em["profiles"][p]["raw"]))
+    assert em["bf16_vs_q4"] == pick_agreement(kept, gen("BF16"), gen("Q4_K_M"))
+    assert b["agreement_with_c1"] == pick_agreement(kept, lambda r: estimate_batched_joules(r, b), gen("Q4_K_M"))
 
     rows = [json.loads(line) for line in (out / "est_joules.jsonl").read_text().splitlines()]
     assert len(rows) == 79 and set(rows[0]) == {"attempt_id", "est_joules_q4", "est_gen_joules_q4"}

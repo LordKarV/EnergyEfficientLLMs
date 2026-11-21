@@ -19,7 +19,8 @@ est_joules.jsonl (one {attempt_id, est_joules_q4, est_gen_joules_q4} per pool at
 the fallback; selection obeys the flag). The fallback reads the nested LOAO error of the raw Q4_K_M fit.
 est_joules_q4 is the provisional whole-attempt estimate used for ranking (generation-window model plus
 the profile's idle_w x tool_seconds); est_gen_joules_q4 is its generation-window part. The pick-agreement
-checks compare whole-attempt estimates, each profile with its own idle_w.
+checks compare coefficient sets (docs/04), so both sides are generation-window estimates: a shared
+idle_w x tool_seconds term would pull both rankings toward the run with the fewest tool seconds.
 """
 
 import argparse
@@ -80,12 +81,12 @@ def main():
     pool, n_error = pool_records([r for p in args.pool for r in read_jsonl(p)])
     q4_gen = {r["attempt_id"]: estimate_attempt_joules(r, model) for r in pool}
     q4 = {r["attempt_id"]: estimate_attempt_joules(r, model, idle_w=idle_w) for r in pool}
-    by_q4 = lambda r: q4[r["attempt_id"]]
+    by_q4_gen = lambda r: q4_gen[r["attempt_id"]]
 
     bf16 = None
     b = profiles.get("BF16")
-    if b and "error" not in b[RANK_TARGET] and b["idle_w"] is not None:
-        bf16 = pick_agreement(pool, lambda r: estimate_attempt_joules(r, b[RANK_TARGET], idle_w=b["idle_w"]), by_q4,
+    if b and "error" not in b[RANK_TARGET]:
+        bf16 = pick_agreement(pool, lambda r: estimate_attempt_joules(r, b[RANK_TARGET]), by_q4_gen,
                               args.min_candidates)
     batched = None
     if args.windows:
@@ -94,7 +95,7 @@ def main():
         if other:
             raise SystemExit(f"--window-attempts must all be {RANK_PROFILE} (the --windows block), found {other}")
         fit = fit_batched(read_jsonl(args.windows), block)
-        agree = pick_agreement(pool, lambda r: estimate_batched_joules(r, fit), by_q4, args.min_candidates)
+        agree = pick_agreement(pool, lambda r: estimate_batched_joules(r, fit), by_q4_gen, args.min_candidates)
         share = agree["share_same_pick"]
         batched = {**fit, "agreement_with_c1": agree, "below_85pct": None if share is None else share < AGREEMENT_MIN}
 

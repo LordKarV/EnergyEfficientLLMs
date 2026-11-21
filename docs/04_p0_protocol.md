@@ -247,8 +247,13 @@ attempt start and end, plus run totals, marked `not_attributable`.
   outer fold. A forced-decode replay check is optional, only if the CV error is borderline.
 - Batched coefficients: each profile's main llama.cpp block runs llama-server with `--metrics`,
   logging the energy counter and the server's cumulative prompt and predicted token counters
-  every 1 s. Regress each window's joules on its prefill and decode tokens, and report how often pool
-  rankings under the batched and concurrency-1 `Q4_K_M` coefficients pick the same cheapest run. If
+  every 1 s. Regress each window's joules on its seconds (a per-second intercept) and its prefill and
+  decode tokens, non-negative. The window tokens come from the harness per-turn timestamps: a turn's
+  uncached prefill is spread over `gen_t_start` to `gen_t_first_token` and its output over
+  `gen_t_first_token` to `gen_t_end`, since at the llama.cpp pin the predicted-token counter credits
+  a request only when it ends; a fit on the server counters is reported as a cross-check. Report how
+  often pool rankings under the batched and concurrency-1 `Q4_K_M` coefficients (generation-window
+  estimates on both sides, the intercept left out of the batched one) pick the same cheapest run. If
   they agree on fewer than 85% of tasks, `fewest_joules`, the `qtrace` cost rank and `E_Q4` name
   their regime, and P2 reports energy in both.
 - Concurrent runs report measured joules only as run-level totals, since energy can't be split
