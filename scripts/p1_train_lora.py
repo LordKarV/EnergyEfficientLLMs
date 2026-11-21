@@ -23,14 +23,14 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from qtrace import sft
 from qtrace.common import load_config
 from qtrace.models import pick_device
-from qtrace.probe import kernel_status
+from qtrace.probe import kernel_paths, kernel_status
 
 
 def check_kernels(allow_slow):
     """Kernel record for the metadata; exits unless both training-path ops resolved to the fast packages."""
     import transformers
 
-    kernels = {"in_use": sft.kernel_paths(), "importable": kernel_status(), "transformers": transformers.__version__}
+    kernels = {"in_use": kernel_paths(), "importable": kernel_status(), "transformers": transformers.__version__}
     if not all(op["fast"] for op in kernels["in_use"].values()) and not allow_slow:
         raise SystemExit(f"fla and causal_conv1d must be in use, transformers resolved {kernels['in_use']} "
                          "(docs/04 requires the fast kernels); pass --allow-slow-kernels only for a smoke test")

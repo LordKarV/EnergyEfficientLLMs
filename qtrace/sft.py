@@ -9,7 +9,6 @@ gives every arm the same count because every arm has one run per task.
 """
 
 import collections
-import inspect
 import itertools
 import os
 import random
@@ -23,10 +22,6 @@ from qtrace.probe import GATE_TARGETS, attach_lora, chunked_ce_loss
 ARM_FIELDS = ("arm", "seed", "task_id", "attempt_id", "episode_path")
 EPISODE_ARRAYS = ("input_ids", "model_mask", "turn_spans")
 GRAD_CLIP = 1.0
-
-# The two DeltaNet ops on the training path. Without a cache, Qwen3_5GatedDeltaNet.forward always calls
-# causal_conv1d_fn and torch_chunk_gated_delta_rule (the *_update / recurrent ops serve one-token decode).
-TRAINING_OPS = {"chunk_gated_delta_rule": "torch_chunk_gated_delta_rule", "causal_conv1d_fn": "causal_conv1d_fn"}
 
 
 def load_arm(path, arm, seed):
@@ -216,23 +211,3 @@ def train(model, examples, plan, lr, warmup_steps, loss_norm, chunk=2048, on_ste
         if on_step is not None:
             on_step(record)
     return records
-
-
-def kernel_paths():
-    """Which implementation each training-path DeltaNet op calls: the fast package or the torch fallback.
-
-    transformers 5.23 decides once, when modeling_qwen3_5 is imported: use_kernel_func_from_hub_with_fallback
-    (integrations/hub_kernels.py) tries to import fla / causal_conv1d and closes over the result, falling
-    back to the torch function on any import error, with only a warning at the first call. So importable
-    is not enough: a broken install (say fla without a working triton) trains on the slow path. This reads
-    the closure the model will call. An unreadable closure (another transformers version) reports not fast.
-    """
-    from transformers.models.qwen3_5 import modeling_qwen3_5
-
-    out = {}
-    for op, attr in TRAINING_OPS.items():
-        found = inspect.getclosurevars(getattr(modeling_qwen3_5, attr)).nonlocals
-        impl = found.get("implementation")
-        out[op] = {"fast": bool(found.get("is_new_implementation")),
-                   "impl": f"{impl.__module__}.{impl.__qualname__}" if callable(impl) else "unknown"}
-    return out

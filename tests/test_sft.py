@@ -18,7 +18,6 @@ import yaml
 from test_probe import tiny_qwen35
 
 from qtrace import sft
-from qtrace.probe import kernel_status
 
 TARGETS = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj", "in_proj_qkv", "in_proj_z",
            "out_proj"]
@@ -248,17 +247,6 @@ def test_inputs_are_validated_at_the_boundary(tmp_path):
         sft.attach(tiny_qwen35(), {**TRAIN, "targets": TARGETS + ["in_proj_a"]}, 0)
 
 
-def test_kernel_paths_report_what_transformers_resolved():
-    paths = sft.kernel_paths()
-    assert set(paths) == {"chunk_gated_delta_rule", "causal_conv1d_fn"}
-    status = kernel_status()
-    if not status["fla"]:
-        assert not paths["chunk_gated_delta_rule"]["fast"]
-        assert paths["chunk_gated_delta_rule"]["impl"].endswith("modeling_qwen3_5.torch_chunk_gated_delta_rule")
-    if not status["causal_conv1d"]:
-        assert not paths["causal_conv1d_fn"]["fast"]
-
-
 def load_script():
     spec = importlib.util.spec_from_file_location("p1_train_lora", os.path.join(ROOT, "scripts", "p1_train_lora.py"))
     module = importlib.util.module_from_spec(spec)
@@ -325,8 +313,10 @@ def test_script_end_to_end_writes_logs_meta_and_a_merged_model(tmp_path):
 
 def test_kernel_guard_refuses_slow_kernels_without_the_flag(tmp_path, monkeypatch):
     cfg_path, _ = write_setup(tmp_path)
-    monkeypatch.setattr(sft, "kernel_paths", lambda: {"chunk_gated_delta_rule": {"fast": False, "impl": "torch"},
-                                                      "causal_conv1d_fn": {"fast": True, "impl": "causal_conv1d"}})
+    script = load_script()
+    # the trainer guards on the probe's check (qtrace.probe.kernel_paths), not a copy of it
+    monkeypatch.setattr(script, "kernel_paths", lambda: {"chunk_gated_delta_rule": {"fast": False, "impl": "torch"},
+                                                         "causal_conv1d_fn": {"fast": True, "impl": "causal_conv1d"}})
     with pytest.raises(SystemExit, match="allow-slow-kernels"):
-        load_script().main(["--config", str(cfg_path), "--arm", "fewest_turns", "--seed", "0", "--device", "cpu"])
+        script.main(["--config", str(cfg_path), "--arm", "fewest_turns", "--seed", "0", "--device", "cpu"])
     assert not (tmp_path / "runs").exists()
