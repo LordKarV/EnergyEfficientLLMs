@@ -194,6 +194,7 @@ def join_runs(attempts, scores, est_joules=None, lists=POOL_LISTS):
             "q4_rows_without_q3": sum(1 for aid, p in rows if p == AGREEMENT_PROBE and aid not in q3_ids),
             "lists": list(lists), "n_eligible_without_q3": len(eligible - q3_ids),
             "n_runs_without_q4": sum(1 for r in runs if r["q4"] is None),
+            "n_runs_without_halves": sum(1 for r in runs if r["even"] is None or r["odd"] is None),
             "est_joules_given": est_joules is not None,
             "n_runs_without_est_joules": sum(1 for r in runs if r["est_joules_q4"] is None)}
     return runs, info
@@ -214,12 +215,13 @@ def _check(value, ok):
 def candidate_stats(runs, name, have_joules=True, min_runs=MIN_RUNS):
     """Every number docs/04 asks for one candidate, the six checks and whether it passes.
 
-    The joules and probe-agreement checks do not run while any run lacks its est_joules value or its
-    Q4_K_M row (P0a or the scorer still running): on the few tasks that happen to be complete they
-    could pass a candidate the full pool fails.
+    The joules, probe-agreement and split-half checks do not run while any run lacks its est_joules
+    value, its Q4_K_M row or either turn-parity half (P0a or the scorer still running): on the few
+    tasks that happen to be complete they could pass a candidate the full pool fails.
     """
     no_joules = sum(1 for r in runs if r["est_joules_q4"] is None)
     no_q4 = sum(1 for r in runs if r["q4"] is None)
+    no_halves = sum(1 for r in runs if r["even"] is None or r["odd"] is None)
     against = {}
     for k in CONFOUNDS:
         if k == "est_joules_q4" and not have_joules:
@@ -230,13 +232,15 @@ def candidate_stats(runs, name, have_joules=True, min_runs=MIN_RUNS):
             against[k] = within_task(_grouped(runs, lambda r, k=k: (r["score"][name], r[k])), min_runs)
     agreement = ({"not_run": f"{no_q4} of {len(runs)} runs have no {AGREEMENT_PROBE} row"} if no_q4 else
                  within_task(_grouped(runs, lambda r: (r["score"][name], r["q4"][name])), min_runs))
-    rho = within_task(_grouped(runs, lambda r: (r["even"] and r["even"][name], r["odd"] and r["odd"][name])),
-                      min_runs)
-    split = {"rho": rho, "spearman_brown_mean": spearman_brown(rho["mean"]),
-             "spearman_brown_median": spearman_brown(rho["median"])}
+    if no_halves:
+        rho, split = {}, {"not_run": f"{no_halves} of {len(runs)} runs lack the even or odd half"}
+    else:
+        rho = within_task(_grouped(runs, lambda r: (r["even"][name], r["odd"][name])), min_runs)
+        split = {"rho": rho, "spearman_brown_mean": spearman_brown(rho["mean"]),
+                 "spearman_brown_median": spearman_brown(rho["median"])}
     checks = {k: _check(against[k].get("mean"), lambda m: abs(m) <= MAX_ABS_RHO) for k in CONFOUNDS}
     # SB(r) >= 0.5 exactly when r >= 1/3; testing the raw mean keeps r = -1 a failure, not "not run".
-    checks["split_half"] = _check(rho["mean"], lambda m: m >= MIN_SPLIT_HALF / (2 - MIN_SPLIT_HALF))
+    checks["split_half"] = _check(rho.get("mean"), lambda m: m >= MIN_SPLIT_HALF / (2 - MIN_SPLIT_HALF))
     checks["probe_agreement"] = _check(agreement.get("mean"), lambda m: m >= MIN_AGREEMENT)
     failed = [k for k, v in checks.items() if v is False]
     not_run = [k for k, v in checks.items() if v is None]

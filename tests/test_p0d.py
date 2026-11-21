@@ -206,6 +206,19 @@ def test_partial_q4_or_joules_coverage_leaves_the_rule_undecided():
     assert out["chosen"] is None and not out["decided"]
 
 
+def test_partial_halves_coverage_leaves_split_half_not_run():
+    # Halves in 3 of 40 tasks must not decide split-half reliability for the pool.
+    attempts, scores, joules = make_pool()
+    keep = {"task0", "task1", "task2"}
+    partial = [s if s["task_id"] in keep else {k: v for k, v in s.items() if k != "halves"} for s in scores]
+    runs, info = join_runs(attempts, partial, joules)
+    out = choose_score(runs)
+    assert info["n_runs_without_halves"] == 222
+    assert out["candidates"]["kl_mean"]["checks"]["split_half"] is None
+    assert "not_run" in out["candidates"]["kl_mean"]["split_half"]
+    assert out["chosen"] is None and not out["decided"] and "split_half" in out["verdict"]
+
+
 def test_missing_q3_rows_leave_the_rule_undecided():
     # 240 eligible attempts, Q3_K_M rows for 120 of them: the rule must not decide on the scored half.
     attempts, scores, joules = make_pool()

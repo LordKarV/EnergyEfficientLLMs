@@ -36,7 +36,7 @@ def print_table(choice):
     for name in CANDIDATES:
         c = choice["candidates"][name]
         vals = [c["against"][k].get("mean") for k in CONFOUNDS]
-        vals += [c["split_half"]["spearman_brown_mean"], c["probe_agreement"].get("mean")]
+        vals += [c["split_half"].get("spearman_brown_mean"), c["probe_agreement"].get("mean")]
         result = "pass" if c["pass"] else f"fails {', '.join(c['failed'])}" if c["failed"] else \
             f"not run: {', '.join(c['not_run'])}"
         print(f"{name:<12}" + "".join(f"{fmt(v):>11}" for v in vals) + f"  {result}")
