@@ -109,6 +109,19 @@ def test_error_rows_leave_the_rate_denominators():
     assert s["context_limit_check"]["share"] == 0.25 and s["wall_clock_check"]["share"] == 0.25
 
 
+def test_probe_table_marks_slow_kernel_rows():
+    base = {"length": 16384, "status": "ok", "sec_per_step": 9.0, "mem_gib": 30.0, "mem_kind": "cuda_peak",
+            "supervised_frac": 0.15, "loss_path": "chunked"}
+    ops = lambda *fast: {"in_use": {f"op{i}": {"fast": f, "impl": "x"} for i, f in enumerate(fast)}}
+    probe = [{**base, "kernels": ops(True, True)}, {**base, "length": 8192, "kernels": ops(True, False)},
+             {**base, "length": 4096}]  # a probe file written before the kernels field
+    md = render_markdown({}, probe=probe, extras={}, projections={})
+    assert "| loss | supervised | length | status | s/step | memory | kernels |" in md
+    assert "| chunked | 0.15 | 16384 | ok | 9.0 | 30.0 GiB (cuda_peak) | fast |" in md
+    assert "| chunked | 0.15 | 8192 | ok | 9.0 | 30.0 GiB (cuda_peak) | slow path |" in md
+    assert "| chunked | 0.15 | 4096 | ok | 9.0 | 30.0 GiB (cuda_peak) | unknown |" in md
+
+
 def test_flagged_share_by_profile_and_strict_field():
     rows = [rec("llama.cpp", "submitted", 0, 600, profile="BF16", touched=True),
             rec("llama.cpp", "submitted", 0, 600, profile="BF16"),

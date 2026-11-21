@@ -171,6 +171,15 @@ def _pct(x):
     return "n/a" if x is None else f"{100 * x:.1f}%"
 
 
+def _kernels(probe_row):
+    """Whether the probe ran the fast DeltaNet kernels (kernels.in_use from #5); a --allow-slow-kernels run's
+    s/step and memory come from the torch fallback. Probe files written before that field show unknown."""
+    in_use = (probe_row.get("kernels") or {}).get("in_use")
+    if not in_use:
+        return "unknown"
+    return "fast" if all(op["fast"] for op in in_use.values()) else "slow path"
+
+
 def render_markdown(stats, probe, extras, projections):
     lines = ["# Pilot exit report", ""]
     lines += ["## Attempts per hour", "", ("Resolve, limit and flagged shares leave out end_reason error rows "
@@ -209,12 +218,13 @@ def render_markdown(stats, probe, extras, projections):
                      f"| {s['tool_seconds_per_attempt']:.0f} | {busy} |")
     lines += ["", "## Training probe", ""]
     if probe:
-        lines += ["| loss | supervised | length | status | s/step | memory |", "|---|---|---|---|---|---|"]
+        lines += ["| loss | supervised | length | status | s/step | memory | kernels |",
+                  "|---|---|---|---|---|---|---|"]
         for p in probe:
             sec = f"{p['sec_per_step']:.1f}" if p["status"] == "ok" else "-"
             mem = "n/a" if p.get("mem_gib") is None else f"{p['mem_gib']:.1f} GiB ({p['mem_kind']})"
             lines.append(f"| {p['loss_path']} | {p['supervised_frac']:.2f} | {p['length']} | {p['status']} "
-                         f"| {sec} | {mem} |")
+                         f"| {sec} | {mem} | {_kernels(p)} |")
     else:
         lines.append("No probe results.")
     if projections:
