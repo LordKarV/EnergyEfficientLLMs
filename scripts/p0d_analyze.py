@@ -32,6 +32,11 @@ POWER_EFFECTS = (0.05, 0.10, 0.15, 0.20, 0.25, 0.30)
 POWER_SEEDS = (4, 8)  # docs/04: 4 seeded attempts per prefix, extra budget goes to 8
 
 
+def rates(text):
+    """A success rate, or comma-separated per-task rates (paired by position across BF16 and Q3)."""
+    return [float(v) for v in text.split(",")]
+
+
 def fmt(x):
     return "n/a" if x is None else f"{x:+.2f}"
 
@@ -63,7 +68,10 @@ def main(argv=None):
     ap.add_argument("--lists", nargs="+", default=list(POOL_LISTS), help="the pool lists p0d_score_pool.py scored")
     ap.add_argument("--est-joules", help="outputs/p0a/est_joules.jsonl; omit until P0a's energy model exists")
     ap.add_argument("--continuations", help="continuation results; runs the DiD test on the frozen pairs")
-    ap.add_argument("--power-rates", nargs=2, type=float, metavar=("BF16", "Q3"))
+    ap.add_argument("--power-rates", nargs=2, type=rates, metavar=("BF16", "Q3"),
+                    help="expected continuation success rates: two numbers, or two comma-separated per-task lists")
+    ap.add_argument("--replay-drop-rate", type=float, default=0.0,
+                    help="expected pair drop rate (pilot replay match rate), so power counts pairs after drops")
     ap.add_argument("--n-boot", type=int, default=5000)
     ap.add_argument("--seed", type=int, default=20261120)
     ap.add_argument("--out-dir", default="outputs/p0d")
@@ -83,7 +91,8 @@ def main(argv=None):
     out = {**choice, "inputs": {**info, "scores": args.scores, "est_joules": args.est_joules}, "pairs": pairs}
     if args.power_rates and pairs and pairs["n_tasks"] >= 2:
         out["power"] = [power(*args.power_rates, n_tasks=pairs["n_tasks"], seeds=s, effects=POWER_EFFECTS,
-                              n_boot=args.n_boot, seed=args.seed) for s in POWER_SEEDS]
+                              n_boot=args.n_boot, seed=args.seed, drop_rate=args.replay_drop_rate,
+                              covariates=[p["diff"] for p in pairs["tasks"]]) for s in POWER_SEEDS]
     write_json(os.path.join(args.out_dir, "score_choice.json"), out)
     stale = os.path.join(args.out_dir, "did.json")
     if os.path.exists(stale):
@@ -93,7 +102,7 @@ def main(argv=None):
     if pairs:
         print(f"pairs: {pairs['n_tasks']} tasks, spread {pairs['spread']}")
     for p in out.get("power", []):
-        print(f"power at {p['seeds']} seeds/prefix, {p['n_tasks']} tasks:",
+        print(f"power at {p['seeds']} seeds/prefix, {p['n_tasks_after_drops']} of {p['n_tasks']} tasks after drops:",
               ", ".join(f"{e['effect']:.2f}: {e['power']:.2f}" for e in p["power"]), f"(MDE80 {p['mde_80']})")
 
 

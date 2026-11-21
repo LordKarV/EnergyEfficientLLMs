@@ -392,6 +392,11 @@ def _adjusted(did, cov):
     return {**out, "estimate": float(beta[0]), "coef": {k: float(b) for k, b in zip(kept, beta[1:])}}
 
 
+def _keeps(mean, adj):
+    """docs/04's pass condition on the adjusted estimate: it keeps the DiD's sign and at least half its size."""
+    return bool(adj is not None and mean != 0 and np.sign(adj) == np.sign(mean) and abs(adj) >= 0.5 * abs(mean))
+
+
 def did_test(rows, covariates=None, profile=PROBE, n_boot=5000, seed=0, alpha=0.05, min_effect=MIN_EFFECT,
              pairs=None):
     """docs/04's P0d test on continuation results.
@@ -443,10 +448,8 @@ def did_test(rows, covariates=None, profile=PROBE, n_boot=5000, seed=0, alpha=0.
             raise ValueError(f"no covariates for tasks {missing[:5]}")
         adjusted = _adjusted(did, [{k: _number(_field(covariates[t], k, f"covariates {t}"), f"covariates {t} {k}",
                                                optional=False) for k in COVARIATES} for t in kept])
-    mean = float(did_int.sum() / (len(did) * denom))  # exact sign, so "mean != 0" below is too
-    adj = adjusted and adjusted["estimate"]
-    keeps = adj is not None and mean != 0 and np.sign(adj) == np.sign(mean) and abs(adj) >= 0.5 * abs(mean)
-    pass_rule, fail_rule = p < alpha and bool(keeps), upper < min_effect
+    mean = float(did_int.sum() / (len(did) * denom))  # exact sign, so "mean != 0" in _keeps is too
+    pass_rule, fail_rule = p < alpha and _keeps(mean, adjusted and adjusted["estimate"]), upper < min_effect
     # docs/04 lists pass before fail; both can hold for a significant effect below min_effect, so both are reported.
     decision = "incomplete" if without else "pass" if pass_rule else "fail" if fail_rule else "inconclusive"
     return {"profile": profile, "n_tasks": len(kept), "n_pairs_selected": len(selected),
@@ -460,22 +463,32 @@ def did_test(rows, covariates=None, profile=PROBE, n_boot=5000, seed=0, alpha=0.
             "n_boot": n_boot, "seed": seed, "per_task": [{"task_id": t, "did": float(d)} for t, d in zip(kept, did)]}
 
 
-def power(p_bf16, p_q3, n_tasks, seeds, effects=(MIN_EFFECT,), n_sim=1000, n_boot=2000, alpha=0.05, seed=0):
-    """Simulated power of did_test's one-sided bootstrap test (p < alpha) at each planted effect.
+def power(p_bf16, p_q3, n_tasks, seeds, effects=(MIN_EFFECT,), n_sim=1000, n_boot=2000, alpha=0.05, seed=0,
+          drop_rate=0.0, covariates=None):
+    """Simulated power of did_test's pass decision at each planted effect.
 
     p_bf16, p_q3: continuation success rates, scalars or paired per-task arrays (pilot or P0c), drawn
     with replacement for each simulated task. The Q3 rates after the low- and high-score prefixes are
     q + effect/2 and q - effect/2, shifted together back inside [0, 1] where they would leave it, so
     every task carries a gap of exactly `effect` (clipping each side would plant less near 0 and 1,
     and P0c rates of x/4 sit there often). BF16 has the same rate after both. Each of the four cells
-    gets `seeds` attempts. The adjusted-estimate condition is not simulated, so this is the power of
-    the primary test only.
+    gets `seeds` attempts. drop_rate: the expected pair drop rate, so a study tests the
+    round(n_tasks * (1 - drop_rate)) pairs left after replay drops.
+
+    covariates: the pairs' covariate differences (select_pairs' diff). Given, each simulated study
+    draws one per task, independent of its DiD, and passes only when p < alpha and the adjusted
+    estimate keeps its sign and half its size, as in did_test; "power_p_only" is p < alpha alone.
+    Without them the adjusted condition is not simulated and both are the same.
     """
     b, q = (np.atleast_1d(np.asarray(v, dtype=float)) for v in (p_bf16, p_q3))
     if b.shape != q.shape or ((b < 0) | (b > 1) | (q < 0) | (q > 1)).any():
         raise ValueError("p_bf16 and p_q3 must be rates in [0, 1] of the same length")
+    if not 0 <= drop_rate < 1:
+        raise ValueError(f"drop_rate must be in [0, 1), got {drop_rate}")
+    n_planned, n_tasks = n_tasks, round(n_tasks * (1 - drop_rate))
     if n_tasks < 2 or seeds < 1:
-        raise ValueError("need at least 2 tasks and 1 seed per prefix")
+        raise ValueError("need at least 2 tasks after replay drops and 1 seed per prefix")
+    cov = None if covariates is None else np.array([[c[k] for k in COVARIATES] for c in covariates], dtype=float)
     if any(not 0 <= e <= 1 for e in effects):
         raise ValueError(f"effects must be success-rate gaps in [0, 1], got {effects}")
     rng = np.random.default_rng(seed)
@@ -492,7 +505,15 @@ def power(p_bf16, p_q3, n_tasks, seeds, effects=(MIN_EFFECT,), n_sim=1000, n_boo
         low = np.clip(q[j] + e / 2, e, 1)
         did_int = (successes(low) - successes(b[j])) - (successes(low - e) - successes(b[j]))  # DiD x seeds
         p = ((counts @ did_int.T) <= 0).mean(axis=0)
-        out.append({"effect": float(e), "power": float((p < alpha).mean())})
+        significant = p < alpha
+        passed = significant.copy()
+        if cov is not None:
+            for i in np.flatnonzero(significant):
+                draw = cov[rng.integers(0, len(cov), n_tasks)]
+                adj = _adjusted(did_int[i] / seeds, [dict(zip(COVARIATES, row)) for row in draw])["estimate"]
+                passed[i] = _keeps(did_int[i].mean() / seeds, adj)
+        out.append({"effect": float(e), "power": float(passed.mean()), "power_p_only": float(significant.mean())})
     passing = [o["effect"] for o in out if o["power"] >= 0.8]
-    return {"n_tasks": n_tasks, "seeds": seeds, "p_bf16": b.tolist(), "p_q3": q.tolist(), "alpha": alpha,
+    return {"n_tasks": n_planned, "drop_rate": drop_rate, "n_tasks_after_drops": n_tasks, "seeds": seeds,
+            "p_bf16": b.tolist(), "p_q3": q.tolist(), "alpha": alpha, "adjusted_condition": cov is not None,
             "n_sim": n_sim, "n_boot": n_boot, "power": out, "mde_80": min(passing) if passing else None}

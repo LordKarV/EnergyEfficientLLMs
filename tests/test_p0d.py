@@ -551,6 +551,27 @@ def test_power_plants_the_full_effect_at_the_rate_bounds():
     assert power(0.5, 0.0, **kw)["power"] == power(0.5, 0.02, **kw)["power"]
 
 
+def test_power_counts_tasks_after_replay_drops():
+    kw = {"seeds": 4, "effects": (0.10,), "n_sim": 200, "n_boot": 300}
+    dropped = power(0.7, 0.5, n_tasks=50, drop_rate=0.2, **kw)
+    assert dropped["n_tasks_after_drops"] == 40 and dropped["power"] == power(0.7, 0.5, n_tasks=40, **kw)["power"]
+    with pytest.raises(ValueError, match="drop_rate"):
+        power(0.7, 0.5, n_tasks=50, drop_rate=1.0, **kw)
+
+
+def test_power_applies_the_adjusted_estimate_condition():
+    kw = {"n_tasks": 50, "seeds": 4, "effects": (0.10, 0.30), "n_sim": 200, "n_boot": 300}
+    plain = power(0.7, 0.5, **kw)
+    assert all(e["power"] == e["power_p_only"] for e in plain["power"]) and not plain["adjusted_condition"]
+    noise = power(0.7, 0.5, covariates=list(noise_covariates(50).values()), **kw)
+    assert noise["adjusted_condition"] and all(e["power"] <= e["power_p_only"] for e in noise["power"])
+    assert noise["power"][1]["power"] > 0.9 * noise["power"][1]["power_p_only"] > 0.5  # noise rarely costs a pass
+    # Covariate differences far from 0 make the intercept an extrapolation, so it often loses half the DiD.
+    far = [{**c, "turns": 100 + c["turns"] / 10} for c in noise_covariates(50).values()]
+    strong = power(0.7, 0.5, covariates=far, **kw)["power"][1]
+    assert strong["power"] < strong["power_p_only"] - 0.2
+
+
 # The pool scorer (scripts/p0d_score_pool.py), with the llama.cpp call replaced.
 
 def write_episode(path, n=60):
@@ -693,11 +714,14 @@ def test_analyze_writes_score_choice_and_did(tmp_path):
     out_dir = tmp_path / "p0d"
     mod = load_script("p0d_analyze")
     mod.main([str(paths["attempts"]), "--scores", str(paths["scores"]), "--est-joules", str(paths["joules"]),
-              "--out-dir", str(out_dir), "--power-rates", "0.7", "0.5", "--n-boot", "300"])
+              "--out-dir", str(out_dir), "--power-rates", "0.9,0.5", "0.8,0.3", "--replay-drop-rate", "0.1",
+              "--n-boot", "300"])
     choice = json.loads((out_dir / "score_choice.json").read_text())
     assert choice["chosen"] == "kl_mean" and set(choice["candidates"]) == set(CANDIDATES)
     assert all(isinstance(c["pass"], bool) for c in choice["candidates"].values())
     assert choice["pairs"]["n_tasks"] == 30 and {p["seeds"] for p in choice["power"]} == {4, 8}
+    assert all(p["p_bf16"] == [0.9, 0.5] and p["n_tasks_after_drops"] == 27 and p["adjusted_condition"]
+               for p in choice["power"])
     assert choice["inputs"]["flagged_excluded"] == {"pool200": 1}
 
     cont = tmp_path / "continuations.jsonl"
