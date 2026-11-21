@@ -5,19 +5,22 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import pytest
+
 from qtrace.exit_report import attempt_stats, project_hours, render_markdown
 
 
 def rec(runtime, end_reason, t0, t1, out=1000, unc=3000, cached=20000, server_cached=20000, malformed=None,
-        tool_s=60.0, cpu_s=30.0, gen_s=120.0):
+        tool_s=60.0, cpu_s=30.0, gen_s=120.0, profile="BF16", touched=False):
     return {"runtime": runtime, "end_reason": end_reason, "resolved": end_reason == "submitted",
+            "grading": {"test_files_touched": touched},
             "tokens": {"output": out, "input_uncached": unc, "input_cached": cached,
                        "server_reported_cached": server_cached},
             "malformed": malformed or {"misnested_tag": 0, "wrong_name": 0, "text_after_call": 0,
                                        "truncated_call": 0, "no_call_no_answer": 0},
             "energy": {"t_start": t0, "t_end": t1}, "tool_seconds": tool_s, "container_cpu_seconds": cpu_s,
             "gen_seconds": gen_s,
-            "turns": 10, "tool_calls": 10, "profile": "BF16", "concurrency": 14}
+            "turns": 10, "tool_calls": 10, "profile": profile, "concurrency": 14}
 
 
 def test_attempt_stats_rates_and_shares():
@@ -84,3 +87,44 @@ def test_projections_by_profile_with_fallback_and_sub_run():
     assert p["P0a"]["upper_hours"] > p["P0a"]["point_hours"]  # the 600-attempt top-up
     assert "P0b" not in p and any("vllm BF16" in x for x in p["not_included"])
     assert p["energy_sub_run"]["serial"] and abs(p["energy_sub_run"]["point_hours"] - 150 * (120 + 60 + 45) / 3600) < 1e-9
+
+
+def test_null_server_cached_counts_as_not_reported():
+    rows = [rec("vllm", "submitted", 0, 600), rec("vllm", "submitted", 0, 600, server_cached=None)]
+    s = attempt_stats(rows)["vllm"]
+    assert s["n_server_cached_missing"] == 1
+    assert s["realized_uncached_per_attempt"] is None and s["server_vs_ideal_cached"] is None
+    assert "| 1 |" in render_markdown({"vllm": s}, probe=[], extras={}, projections={})
+
+
+def test_error_rows_leave_the_rate_denominators():
+    rows = [rec("vllm", "submitted", 0, 600), rec("vllm", "context_limit", 0, 600),
+            rec("vllm", "infra_timeout", 0, 600), rec("vllm", "turn_limit", 0, 600),
+            rec("vllm", "error", 0, 600), rec("vllm", "error", 0, 600)]
+    for r in rows[4:]:
+        r["grading"] = None  # an infrastructure fault may never reach the grader
+    s = attempt_stats(rows)["vllm"]
+    assert s["n_error"] == 2 and s["n_attempts"] == 6
+    assert s["resolve_rate"] == 0.25
+    assert s["context_limit_check"]["share"] == 0.25 and s["wall_clock_check"]["share"] == 0.25
+
+
+def test_flagged_share_by_profile_and_strict_field():
+    rows = [rec("llama.cpp", "submitted", 0, 600, profile="BF16", touched=True),
+            rec("llama.cpp", "submitted", 0, 600, profile="BF16"),
+            rec("llama.cpp", "turn_limit", 0, 600, profile="Q4_K_M")]
+    s = attempt_stats(rows)["llama.cpp"]
+    assert s["flagged_share_by_profile"] == {"BF16": 0.5, "Q4_K_M": 0.0}
+    assert abs(s["flagged_share"] - 1 / 3) < 1e-12
+    assert "| llama.cpp | BF16 | 50.0% |" in render_markdown({"llama.cpp": s}, probe=[], extras={}, projections={})
+    del rows[2]["grading"]["test_files_touched"]
+    with pytest.raises(KeyError):
+        attempt_stats(rows)
+
+
+@pytest.mark.parametrize("field,value", [("runtime", "vLLM"), ("profile", "Q4_K_M_gates")])
+def test_unknown_runtime_or_profile_raises(field, value):
+    r = rec("vllm", "submitted", 0, 600)
+    r[field] = value
+    with pytest.raises(ValueError, match="not in"):
+        attempt_stats([r])

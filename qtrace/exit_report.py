@@ -8,6 +8,11 @@ idle watts, the replay match rate) come from an optional extras JSON; anything m
 
 from collections import Counter, defaultdict
 
+# Allowed record values. Runtimes from docs/04 (Serving); profile names from docs/04 (Profiles), with
+# Q4_K_M_gate8 naming the Q4_K_M file whose ssm_alpha/ssm_beta are overridden to Q8_0. Issue #1 does not
+# pin these strings yet, so an unknown value raises here instead of moving a step under "Not included".
+RUNTIMES = ("vllm", "llama.cpp")
+PROFILES = ("BF16", "Q8_0", "Q4_K_M", "Q3_K_M", "Q4_K_M_gate8")
 MALFORMED = ["misnested_tag", "wrong_name", "text_after_call", "truncated_call", "no_call_no_answer"]
 # Concurrent P0 blocks (docs/04): runtime, attempts per profile at the point and the upper count.
 # P0a has a 600-attempt top-up (BF16 and Q4_K_M) if inconclusive; P0d can grow to about 1,600.
@@ -32,6 +37,9 @@ EXTRAS = ["rates", "peak_gpu_gib", "energy_counter", "replay_match_rate", "sampl
 def attempt_stats(rows):
     by_runtime = defaultdict(list)
     for r in rows:
+        if r["runtime"] not in RUNTIMES or r["profile"] not in PROFILES:
+            raise ValueError(f"attempt {r.get('attempt_id')}: runtime {r['runtime']!r} / profile {r['profile']!r} "
+                             f"not in {RUNTIMES} / {PROFILES}")
         by_runtime[r["runtime"]].append(r)
     return {rt: _stats(rs) for rt, rs in sorted(by_runtime.items())}
 
@@ -40,22 +48,34 @@ def _stats(rows):
     n = len(rows)
     span = max(r["energy"]["t_end"] for r in rows) - min(r["energy"]["t_start"] for r in rows)
     ends = Counter(r["end_reason"] for r in rows)
+    # end_reason error is an infrastructure fault, rerun as a fresh attempt (04), so those rows stay out of the
+    # resolve, limit and flagged rates (as #6, #13 and #14 drop them); their count is reported.
+    scored = [r for r in rows if r["end_reason"] != "error"]
+    m = len(scored)
+    by_profile = defaultdict(list)
+    for r in scored:
+        by_profile[r["profile"]].append(r["grading"]["test_files_touched"])  # required bool: missing raises
     calls = sum(r["tool_calls"] for r in rows)
     turns = sum(r["turns"] for r in rows)
     tok = {k: sum(r["tokens"][k] for r in rows) for k in ("output", "input_uncached", "input_cached")}
-    has_server = all("server_reported_cached" in r["tokens"] for r in rows)
-    server_cached = sum(r["tokens"].get("server_reported_cached", 0) for r in rows)
-    ctx_share = ends.get("context_limit", 0) / n
-    wall_share = ends.get("infra_timeout", 0) / n
+    # A missing or null count means the server did not report it (as in #13); the realized split then needs all.
+    n_server_missing = sum(r["tokens"].get("server_reported_cached") is None for r in rows)
+    has_server = n_server_missing == 0
+    server_cached = sum(r["tokens"]["server_reported_cached"] for r in rows) if has_server else 0
+    ctx_share = ends.get("context_limit", 0) / m if m else None
+    wall_share = ends.get("infra_timeout", 0) / m if m else None
     hit = tok["input_cached"] / (tok["input_cached"] + tok["input_uncached"]) if tok["input_cached"] else 0.0
     return {
         "n_attempts": n,
         "span_s": span,
         "attempts_per_hour": n / span * 3600 if span else None,
-        "resolve_rate": sum(bool(r["resolved"]) for r in rows) / n,
+        "n_error": n - m,
+        "resolve_rate": sum(bool(r["resolved"]) for r in scored) / m if m else None,
+        "flagged_share": sum(sum(v) for v in by_profile.values()) / m if m else None,
+        "flagged_share_by_profile": {p: sum(v) / len(v) for p, v in sorted(by_profile.items())},
         "end_reason_share": {k: v / n for k, v in sorted(ends.items())},
-        "context_limit_check": {"share": ctx_share, "over_10pct": ctx_share > 0.10},
-        "wall_clock_check": {"share": wall_share, "over_2pct": wall_share > 0.02},
+        "context_limit_check": {"share": ctx_share, "over_10pct": ctx_share is not None and ctx_share > 0.10},
+        "wall_clock_check": {"share": wall_share, "over_2pct": wall_share is not None and wall_share > 0.02},
         # Per turn: a malformed turn executes no call, so a per-call rate can exceed 1.
         "malformed_per_turn": {k: sum(r["malformed"][k] for r in rows) / turns if turns else 0.0 for k in MALFORMED},
         "tokens_per_attempt": {k: v / n for k, v in tok.items()},
@@ -65,7 +85,8 @@ def _stats(rows):
         "gen_seconds_per_attempt": sum(r.get("gen_seconds", 0.0) for r in rows) / n,
         "prefix_cache_hit_rate_ideal": hit,
         "prefix_cache_flag": hit < HERO_PREFIX_HIT - 0.12,
-        "server_vs_ideal_cached": server_cached / tok["input_cached"] if tok["input_cached"] else None,
+        "n_server_cached_missing": n_server_missing,
+        "server_vs_ideal_cached": server_cached / tok["input_cached"] if tok["input_cached"] and has_server else None,
         "tool_seconds_per_attempt": sum(r["tool_seconds"] for r in rows) / n,
         "container_vcpus_busy": sum(r["container_cpu_seconds"] for r in rows) / span if span else None,
         "concurrency": Counter(r["concurrency"] for r in rows).most_common(1)[0][0],
@@ -145,11 +166,17 @@ def _pct(x):
 
 def render_markdown(stats, probe, extras, projections):
     lines = ["# Pilot exit report", ""]
-    lines += ["## Attempts per hour", "", "| runtime | attempts | per hour | resolve rate | concurrency |",
-              "|---|---|---|---|---|"]
+    lines += ["## Attempts per hour", "", ("Resolve, limit and flagged shares leave out end_reason error rows "
+              "(rerun as fresh attempts)."), "",
+              "| runtime | attempts | errors | per hour | resolve rate | flagged | concurrency |",
+              "|---|---|---|---|---|---|---|"]
     for rt, s in stats.items():
-        lines.append(f"| {rt} | {s['n_attempts']} | {s['attempts_per_hour']:.1f} | {_pct(s['resolve_rate'])} "
-                     f"| {s['concurrency']} |")
+        lines.append(f"| {rt} | {s['n_attempts']} | {s['n_error']} | {s['attempts_per_hour']:.1f} "
+                     f"| {_pct(s['resolve_rate'])} | {_pct(s['flagged_share'])} | {s['concurrency']} |")
+    lines += ["", "## Test-file tripwire", "", "Share of attempts with grading.test_files_touched, by profile.", "",
+              "| runtime | profile | flagged |", "|---|---|---|"]
+    for rt, s in stats.items():
+        lines += [f"| {rt} | {p} | {_pct(v)} |" for p, v in s["flagged_share_by_profile"].items()]
     lines += ["", "## Limits hit", "", "| runtime | end reasons | 64K context (owner check at 10%) "
               "| wall clock (cap check at 2%) |", "|---|---|---|---|"]
     for rt, s in stats.items():
@@ -163,15 +190,15 @@ def render_markdown(stats, probe, extras, projections):
         lines.append(f"| {rt} | " + " | ".join(_pct(s["malformed_per_turn"][k]) for k in MALFORMED) + " |")
     lines += ["", "## Tokens and prefix cache", "",
               "| runtime | output | uncached input | cached input | ideal hit rate (flag below 80%) "
-              "| server / ideal cached "
-              "| tool s | vCPUs busy |", "|---|---|---|---|---|---|---|---|"]
+              "| server / ideal cached | server count missing "
+              "| tool s | vCPUs busy |", "|---|---|---|---|---|---|---|---|---|"]
     for rt, s in stats.items():
         t = s["tokens_per_attempt"]
         flag = " **below HERO's ~92%**" if s["prefix_cache_flag"] else ""
         ratio = "n/a" if s["server_vs_ideal_cached"] is None else f"{s['server_vs_ideal_cached']:.2f}"
         busy = "n/a" if s["container_vcpus_busy"] is None else f"{s['container_vcpus_busy']:.1f}"
         lines.append(f"| {rt} | {t['output']:.0f} | {t['input_uncached']:.0f} | {t['input_cached']:.0f} "
-                     f"| {_pct(s['prefix_cache_hit_rate_ideal'])}{flag} | {ratio} "
+                     f"| {_pct(s['prefix_cache_hit_rate_ideal'])}{flag} | {ratio} | {s['n_server_cached_missing']} "
                      f"| {s['tool_seconds_per_attempt']:.0f} | {busy} |")
     lines += ["", "## Training probe", ""]
     if probe:
