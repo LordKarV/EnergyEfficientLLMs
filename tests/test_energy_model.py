@@ -568,7 +568,9 @@ def test_cli_writes_model_and_estimates(tmp_path):
     samples, block = concurrent_block(rng, n_slots=8, seconds=300, decode_j=2.5, noise_j=0.5)
     win_path, block_path = tmp_path / "metrics.jsonl", tmp_path / "block.jsonl"
     win_path.write_text("".join(json.dumps(w) + "\n" for w in samples))
-    block_path.write_text("".join(json.dumps(r) + "\n" for r in block))
+    # One P0c run file can hold every llama.cpp profile; only the Q4_K_M rows belong to the --windows block.
+    others = [{**r, "attempt_id": f"{p}-{r['attempt_id']}", "profile": p} for p in ("BF16", "Q3_K_M") for r in block]
+    block_path.write_text("".join(json.dumps(r) + "\n" for r in block + others))
 
     out = tmp_path / "p0a"
     script = os.path.join(ROOT, "scripts", "p0a_energy_model.py")
@@ -594,6 +596,7 @@ def test_cli_writes_model_and_estimates(tmp_path):
     assert em["bf16_vs_q4"]["share_same_pick"] is not None
     b = em["batched"]
     assert b["coef"]["decode"] == pytest.approx(2.5, rel=0.02) and b["n_windows"] == 300
+    assert b["n_skipped_other_profiles"] == {"BF16": len(block), "Q3_K_M": len(block)}
     assert b["below_85pct"] == (b["agreement_with_c1"]["share_same_pick"] < 0.85)
     # The agreement checks compare coefficient sets (docs/04), so both sides are generation-window estimates;
     # a shared idle_w x tool_seconds term would pull both rankings toward the fewest tool seconds.
