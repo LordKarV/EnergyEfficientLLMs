@@ -18,10 +18,10 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from qtrace.probe import attach_lora, kernel_status, probe_length
+from qtrace.probe import attach_lora, kernel_paths, kernel_status, probe_length
 
 
-def main():
+def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="Qwen/Qwen3.5-4B")
     ap.add_argument("--lengths", type=int, nargs="+", default=[16384, 32768, 65536])
@@ -32,18 +32,19 @@ def main():
     ap.add_argument("--chunk", type=int, default=2048, help="positions per logits chunk in the loss")
     ap.add_argument("--full-logits-loss", action="store_true", help="comparison: full-vocab transformers loss")
     ap.add_argument("--allow-slow-kernels", action="store_true",
-                    help="run even if fla / causal_conv1d are missing (numbers would not represent training)")
+                    help="run even if fla / causal_conv1d are not in use (numbers would not represent training)")
     ap.add_argument("--out", default="outputs/probe/probe.jsonl")
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
 
     from transformers import AutoModelForCausalLM
 
     device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
-    kernels = kernel_status()
+    # Importable is not in use: transformers falls back to torch on any import error (see kernel_paths).
+    kernels = {"in_use": kernel_paths(), "importable": kernel_status()}
     print(f"device {device}, kernels {kernels}")
-    if not all(kernels.values()) and not args.allow_slow_kernels:
-        raise SystemExit("fla and causal_conv1d must be installed (docs/04 requires the fast kernels); "
-                         "pass --allow-slow-kernels only for a smoke test")
+    if not all(op["fast"] for op in kernels["in_use"].values()) and not args.allow_slow_kernels:
+        raise SystemExit(f"fla and causal_conv1d must be in use, transformers resolved {kernels['in_use']} "
+                         "(docs/04 requires the fast kernels); pass --allow-slow-kernels only for a smoke test")
 
     dtype = torch.bfloat16 if device in ("cuda", "mps") else torch.float32
     model = AutoModelForCausalLM.from_pretrained(args.model, dtype=dtype).to(device)

@@ -7,6 +7,7 @@ only attention and MLP names, which left the mixers in 24 of 32 layers untouched
 """
 
 import importlib.util
+import inspect
 import math
 import time
 
@@ -19,10 +20,34 @@ MLP_TARGETS = ["gate_proj", "up_proj", "down_proj"]
 DELTANET_TARGETS = ["in_proj_qkv", "in_proj_z", "out_proj"]
 GATE_TARGETS = ["in_proj_a", "in_proj_b"]  # DeltaNet write-strength and decay gates; an open decision
 
+# The two DeltaNet ops on the training path. Without a cache, Qwen3_5GatedDeltaNet.forward always calls
+# causal_conv1d_fn and torch_chunk_gated_delta_rule (the *_update / recurrent ops serve one-token decode).
+TRAINING_OPS = {"chunk_gated_delta_rule": "torch_chunk_gated_delta_rule", "causal_conv1d_fn": "causal_conv1d_fn"}
+
 
 def kernel_status():
     """Whether the fast DeltaNet kernels are importable. Without them transformers falls back to slow torch code."""
     return {name: importlib.util.find_spec(name) is not None for name in ("fla", "causal_conv1d")}
+
+
+def kernel_paths():
+    """Which implementation each training-path DeltaNet op calls: the fast package or the torch fallback.
+
+    transformers 5.23 decides once, when modeling_qwen3_5 is imported: use_kernel_func_from_hub_with_fallback
+    (integrations/hub_kernels.py) tries to import fla / causal_conv1d and closes over the result, falling
+    back to the torch function on any import error, with only a warning at the first call. So importable
+    is not enough: a broken install (say fla without a working triton) trains on the slow path. This reads
+    the closure the model will call. An unreadable closure (another transformers version) reports not fast.
+    """
+    from transformers.models.qwen3_5 import modeling_qwen3_5
+
+    out = {}
+    for op, attr in TRAINING_OPS.items():
+        found = inspect.getclosurevars(getattr(modeling_qwen3_5, attr)).nonlocals
+        impl = found.get("implementation")
+        out[op] = {"fast": bool(found.get("is_new_implementation")),
+                   "impl": f"{impl.__module__}.{impl.__qualname__}" if callable(impl) else "unknown"}
+    return out
 
 
 def attach_lora(model, include_gates=False, r=16, alpha=32, grad_ckpt=True, targets=None):
