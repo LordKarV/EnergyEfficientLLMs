@@ -396,8 +396,15 @@ def did_rows(n_tasks, seeds, q_low, q_high, b=0.7, seed=0, invalid=()):
             for profile, rate in (("BF16", b), ("Q3_K_M", q)):
                 rows.append({"task_id": f"t{t}", "prefix": prefix, "profile": profile,
                              "successes": int(rng.binomial(seeds, rate)), "attempts": seeds,
-                             "replay_valid": f"t{t}" not in invalid})
+                             "replay_valid": f"t{t}" not in invalid,
+                             "low_attempt_id": f"t{t}-lo", "high_attempt_id": f"t{t}-hi"})
     return rows
+
+
+def frozen_pairs(n_tasks):
+    """score_choice.json's pairs["tasks"] for did_rows' tasks."""
+    cov = noise_covariates(n_tasks)
+    return [{"task_id": f"t{t}", "low": f"t{t}-lo", "high": f"t{t}-hi", "diff": cov[f"t{t}"]} for t in range(n_tasks)]
 
 
 def noise_covariates(n_tasks, seed=1):
@@ -495,6 +502,37 @@ def test_did_counts_bootstrap_means_of_exactly_zero():
                 rows.append({"task_id": f"t{i:02d}", "prefix": prefix, "profile": profile, "successes": s,
                              "attempts": 4, "replay_valid": True})
     assert did_test(rows, seed=0)["p_one_sided"] == 0.0502
+
+
+def test_pair_drop_rate_is_over_every_selected_pair():
+    pairs, rows = frozen_pairs(30), did_rows(30, 4, 0.6, 0.4)
+    first10 = {f"t{i}" for i in range(10)}
+    done = [r for r in rows if r["task_id"] not in first10]
+    # The reviewer's case: 10 of 30 pairs produced no rows, which read as a drop rate of 0.
+    out = did_test(done, pairs=pairs)
+    assert out["n_pairs_selected"] == 30 and out["pair_tasks_without_continuations"] == sorted(first10)
+    assert out["n_tasks"] == 20 and out["decision"] == "incomplete"
+    # The harness writes an explicit replay_valid false row, without results, for each failed replay.
+    failed = [{"task_id": t, "prefix": "low", "profile": "BF16", "replay_valid": False,
+               "low_attempt_id": f"{t}-lo", "high_attempt_id": f"{t}-hi"} for t in sorted(first10)]
+    out = did_test(failed + done, pairs=pairs)
+    assert out["pair_drop_rate"] == 10 / 30 and out["n_pairs_dropped"] == 10 and out["n_tasks"] == 20
+    assert out["pair_tasks_without_continuations"] == [] and out["decision"] != "incomplete"
+    # A task with only Q4_K_M rows is listed, not dropped without a trace.
+    q4 = [{**r, "profile": "Q4_K_M"} for r in rows if r["task_id"] == "t0"]
+    out = did_test(failed[1:] + q4 + done, pairs=pairs)
+    assert out["pair_tasks_only_other_profiles"] == ["t0"] and out["decision"] == "incomplete"
+
+
+def test_continuations_must_name_the_frozen_pair():
+    pairs, rows = frozen_pairs(10), did_rows(10, 4, 0.6, 0.4)
+    assert did_test(rows, pairs=pairs)["adjusted"]["estimate"] is not None  # covariates come from the pairs
+    with pytest.raises(ValueError, match="not the frozen pair"):
+        did_test([{**rows[0], "low_attempt_id": "t0-other"}] + rows[1:], pairs=pairs)
+    with pytest.raises(ValueError, match="high_attempt_id"):
+        did_test([{k: v for k, v in rows[0].items() if k != "high_attempt_id"}] + rows[1:], pairs=pairs)
+    with pytest.raises(ValueError, match="not a frozen replay pair"):
+        did_test(rows, pairs=pairs[1:])
 
 
 def test_power_rises_with_the_effect():
@@ -663,15 +701,41 @@ def test_analyze_writes_score_choice_and_did(tmp_path):
     assert choice["inputs"]["flagged_excluded"] == {"pool200": 1}
 
     cont = tmp_path / "continuations.jsonl"
+    pair = {p["task_id"]: p for p in choice["pairs"]["tasks"]}
     rows = did_rows(30, 4, 0.6, 0.4)
     for r in rows:
         r["task_id"] = r["task_id"].replace("t", "task")
+        r["low_attempt_id"], r["high_attempt_id"] = pair[r["task_id"]]["low"], pair[r["task_id"]]["high"]
     cont.write_text("".join(json.dumps(r) + "\n" for r in rows))
-    mod.main([str(paths["attempts"]), "--scores", str(paths["scores"]), "--est-joules", str(paths["joules"]),
-              "--out-dir", str(out_dir), "--continuations", str(cont), "--n-boot", "300"])
+    paths["scores"].unlink()  # the DiD step reads the frozen pairs, not the inputs they came from
+    mod.main(["--out-dir", str(out_dir), "--continuations", str(cont), "--n-boot", "300"])
     did = json.loads((out_dir / "did.json").read_text())
     assert did["n_tasks"] == 30 and did["decision"] in ("pass", "fail", "inconclusive")
     assert did["pair_tasks_without_continuations"] == [] and did["adjusted"]["estimate"] is not None
+    assert did["score"] == "kl_mean" and did["n_pairs_selected"] == 30
+
+
+def test_analyze_rerun_removes_a_stale_did_and_says_why_there_are_no_pairs(tmp_path):
+    out_dir = tmp_path / "p0d"
+    out_dir.mkdir()
+    (out_dir / "did.json").write_text("{}")
+    mod = load_script("p0d_analyze")
+
+    def run(roles, with_joules):
+        attempts, scores, joules = make_pool(n_tasks=10, roles=roles)
+        paths = {}
+        for name, rows in (("attempts", attempts), ("scores", scores), ("joules", joules)):
+            paths[name] = tmp_path / f"{name}.jsonl"
+            paths[name].write_text("".join(json.dumps(r) + "\n" for r in rows))
+        mod.main([str(paths["attempts"]), "--scores", str(paths["scores"]), "--out-dir", str(out_dir)] +
+                 (["--est-joules", str(paths["joules"])] if with_joules else []))
+        with pytest.raises(SystemExit) as stop:
+            mod.main(["--out-dir", str(out_dir), "--continuations", str(paths["attempts"])])
+        return str(stop.value)
+
+    assert "undecided" in run({c: "trait" for c in CANDIDATES}, with_joules=False)
+    assert not (out_dir / "did.json").exists()
+    assert "H3 was answered negatively" in run({c: "noise" for c in CANDIDATES}, with_joules=True)
 
 
 # Optional: the scorer against real GGUF files (about 18.5 GB peak for the 4B pair).

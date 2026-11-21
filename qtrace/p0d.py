@@ -331,23 +331,36 @@ def _boot_counts(n, n_boot, rng):
     return rng.multinomial(n, np.full(n, 1.0 / n), size=n_boot)
 
 
-def _continuation_cells(rows, profile):
-    """(task, prefix, profile) -> [successes, attempts], tasks with an invalid replay, rows ignored."""
+def _continuation_cells(rows, profile, pairs=None):
+    """(task, prefix, profile) -> [successes, attempts], the tasks with rows of BF16 or `profile`, the
+    tasks with an invalid replay (on a row of any profile: the replay is shared), rows ignored.
+
+    pairs: {task_id: frozen pair}; each row must then name the pair's runs in low_attempt_id and
+    high_attempt_id, so a continuation can only be scored against the pair it replayed.
+    """
     cells, tasks, invalid, ignored = defaultdict(lambda: [0, 0]), set(), set(), defaultdict(int)
     for r in rows:
         what = f"continuation row {r!r}"
-        task, prefix, prof = (_field(r, k, what) for k in ("task_id", "prefix", "profile"))
-        if prefix not in ("low", "high"):
-            raise ValueError(f"{what}: prefix must be 'low' or 'high'")
+        task, prefix, prof, valid = (_field(r, k, what) for k in ("task_id", "prefix", "profile", "replay_valid"))
+        if prefix not in ("low", "high") or not isinstance(valid, bool):
+            raise ValueError(f"{what}: prefix must be 'low' or 'high' and replay_valid a boolean")
+        if pairs is not None:
+            if task not in pairs:
+                raise ValueError(f"{what}: task {task!r} is not a frozen replay pair")
+            ids = (_field(r, "low_attempt_id", what), _field(r, "high_attempt_id", what))
+            if ids != (pairs[task]["low"], pairs[task]["high"]):
+                raise ValueError(f"{what}: replayed runs {ids} are not the frozen pair "
+                                 f"({pairs[task]['low']!r}, {pairs[task]['high']!r})")
+        if not valid:
+            invalid.add(task)  # the harness writes these without results, so successes are not read
+            continue
         if prof not in ("BF16", profile):
             ignored[prof] += 1
             continue
-        s, n, valid = (_field(r, k, what) for k in ("successes", "attempts", "replay_valid"))
-        if not (isinstance(s, int) and isinstance(n, int) and 0 <= s <= n) or not isinstance(valid, bool):
-            raise ValueError(f"{what}: need integer 0 <= successes <= attempts and a boolean replay_valid")
+        s, n = (_field(r, k, what) for k in ("successes", "attempts"))
+        if not (isinstance(s, int) and isinstance(n, int) and 0 <= s <= n):
+            raise ValueError(f"{what}: need integer 0 <= successes <= attempts")
         tasks.add(task)
-        if not valid:
-            invalid.add(task)
         cells[task, prefix, prof][0] += s
         cells[task, prefix, prof][1] += n
     return cells, tasks, invalid, dict(ignored)
@@ -379,17 +392,32 @@ def _adjusted(did, cov):
     return {**out, "estimate": float(beta[0]), "coef": {k: float(b) for k, b in zip(kept, beta[1:])}}
 
 
-def did_test(rows, covariates=None, profile=PROBE, n_boot=5000, seed=0, alpha=0.05, min_effect=MIN_EFFECT):
+def did_test(rows, covariates=None, profile=PROBE, n_boot=5000, seed=0, alpha=0.05, min_effect=MIN_EFFECT,
+             pairs=None):
     """docs/04's P0d test on continuation results.
 
-    rows: {task_id, prefix "low"|"high", profile, successes, attempts, replay_valid}; rows of one cell
-    are summed (one row per cell or per seed both work). Rows for profiles other than BF16 and
-    `profile` are ignored and counted (Q4_K_M continuations are a separate, secondary run). A pair is
-    dropped if any of its rows has an invalid replay. Per task DiD = (Q - BF16 success rate on the low
-    prefix) - (Q - BF16 on the high prefix). p = share of task-bootstrap means <= 0. covariates:
-    {task_id: {entropy, turns, malformed}} per COVARIATE_CONVENTION, for the adjusted estimate.
+    rows: {task_id, prefix "low"|"high", profile, replay_valid, successes, attempts}, plus
+    low_attempt_id and high_attempt_id when `pairs` is given; rows of one cell are summed (one row per
+    cell or per seed both work). Rows for profiles other than BF16 and `profile` are ignored and
+    counted (Q4_K_M continuations are a separate, secondary run). A pair is dropped if any of its rows
+    has replay_valid false; those rows need no successes or attempts. Per task DiD = (Q - BF16 success
+    rate on the low prefix) - (Q - BF16 on the high prefix). p = share of task-bootstrap means <= 0.
+    covariates: {task_id: {entropy, turns, malformed}} per COVARIATE_CONVENTION, for the adjusted
+    estimate.
+
+    pairs: the frozen pair list (select_pairs' "tasks", read back from score_choice.json). Every row
+    must belong to one of them and name its runs, the covariates default to the pairs' diff, and the
+    pair drop rate is over all of them. A pair with neither a dropped replay nor BF16 and `profile`
+    rows (none at all, or only rows of other profiles) is listed in pair_tasks_without_continuations
+    and the decision is "incomplete": the test would otherwise run on whichever pairs finished first.
     """
-    cells, tasks, invalid, ignored = _continuation_cells(rows, profile)
+    frozen = None if pairs is None else {p["task_id"]: p for p in pairs}
+    cells, tasks, invalid, ignored = _continuation_cells(rows, profile, frozen)
+    if frozen is not None and covariates is None:
+        covariates = {t: p["diff"] for t, p in frozen.items()}
+    selected = set(frozen) if frozen is not None else tasks | invalid
+    without = sorted(selected - tasks - invalid)
+    only_other = sorted(t for t in without if any(r["task_id"] == t for r in rows))
     kept = sorted(tasks - invalid)
     if not kept:
         raise ValueError("no task has a valid replayed pair")
@@ -420,9 +448,11 @@ def did_test(rows, covariates=None, profile=PROBE, n_boot=5000, seed=0, alpha=0.
     keeps = adj is not None and mean != 0 and np.sign(adj) == np.sign(mean) and abs(adj) >= 0.5 * abs(mean)
     pass_rule, fail_rule = p < alpha and bool(keeps), upper < min_effect
     # docs/04 lists pass before fail; both can hold for a significant effect below min_effect, so both are reported.
-    decision = "pass" if pass_rule else "fail" if fail_rule else "inconclusive"
-    return {"profile": profile, "n_tasks": len(kept), "n_pairs_dropped": len(invalid),
-            "pair_drop_rate": len(invalid) / len(tasks), "rows_ignored_by_profile": ignored,
+    decision = "incomplete" if without else "pass" if pass_rule else "fail" if fail_rule else "inconclusive"
+    return {"profile": profile, "n_tasks": len(kept), "n_pairs_selected": len(selected),
+            "n_pairs_dropped": len(invalid), "pair_drop_rate": len(invalid) / len(selected),
+            "pair_tasks_without_continuations": without, "pair_tasks_only_other_profiles": only_other,
+            "rows_ignored_by_profile": ignored,
             "did_mean": mean, "p_one_sided": p, "upper95_one_sided": upper,
             "upper95_definition": UPPER_BOUND_DEFINITION, "adjusted": adjusted, "alpha": alpha,
             "small_sample_note": SMALL_SAMPLE_NOTE if len(kept) < SMALL_SAMPLE else None,

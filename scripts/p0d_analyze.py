@@ -2,14 +2,20 @@
 the DiD test (docs/04, P0d).
 
     python scripts/p0d_analyze.py outputs/attempts/<P0b run>.jsonl ... --scores outputs/p0d/scores.jsonl \
-        [--est-joules outputs/p0a/est_joules.jsonl] [--power-rates BF16 Q3] [--continuations FILE]
+        [--est-joules outputs/p0a/est_joules.jsonl] [--power-rates BF16 Q3]
+    python scripts/p0d_analyze.py --continuations FILE
 
-Writes outputs/p0d/score_choice.json: the chosen score (or null), every candidate's numbers, the
-replay pairs under the chosen score and, with --power-rates, the simulated power of the DiD test at
-4 and 8 seeds per prefix. --power-rates are the expected BF16 and Q3_K_M continuation success rates
-(from the pilot and P0c). With --continuations (rows {task_id, prefix, profile, successes, attempts,
-replay_valid}) it also writes outputs/p0d/did.json. Without --est-joules the joules check does not
-run and the rule stays undecided unless a candidate fails another check first.
+The first form writes outputs/p0d/score_choice.json: the chosen score (or null), every candidate's
+numbers, the replay pairs under the chosen score and, with --power-rates, the simulated power of the
+DiD test at 4 and 8 seeds per prefix. --power-rates are the expected BF16 and Q3_K_M continuation
+success rates (from the pilot and P0c). Without --est-joules the joules check does not run and the
+rule stays undecided unless a candidate fails another check first. A did.json already in --out-dir
+belongs to the score_choice.json this run replaces, so it is removed.
+
+The second form runs the DiD test on the pairs frozen in --out-dir/score_choice.json, never on pairs
+recomputed from inputs that may have changed since the replays, and writes did.json. Continuation
+rows are {task_id, prefix, profile, replay_valid, low_attempt_id, high_attempt_id, successes,
+attempts}; the two ids must be the frozen pair's runs, and a replay_valid false row needs no results.
 """
 
 import argparse
@@ -52,16 +58,22 @@ def write_json(path, obj):
 
 def main(argv=None):
     ap = argparse.ArgumentParser()
-    ap.add_argument("attempts", nargs="+")
+    ap.add_argument("attempts", nargs="*")
     ap.add_argument("--scores", default="outputs/p0d/scores.jsonl")
     ap.add_argument("--lists", nargs="+", default=list(POOL_LISTS), help="the pool lists p0d_score_pool.py scored")
     ap.add_argument("--est-joules", help="outputs/p0a/est_joules.jsonl; omit until P0a's energy model exists")
-    ap.add_argument("--continuations", help="continuation results, one row per (task, prefix, profile)")
+    ap.add_argument("--continuations", help="continuation results; runs the DiD test on the frozen pairs")
     ap.add_argument("--power-rates", nargs=2, type=float, metavar=("BF16", "Q3"))
     ap.add_argument("--n-boot", type=int, default=5000)
     ap.add_argument("--seed", type=int, default=20261120)
     ap.add_argument("--out-dir", default="outputs/p0d")
     args = ap.parse_args(argv)
+    if args.continuations:
+        if args.attempts:
+            ap.error("--continuations reads the pairs frozen in --out-dir/score_choice.json; pass no attempts files")
+        return did_step(args)
+    if not args.attempts:
+        ap.error("attempts files are required to choose the score")
 
     attempts = [r for path in args.attempts for r in read_jsonl(path)]
     joules = read_jsonl(args.est_joules) if args.est_joules else None
@@ -73,6 +85,10 @@ def main(argv=None):
         out["power"] = [power(*args.power_rates, n_tasks=pairs["n_tasks"], seeds=s, effects=POWER_EFFECTS,
                               n_boot=args.n_boot, seed=args.seed) for s in POWER_SEEDS]
     write_json(os.path.join(args.out_dir, "score_choice.json"), out)
+    stale = os.path.join(args.out_dir, "did.json")
+    if os.path.exists(stale):
+        os.remove(stale)
+        print("removed", stale, "(it tested the pairs of the score_choice.json just replaced)")
     print_table(choice)
     if pairs:
         print(f"pairs: {pairs['n_tasks']} tasks, spread {pairs['spread']}")
@@ -80,22 +96,24 @@ def main(argv=None):
         print(f"power at {p['seeds']} seeds/prefix, {p['n_tasks']} tasks:",
               ", ".join(f"{e['effect']:.2f}: {e['power']:.2f}" for e in p["power"]), f"(MDE80 {p['mde_80']})")
 
-    if args.continuations:
-        if not pairs:
-            raise SystemExit("no chosen score, so there are no replay pairs to test")
-        cov = {p["task_id"]: p["diff"] for p in pairs["tasks"]}
-        rows = read_jsonl(args.continuations)
-        unknown = sorted({r["task_id"] for r in rows} - set(cov))
-        if unknown:
-            raise SystemExit(f"continuation tasks that are not replay pairs: {unknown[:5]}")
-        did = did_test(rows, cov, n_boot=args.n_boot, seed=args.seed)
-        did["pair_tasks_without_continuations"] = sorted(set(cov) - {r["task_id"] for r in rows})
-        did["score"] = choice["chosen"]
-        write_json(os.path.join(args.out_dir, "did.json"), did)
-        adj = did["adjusted"]["estimate"] if did["adjusted"] else None
-        print(f"DiD {did['did_mean']:+.3f} (p one-sided {did['p_one_sided']:.4f}, "
-              f"upper95 {did['upper95_one_sided']:+.3f}), adjusted {fmt(adj)}, "
-              f"pair drop rate {did['pair_drop_rate']:.2f}: {did['decision']}")
+
+def did_step(args):
+    path = os.path.join(args.out_dir, "score_choice.json")
+    with open(path) as f:
+        frozen = json.load(f)
+    if not frozen["pairs"]:
+        why = "H3 was answered negatively" if frozen["decided"] else "the score rule is undecided"
+        raise SystemExit(f"{path} has no chosen score ({why}: {frozen['verdict']}), so there are no replay pairs")
+    did = did_test(read_jsonl(args.continuations), pairs=frozen["pairs"]["tasks"], n_boot=args.n_boot,
+                   seed=args.seed)
+    did["score"], did["score_choice"] = frozen["chosen"], path
+    write_json(os.path.join(args.out_dir, "did.json"), did)
+    adj = did["adjusted"]["estimate"] if did["adjusted"] else None
+    print(f"DiD {did['did_mean']:+.3f} (p one-sided {did['p_one_sided']:.4f}, "
+          f"upper95 {did['upper95_one_sided']:+.3f}), adjusted {fmt(adj)}, "
+          f"pair drop rate {did['pair_drop_rate']:.2f} of {did['n_pairs_selected']}: {did['decision']}")
+    if did["pair_tasks_without_continuations"]:
+        print(f"{len(did['pair_tasks_without_continuations'])} pairs have no BF16 and Q3_K_M continuation rows")
 
 
 if __name__ == "__main__":
