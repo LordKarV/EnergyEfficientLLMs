@@ -658,13 +658,15 @@ def guard_se(tasks, n_by_repo=HELDOUT691_BY_REPO, seeds=3):
       se_rr_diff = sqrt(2 v / (S n)), RR_arm - RR_random when both arms have each task's p_t, the paired
         difference the guard bounds (the task-level spread of p_t cancels in the shared draws).
     The guard's one-sided 95% lower bound sits about 1.645 se_rr_diff below the observed difference, so a margin
-    of m se_rr_diff passes an arm with no true difference with probability about Phi(m - 1.645).
+    of m se_rr_diff passes an arm with no true difference with probability about Phi(m - 1.645). margin_se is
+    se_rr_diff, the SE the margin is set from (owner's agent on PR #17, answer 1); the multiple m is the owner's.
     """
     pools = _pass_rates(tasks, n_by_repo)
     n = sum(n_by_repo.values())
     v = sum(n_by_repo[r] * pools[r][:, 1].mean() for r in pools) / n
     return {"n_tasks": n, "seeds": seeds, "mean_binomial_variance": float(v),
             "se_rr": math.sqrt(v / (seeds * n)), "se_rr_diff": math.sqrt(2 * v / (seeds * n)),
+            "margin_se": math.sqrt(2 * v / (seeds * n)), "margin_se_from": "se_rr_diff",
             "formula": "se_rr = sqrt(v / (S n)), se_rr_diff = sqrt(2 v / (S n)), v = repo-weighted mean of "
                        "s (k - s) / (k (k - 1)) over the measured tasks"}
 

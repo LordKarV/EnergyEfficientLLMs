@@ -100,6 +100,8 @@ def main(argv=None):
               + (f", with guard {p['power_with_guard']:.3f}" if "power_with_guard" in p else ""))
     print(f"MDE at 80% power: ratio {out['mde_ratio_80']} (cost: {out['cost']['source']}); se_rr {se['se_rr']:.4f}, "
           f"se_rr_diff {se['se_rr_diff']:.4f} ({se['formula']})")
+    print(f"guard margin = k x se_rr_diff = k x {se['margin_se']:.4f} (the guard bounds the paired difference; "
+          "k is the owner's decision)")
     if args.guard_margin is not None:
         print(f"MDE at 80% power with the guard at margin {args.guard_margin}: ratio {out['mde_ratio_80_with_guard']}")
         if out["guard_pass_rate"] < MDE_POWER:

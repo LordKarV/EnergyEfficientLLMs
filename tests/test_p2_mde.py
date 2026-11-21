@@ -37,6 +37,8 @@ def test_guard_se_matches_closed_form():
     assert se["mean_binomial_variance"] == pytest.approx(v)
     assert se["se_rr"] == pytest.approx(math.sqrt(v / 1800))
     assert se["se_rr_diff"] == pytest.approx(math.sqrt(2 * v / 1800))
+    # Owner's agent on PR #17 (answer 1): the guard bounds the paired difference, so se_rr_diff is the margin's SE.
+    assert se["margin_se"] == se["se_rr_diff"] and se["margin_se_from"] == "se_rr_diff"
 
 
 def test_power_known_answer():
@@ -164,6 +166,7 @@ def test_cli_on_attempt_rows(tmp_path):
         assert out["cost"]["source"] == source and out["cost"]["mean_resolved"] == mean_resolved
         assert out["n_measured_tasks"] == 4 and out["mean_pass1"] == 0.5  # the error row is left out
         assert [p["ratio"] for p in out["power"]] == [0.9, 1.0]
+        assert f"guard margin = k x se_rr_diff = k x {out['guard_se']['se_rr_diff']:.4f}" in proc.stdout
 
 
 def test_cli_counts_only_submitted_resolves_and_reads_each_profile(tmp_path):
