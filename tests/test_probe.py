@@ -1,14 +1,26 @@
 """Tests for the training probe on a tiny Qwen3.5. Run:  python -m pytest tests/test_probe.py -q"""
 
+import importlib.util
+import json
 import os
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, ROOT)
 
+import pytest
 import torch
 
-from qtrace.probe import (DELTANET_TARGETS, GATE_TARGETS, attach_lora, chunked_ce_loss, kernel_status,
-                          probe_length, supervised_mask)
+from qtrace.probe import (
+    DELTANET_TARGETS,
+    GATE_TARGETS,
+    attach_lora,
+    chunked_ce_loss,
+    kernel_paths,
+    kernel_status,
+    probe_length,
+    supervised_mask,
+)
 
 
 def tiny_qwen35(seed=0):
@@ -77,3 +89,49 @@ def test_chunked_loss_matches_full_logits_loss_and_gradients():
 def test_kernel_status_names_both_kernels():
     status = kernel_status()
     assert set(status) == {"fla", "causal_conv1d"}
+
+
+def test_kernel_paths_report_what_transformers_resolved():
+    paths = kernel_paths()
+    assert set(paths) == {"chunk_gated_delta_rule", "causal_conv1d_fn"}
+    status = kernel_status()
+    if not status["fla"]:
+        assert not paths["chunk_gated_delta_rule"]["fast"]
+        assert paths["chunk_gated_delta_rule"]["impl"].endswith("modeling_qwen3_5.torch_chunk_gated_delta_rule")
+    if not status["causal_conv1d"]:
+        assert not paths["causal_conv1d_fn"]["fast"]
+
+
+def load_script():
+    path = os.path.join(ROOT, "scripts", "p0_training_probe.py")
+    spec = importlib.util.spec_from_file_location("p0_training_probe", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+SLOW_IN_USE = {"chunk_gated_delta_rule": {"fast": False, "impl": "torch"},
+               "causal_conv1d_fn": {"fast": True, "impl": "causal_conv1d"}}
+
+
+def test_script_refuses_importable_kernels_that_are_not_in_use(tmp_path, monkeypatch):
+    script = load_script()
+    monkeypatch.setattr(script, "kernel_status", lambda: {"fla": True, "causal_conv1d": True})
+    monkeypatch.setattr(script, "kernel_paths", lambda: SLOW_IN_USE)
+    out = tmp_path / "probe.jsonl"
+    with pytest.raises(SystemExit, match="allow-slow-kernels"):
+        script.main(["--model", str(tmp_path / "no_model"), "--out", str(out)])
+    assert not out.exists()
+
+
+def test_script_records_kernels_in_use_in_every_row(tmp_path, monkeypatch):
+    ckpt = tmp_path / "ckpt"
+    tiny_qwen35().save_pretrained(ckpt)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: False)
+    out = tmp_path / "probe.jsonl"
+    load_script().main(["--model", str(ckpt), "--lengths", "48", "64", "--steps", "1", "--chunk", "16",
+                        "--supervised-frac", "0.5", "--allow-slow-kernels", "--out", str(out)])
+    rows = [json.loads(line) for line in out.read_text().splitlines()]
+    assert len(rows) == 2 and all(r["status"] == "ok" for r in rows)
+    assert all(r["kernels"] == {"in_use": kernel_paths(), "importable": kernel_status()} for r in rows)
