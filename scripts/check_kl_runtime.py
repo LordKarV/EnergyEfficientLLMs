@@ -24,11 +24,12 @@ the full KL by the data-processing inequality, with tail_mass_hf, the HF probabi
 These two are informative and are not judged.
 
     python scripts/check_kl_runtime.py EPISODE.npz --hf models/Qwen3.5-4B --kl-score bin/kl_score \
-        --gguf-bf16 bf16.gguf --gguf-q4 q4_k_m.gguf [--device cuda] [--out row.json]
+        --gguf-bf16 bf16.gguf --gguf-q4 q4_k_m.gguf [--device cuda] [--machine ec2-g6e.16xlarge] [--out row.json]
 
 EPISODE.npz is the episode store's format (input_ids [n], bool model_mask [n]). The row printed and
 written to --out holds every number, the thresholds, a pass flag per criterion, the helper's runtime
-settings and the machine.
+settings, the platform string ("machine") and the optional --machine label as given ("machine_label").
+No hostname is recorded: committed rows should not carry personal machine names (PR #11 review).
 """
 
 import argparse
@@ -118,6 +119,7 @@ def main(argv=None):
     ap.add_argument("--top-k", type=int, default=256)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--out")
+    ap.add_argument("--machine", help="free-text label for the machine, e.g. mac-48gb; recorded as given")
     args = ap.parse_args(argv)
     with np.load(args.episode) as z:
         ids, mask = torch.from_numpy(z["input_ids"].astype(np.int64)), torch.from_numpy(z["model_mask"])
@@ -148,6 +150,7 @@ def main(argv=None):
            "top_k": args.top_k, "noise_floor_positions": idx[sub].tolist(), "noise_floor_seed": NOISE_FLOOR_SEED,
            **judge(gguf, hf, float(gguf["kl"].mean()), kl_exact), "runtime": g["runtime"],
            "hf_device": args.device, "torch": torch.__version__, "machine": platform.platform(),
+           "machine_label": args.machine,
            "seconds": {"gguf": round(gguf_s, 1), "hf": round(hf_s, 1)}}
     print(json.dumps(row, indent=1))
     if args.out:
