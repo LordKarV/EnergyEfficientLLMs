@@ -93,10 +93,36 @@ def test_projections_by_profile_with_fallback_and_sub_run():
     assert steps["P0a"]["profiles"]["Q8_0"]["rate_from"] == "BF16"
     assert steps["P0a"]["profiles"]["BF16"]["rate_source"] == "synthetic"
     assert steps["P0a"]["upper_hours"] > steps["P0a"]["point_hours"]  # the 600-attempt top-up
-    # No synthetic vLLM rate: P0b uses the rate its pilot records reached, and says so.
-    assert steps["P0b"]["profiles"]["BF16"]["rate_source"] == "pilot"
+    # No synthetic vLLM rate: P0b is not projected from the pilot rate (see the next test).
+    assert "P0b" not in steps
     sub = steps["energy_sub_run"]
     assert sub["serial"] and abs(sub["point_hours"] - 150 * (120 + 60 + 45) / 3600) < 1e-9
+
+
+def test_pilot_rates_are_not_projected_from():
+    # Review of eadb97e: a 14-slot pilot, 30 turns of 1 s prefill + 19 s decode + 10 s tool per attempt. Its
+    # decode union covers nearly the whole span, so the pilot rate already holds the tool idleness; projected
+    # with tool time on top, P0b read about 1.9x the pilot's own wall clock as a plain "total" row.
+    rows = []
+    for slot in range(14):
+        t = slot * 2.0
+        for a in range(10):
+            r = rec("vllm", "submitted", t, t + 900, out=12000, unc=45000, cached=300000, server_cached=300000,
+                    tool_s=300.0, gen_s=600.0)
+            r["attempt_id"] = f"{slot}-{a}"
+            r["per_turn"] = [{"turn": k, "output_tokens": 400, "input_uncached": 1500, "input_cached": 0,
+                              "gen_t_start": t + 30 * k, "gen_t_first_token": t + 30 * k + 1.0,
+                              "gen_t_end": t + 30 * k + 20.0} for k in range(30)]
+            rows.append(r)
+            t += 900
+    stats = attempt_stats(rows)
+    assert stats["vllm"]["pilot_rates"]["BF16"]["decode_tok_s"] > 0  # still derived and printed
+    sc = projections(stats, {})["scenarios"]["64K x 16"]
+    assert "P0b" not in sc["steps"]
+    assert any("no synthetic rate (extras rates) for vllm BF16 (the pilot rate above is a cross-check only)" in x
+               for x in sc["missing"])
+    md = render_markdown(stats, [], {}, projections(stats, {}))
+    assert "| vllm | BF16 | pilot |" in md and "| P0b |" not in md.split("## KL scoring")[0]
 
 
 def test_null_server_cached_counts_as_not_reported():
@@ -228,7 +254,8 @@ def test_projection_scenarios_64k_x16_and_128k_x8():
     stats = attempt_stats([rec("vllm", "submitted", 0, 600), rec("llama.cpp", "submitted", 0, 600),
                            rec("llama.cpp", "submitted", 0, 600, profile="Q4_K_M")])
     s = stats["vllm"]
-    p = projections(stats, {"rates": {"vllm": {"BF16": RATE}}})
+    rates = {"vllm": {"BF16": RATE}, "llama.cpp": {"BF16": RATE, "Q4_K_M": RATE}}
+    p = projections(stats, {"rates": rates})
     p64, p128 = p["scenarios"]["64K x 16"], p["scenarios"]["128K x 8"]
     assert p64["slots"] == 16 and p128["slots"] == 8
     assert p64["steps"]["P0b"]["point_hours"] == project_hours(s, RATE, 4800, 16)["hours"]
@@ -237,7 +264,8 @@ def test_projection_scenarios_64k_x16_and_128k_x8():
     assert "| partial total (see below) |" in md.split("### 128K x 8")[1]
     assert "| total |" in md.split("### 128K x 8")[0].split("### 64K x 16")[1]
     half = {"decode_tok_s": 250.0, "prefill_tok_s": 2500.0}
-    p128 = projections(stats, {"rates": {"vllm": {"BF16": RATE}}, "rates_128k_x8": {"vllm": {"BF16": half}}})
+    extras = {"rates": rates, "rates_128k_x8": {"vllm": {"BF16": half}}}
+    p128 = projections(stats, extras)
     assert p128["scenarios"]["128K x 8"]["steps"]["P0b"]["point_hours"] == project_hours(s, half, 4800, 8)["hours"]
     md = render_markdown(stats, probe=[], extras={}, projections=p128)
     assert "### 64K x 16" in md and "### 128K x 8" in md

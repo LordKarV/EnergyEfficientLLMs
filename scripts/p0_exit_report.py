@@ -11,8 +11,8 @@ The extras JSON holds what attempt records can't:
  "concurrency": {"containers", "vcpus_per_container"},
  "kl_scoring": {"machine", "seconds_per_run", "tokens_per_run"}}             # optional; defaults to PR #11's M5 Pro
 runtime is vllm or llama.cpp, profile one of BF16 Q8_0 Q4_K_M Q3_K_M Q4_K_M_gate8; any other rates shape
-raises. Missing keys are listed in the report. Without a synthetic 64K x 16 rate, the rate the pilot
-records reached is used and marked "pilot"; 128K x 8 has no such fallback.
+raises. Missing keys are listed in the report. A step is projected only from synthetic rates; the rate the
+pilot records reached is printed as a cross-check, since it already includes tool idleness.
 """
 
 import argparse

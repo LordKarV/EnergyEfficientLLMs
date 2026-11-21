@@ -4,7 +4,7 @@ attempt_stats and the markdown come from the attempt records agreed in issue #1.
 records can't give (aggregate token rates from synthetic load, peak GPU memory, energy-counter checks,
 idle watts, the replay match rate) come from an optional extras JSON; anything missing is listed under
 "Not yet provided" rather than silently left out. Aggregate rates are also derived from the pilot records
-(_pilot_rates) and used where no synthetic-load rate is given, marked as such.
+(_pilot_rates) and printed as a cross-check; projections use synthetic-load rates only.
 """
 
 import statistics
@@ -112,8 +112,10 @@ def _pilot_rates(rows):
     decode [gen_t_first_token, gen_t_end), the split energy_model (#13) uses; turns with no first token are
     left out. Prefill counts realized work when every record has the server's cache count: the per-turn ideal
     uncached tokens scaled by the attempts' realized / ideal ratio. With tool time fewer than all slots are
-    busy, and the two phases overlap, so these sit below an all-slots-busy synthetic rate and a projection
-    from them errs high.
+    busy, and the two phases overlap, so these sit below an all-slots-busy synthetic rate: with many slots the
+    decode union covers nearly the whole span, so the rate is close to the pilot's wall-clock throughput, which
+    already includes tool idleness. project_hours would then charge tool time and overlapped prefill twice
+    (about 1.9x the pilot's own wall clock in a 14-slot simulation), so these are printed, never projected from.
     """
     by_profile = defaultdict(list)
     for r in rows:
@@ -248,7 +250,8 @@ def _check_rates(extras):
 
 def _rate(extras, key, runtime, profile, pilot):
     """(rate, profile it came from, source). The profile's own rate before its RATE_FALLBACK, and for each the
-    synthetic-load rate (extras[key]) before the pilot's. The pilot ran at 64K, so it serves only "rates"."""
+    synthetic-load rate (extras[key]) before the pilot's. The pilot ran at 64K, so it serves only "rates".
+    Projections pass pilot={}: see _pilot_rates for why a pilot rate is not an all-slots-busy rate."""
     measured = extras.get(key, {}).get(runtime, {})
     for p in dict.fromkeys((profile, RATE_FALLBACK.get(profile, profile))):
         if measured.get(p):
@@ -267,9 +270,10 @@ def _scenario(stats, extras, key, slots):
             continue
         s, rows = stats[runtime], {}
         for profile, (point, upper) in profiles.items():
-            rate, rate_from, source = _rate(extras, key, runtime, profile, s["pilot_rates"])
+            rate, rate_from, source = _rate(extras, key, runtime, profile, {})
             if rate is None:
-                missing.append(f"{step}: no {key} rate for {runtime} {profile}")
+                note = " (the pilot rate above is a cross-check only)" if profile in s["pilot_rates"] else ""
+                missing.append(f"{step}: no synthetic rate (extras {key}) for {runtime} {profile}{note}")
                 break
             rows[profile] = {"rate_from": rate_from, "rate_source": source,
                              "point_hours": project_hours(s, rate, point, slots)["hours"],
