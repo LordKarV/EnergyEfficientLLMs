@@ -23,6 +23,7 @@ from qtrace.probe import (
     chunked_ce_loss,
     kernel_paths,
     kernel_status,
+    lora_update_size,
     probe_length,
     supervised_mask,
 )
@@ -181,3 +182,64 @@ def test_script_trains_and_records_the_config_lora(tmp_path, monkeypatch):
     assert [r["include_gates"] for r in rows] == [False, True]
     assert all(r["targets"] == ["q_proj", "in_proj_qkv"] and r["lora_r"] == 4 and r["lora_alpha"] == 8
                and r["config"] == str(cfg) for r in rows)
+
+
+def plant_update(model, rel, seed=0):
+    """Set every LoRA B so each module's scaling * B @ A has ||.||_F / ||W||_F = rel (the owner's plant, issue #1)."""
+    g = torch.Generator().manual_seed(seed)
+    with torch.no_grad():
+        for mod in model.modules():
+            if "default" not in getattr(mod, "lora_A", {}):
+                continue
+            a, b, s = mod.lora_A["default"].weight, mod.lora_B["default"].weight, mod.scaling["default"]
+            bn = torch.randn(b.shape, generator=g)
+            c = rel * mod.base_layer.weight.float().norm() / (s * (bn @ a.float())).norm()
+            b.copy_((bn * c).to(b.dtype))
+
+
+def test_lora_update_size_gives_back_a_planted_size_by_module_type():
+    torch.manual_seed(0)
+    model = attach_lora(tiny_qwen35().to(torch.bfloat16), include_gates=True, grad_ckpt=False)
+    assert lora_update_size(model)["carried_bf16"] is None  # B = 0 at init: no update yet
+    plant_update(model, 3e-3)
+    size = lora_update_size(model)
+    kinds = set(ATTENTION_TARGETS + MLP_TARGETS + DELTANET_TARGETS + GATE_TARGETS)
+    assert set(size["by_type"]) == kinds
+    assert size["modules"] == sum(t["modules"] for t in size["by_type"].values()) == 4 * 3 + 3 * 5 + 1 * 4
+    for t in size["by_type"].values():  # B is stored in bf16, so the planted size holds to its rounding
+        assert t["rel_p10"] == pytest.approx(3e-3, rel=1e-2) and t["rel_p90"] == pytest.approx(3e-3, rel=1e-2)
+        assert t["rel_p10"] <= t["rel_median"] <= t["rel_p90"]
+
+
+def test_lora_update_size_carried_share_is_near_0_below_half_a_bf16_step_and_near_1_above():
+    torch.manual_seed(0)
+    model = attach_lora(tiny_qwen35().to(torch.bfloat16), include_gates=False, grad_ckpt=False)
+    plant_update(model, 1e-5)  # far below half a bf16 step (2**-9 of each weight): rounds back to W
+    small = lora_update_size(model)
+    plant_update(model, 1e-3)  # the owner's round trip kept 0.52 of a 1e-3 update in the BF16 file
+    mid = lora_update_size(model)
+    plant_update(model, 1e-1)
+    large = lora_update_size(model)
+    assert small["carried_bf16"] < 0.05 and 0.4 < mid["carried_bf16"] < 0.65 and large["carried_bf16"] > 0.99
+    assert all(t["carried_bf16"] < 0.1 for t in small["by_type"].values())
+    assert all(t["carried_bf16"] > 0.98 for t in large["by_type"].values())
+
+
+def test_script_reports_the_update_size_after_each_row(tmp_path, monkeypatch):
+    ckpt = tmp_path / "ckpt"
+    tiny_qwen35().save_pretrained(ckpt)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: False)
+    out = tmp_path / "probe.jsonl"
+    load_script().main(["--model", str(ckpt), "--lengths", "48", "64", "--steps", "1", "--chunk", "16",
+                        "--supervised-frac", "0.5", "--allow-slow-kernels", "--config", P1_CONFIG, "--out", str(out)])
+    rows = [json.loads(line) for line in out.read_text().splitlines()]
+    assert [r["optimizer_steps"] for r in rows] == [2, 2] and [r["adapter_steps"] for r in rows] == [2, 4]
+    for r in rows:
+        size = r["update_size"]
+        assert set(size["by_type"]) == set(ATTENTION_TARGETS + MLP_TARGETS + DELTANET_TARGETS)
+        assert 0 <= size["carried_bf16"] <= 1.05
+        assert all(t["rel_median"] > 0 for t in size["by_type"].values())
+    # the adapter keeps training across rows, so the update grows
+    q = [r["update_size"]["by_type"]["q_proj"]["rel_median"] for r in rows]
+    assert q[1] > q[0]

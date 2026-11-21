@@ -10,6 +10,10 @@ adapter P1 will train. Each row records them.
 Run on the pilot box before the pilot attempts:
     python scripts/p0_training_probe.py --model Qwen/Qwen3.5-4B --config configs/p1_train.yaml
 Writes one JSON line per length to outputs/probe/probe.jsonl and prints a table.
+
+Each row also has update_size (qtrace.probe.lora_update_size): the relative size of the LoRA update and
+the share of it a bf16 merge would keep (issue #1, the owner's round trip). The adapter keeps training
+from row to row, so update_size is cumulative over adapter_steps optimizer steps, not this row's alone.
 """
 
 import argparse
@@ -23,7 +27,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from qtrace import sft
 from qtrace.common import load_config
-from qtrace.probe import kernel_paths, kernel_status, probe_length
+from qtrace.probe import kernel_paths, kernel_status, lora_update_size, probe_length
 
 
 def main(argv=None):
@@ -66,16 +70,22 @@ def main(argv=None):
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     with open(args.out, "a") as f:
         path = "full_logits" if args.full_logits_loss else "chunked"
+        adapter_steps = 0
         for frac in args.supervised_frac:
             for length in sorted(args.lengths):
                 rec = probe_length(model, length, args.steps, device, vocab, supervised_frac=frac,
                                    loss_path=path, chunk=args.chunk)
-                rec.update(model=args.model, config=args.config, **lora, kernels=kernels)
+                adapter_steps += rec["optimizer_steps"]
+                rec.update(model=args.model, config=args.config, **lora, kernels=kernels,
+                           adapter_steps=adapter_steps, update_size=lora_update_size(model))
                 f.write(json.dumps(rec) + "\n")
                 f.flush()
                 sec = f"{rec['sec_per_step']:.1f} s/step" if rec["status"] == "ok" else "OOM"
                 mem = f"{rec['mem_gib']:.1f} GiB ({rec['mem_kind']})" if rec.get("mem_gib") is not None else "n/a"
-                print(f"{path} frac {frac:.2f} {length:>6} tokens: {sec}, memory {mem}")
+                carried = rec["update_size"]["carried_bf16"]
+                carried = "n/a" if carried is None else f"{carried:.2f}"
+                print(f"{path} frac {frac:.2f} {length:>6} tokens: {sec}, memory {mem}, "
+                      f"bf16 carried share {carried} after {adapter_steps} steps")
                 if rec["status"] == "oom":
                     print("stopping this fraction: longer sequences will not fit either")
                     break
