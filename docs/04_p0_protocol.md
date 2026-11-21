@@ -95,8 +95,10 @@ binning must use draws that are independent of the pass rates it compares.
 - Serving: vLLM for the large BF16 sampling in P0b; llama.cpp at one pinned commit for every
   comparison between precisions, BF16 included. llama.cpp splits `-c` across `-np` slots, so
   N slots at context C need `-c N*C` (16 x 64K = 1,048,576).
-- Profiles: `BF16` GGUF, `Q8_0`, `Q4_K_M`, `Q3_K_M`, and `Q4_K_M` with `ssm_alpha`/`ssm_beta`
-  overridden to Q8_0 (the gate-tensor ablation). Default `llama-quantize` flags, no imatrix in P0.
+- Profiles: `BF16` GGUF, `Q8_0`, `Q4_K_M`, `Q3_K_M`, and `Q4_K_M` with `ssm_beta_alpha` (the fused
+  `in_proj_b`/`in_proj_a`) at `Q8_0` (the gate-tensor ablation:
+  `llama-quantize --tensor-type ssm_beta_alpha=q8_0 <in> <out> Q4_K_M`). Default `llama-quantize`
+  flags otherwise, no imatrix in P0.
   The per-tensor type table of every file is saved with its results.
 
 ### Task sets (seeded ID lists saved before anything runs)
