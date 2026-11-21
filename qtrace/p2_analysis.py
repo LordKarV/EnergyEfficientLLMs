@@ -625,3 +625,108 @@ def analyze(records, manifest, energy_model, headline, cfg, estimator_rows=None)
             "h4": h4(data, gdata, headline, cfg, cpu_w) if gdata["n_rows"] else None,
             "settings": {k: cfg[k] for k in ("guard_margin", "infra_error_cap", "n_boot", "seed", "alpha",
                                              "host_cpu_tdp_w", "host_vcpus")}}
+
+
+# P2's task count per held-out repo: #3's data/task_lists/heldout691.json by_repo.
+HELDOUT691_BY_REPO = {"coveragepy": 108, "datalad": 179, "pyramid": 189, "scrapy": 215}
+MDE_RATIOS = (0.70, 0.75, 0.80, 0.85, 0.88, 0.90, 0.92, 0.94, 0.96, 0.98, 1.0)
+MDE_POWER = 0.8
+
+
+def _pass_rates(tasks, n_by_repo):
+    """Per held-out repo, the tasks' pass rates s / k and unbiased binomial variances s (k - s) / (k (k - 1))."""
+    by_repo = {}
+    for t in tasks:
+        s, k = t["successes"], t["attempts"]
+        if any(isinstance(x, bool) or not isinstance(x, int) for x in (s, k)) or k < 2 or not 0 <= s <= k:
+            raise ValueError(f"task {t!r}: successes and attempts must be integers with 0 <= s <= k and k >= 2")
+        by_repo.setdefault(t["repo"], []).append((s / k, s * (k - s) / (k * (k - 1))))
+    missing = sorted(set(n_by_repo) - set(by_repo))
+    if missing:
+        raise ValueError(f"no measured task in held-out repos {missing}; each repo's tasks are resampled from its own")
+    return {r: np.array(by_repo[r]) for r in sorted(n_by_repo)}
+
+
+def guard_se(tasks, n_by_repo=HELDOUT691_BY_REPO, seeds=3):
+    """Standard errors of P2's Q4_K_M resolve rates, from measured per-task pass counts (P0b heldout100).
+
+    tasks: [{"repo", "successes", "attempts"}] with attempts >= 2. v_t = s_t (k_t - s_t) / (k_t (k_t - 1)) is
+    unbiased for the task's p_t (1 - p_t); v is the mean of v_t within each held-out repo, weighted by the repo's
+    share of the n = sum(n_by_repo) P2 tasks. With S = seeds seed models and 1 attempt per task per seed:
+      se_rr = sqrt(v / (S n)), one arm's resolve rate with each task's p_t fixed (attempt noise only);
+      se_rr_diff = sqrt(2 v / (S n)), RR_arm - RR_random when both arms have each task's p_t, the paired
+        difference the guard bounds (the task-level spread of p_t cancels in the shared draws).
+    The guard's one-sided 95% lower bound sits about 1.645 se_rr_diff below the observed difference, so a margin
+    of m se_rr_diff passes an arm with no true difference with probability about Phi(m - 1.645).
+    """
+    pools = _pass_rates(tasks, n_by_repo)
+    n = sum(n_by_repo.values())
+    v = sum(n_by_repo[r] * pools[r][:, 1].mean() for r in pools) / n
+    return {"n_tasks": n, "seeds": seeds, "mean_binomial_variance": float(v),
+            "se_rr": math.sqrt(v / (seeds * n)), "se_rr_diff": math.sqrt(2 * v / (seeds * n)),
+            "formula": "se_rr = sqrt(v / (S n)), se_rr_diff = sqrt(2 v / (S n)), v = repo-weighted mean of "
+                       "s (k - s) / (k (k - 1)) over the measured tasks"}
+
+
+def mde(tasks, cost_resolved, cost_failed, ratios=MDE_RATIOS, n_by_repo=HELDOUT691_BY_REPO, seeds=3, n_sim=500,
+        n_boot=1000, alpha=0.05, seed=0, guard_margin=None):
+    """Simulated power of the frozen primary test at each true JPR ratio, and the minimum detectable effect.
+
+    The test is contrast()'s: _test on strat_weights draws (tasks resampled within repo, shared by both arms),
+    each task averaged over the seed models, p < alpha on T = log(JPR_arm / JPR_random). Each simulated study
+    draws n_by_repo[repo] tasks per held-out repo with replacement from that repo's measured tasks (tasks as in
+    guard_se: P0b heldout100 BF16, or P0a Q4_K_M) and gives each arm seeds x 1 attempt per task, resolving with
+    the task's s / k, the same rate for both arms. An attempt costs a draw from cost_resolved or cost_failed (per
+    pool attempt estimated joules or processed tokens, by outcome), times the ratio for the headline arm, so the
+    true JPR ratio is the ratio and the true resolve-rate difference 0.
+
+    Simplifications, both stated in the output: costs are drawn without regard to the task, so the task-level
+    cost spread the paired draws would cancel is missing (conservative); s / k is used as the true rate, which
+    understates p (1 - p) by a factor (k - 1) / k (slightly optimistic, more so for k = 3 than 16).
+
+    One set of bootstrap weights serves every study and every ratio reuses a study's draws, as in qtrace/p0d.py
+    power (#12), so the result is deterministic in seed and the curve differs only by the ratio. power counts
+    p < alpha; with guard_margin, power_with_guard also needs the guard (lower bound of RR_arm - RR_random >=
+    -guard_margin), which is analyze()'s win. mde_ratio_80 is the largest ratio with power >= 0.8 (the smallest
+    detectable reduction, 1 - ratio), None if none.
+    """
+    if seeds < 1 or n_sim < 1 or n_boot < 100 or not 0 < alpha < 1:
+        raise ValueError(f"need seeds >= 1, n_sim >= 1, n_boot >= 100, 0 < alpha < 1; got {seeds}, {n_sim}, "
+                         f"{n_boot}, {alpha}")
+    if not ratios or any(not 0 < r for r in ratios):
+        raise ValueError(f"ratios are true JPR ratios arm / random, each > 0; got {ratios}")
+    pools = _pass_rates(tasks, n_by_repo)
+    cr, cf = (np.asarray(c, dtype=float) for c in (cost_resolved, cost_failed))
+    for name, c in (("cost_resolved", cr), ("cost_failed", cf)):
+        if c.ndim != 1 or not len(c) or not np.isfinite(c).all() or (c <= 0).any():
+            raise ValueError(f"{name} must be a non-empty list of positive finite per-attempt costs")
+    repos = np.repeat(list(pools), [n_by_repo[r] for r in pools])
+    n = len(repos)
+    rng = np.random.default_rng(seed)
+    W = strat_weights(repos, n_boot, rng)
+    sig, won, rr_diffs = np.zeros(len(ratios)), np.zeros(len(ratios)), []
+    for _ in range(n_sim):
+        p = np.concatenate([rng.choice(pools[r][:, 0], n_by_repo[r]) for r in pools])
+        R = [(rng.random((seeds, n)) < p).astype(float) for _ in range(2)]
+        E = [np.where(r > 0, rng.choice(cr, r.shape), rng.choice(cf, r.shape)) for r in R]
+        rr_diffs.append(float((R[0].mean(0) - R[1].mean(0)).sum() / n))
+        for i, ratio in enumerate(ratios):
+            t = _test(W, {"R": R[0], "E": E[0] * ratio}, {"R": R[1], "E": E[1]})
+            s = t["p_one_sided"] < alpha
+            sig[i] += s
+            won[i] += s and (guard_margin is None or t["rr_diff_lower95_one_sided"] >= -guard_margin)
+    power = [{"ratio": float(r), "power": float(a / n_sim),
+              **({} if guard_margin is None else {"power_with_guard": float(b / n_sim)})}
+             for r, a, b in zip(ratios, sig, won)]
+    passing = [x["ratio"] for x in power if x["power"] >= MDE_POWER]
+    resolves = sum(n_by_repo[r] * pools[r][:, 0].mean() for r in pools)
+    se = guard_se(tasks, n_by_repo, seeds)
+    se["simulated_sd_rr_diff"] = float(np.std(rr_diffs, ddof=1)) if n_sim > 1 else None
+    return {"n_tasks": n, "n_by_repo": dict(n_by_repo), "seeds": seeds, "n_measured_tasks": len(tasks),
+            "mean_pass1": float(resolves / n), "expected_resolves_per_arm_seed": float(resolves),
+            "cost": {"n_resolved": len(cr), "n_failed": len(cf), "mean_resolved": float(cr.mean()),
+                     "mean_failed": float(cf.mean())},
+            "alpha": alpha, "n_sim": n_sim, "n_boot": n_boot, "seed": seed, "guard_margin": guard_margin,
+            "power": power, "mde_ratio_80": max(passing) if passing else None, "guard_se": se,
+            "simplifications": ["costs drawn independently of the task (conservative)",
+                                "measured s / k used as each task's true rate (slightly optimistic)"]}
