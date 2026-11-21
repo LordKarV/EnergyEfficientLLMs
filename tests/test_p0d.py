@@ -630,19 +630,30 @@ def test_kl_mean_secondary_reorders_pairs_by_kl_mean():
     primary = did_test(rows, pairs=pairs, n_boot=500)
     out = did_kl_mean(rows, same, n_boot=500)
     assert out["n_pairs_reordered"] == 0 and out["per_task"] == primary["per_task"] and out["order"] == "kl_mean"
-    # kl_mean ranks t0-t9 the other way round; t10 ties and keeps the smaller attempt_id ("t10-hi") as low.
+    # kl_mean ranks t0-t9 the other way round; t10 ties, so it drops out and is counted (no attempt_id tie-break).
     swapped = [{**p, "low_kl_mean": 0.3 if i < 10 else 0.1, "high_kl_mean": 0.1 if i <= 10 else 0.2}
                for i, p in enumerate(same)]
     out = did_kl_mean(rows, swapped, n_boot=500)
-    assert out["pairs_reordered"] == sorted(f"t{i}" for i in range(11)) and out["n_tasks"] == 30
+    assert out["pairs_reordered"] == sorted(f"t{i}" for i in range(10)) and out["n_pairs_reordered"] == 10
+    assert (out["pairs_tied"], out["n_pairs_tied"], out["n_tasks"], out["n_pairs_frozen"]) == (["t10"], 1, 29, 30)
+    assert out["secondary"] and out["n_pairs_selected"] == 29 and out["decision"] != "incomplete"
     flipped = set(out["pairs_reordered"])
-    want = {d["task_id"]: -d["did"] if d["task_id"] in flipped else d["did"] for d in primary["per_task"]}
+    want = {d["task_id"]: -d["did"] if d["task_id"] in flipped else d["did"] for d in primary["per_task"]
+            if d["task_id"] != "t10"}
     assert {d["task_id"]: d["did"] for d in out["per_task"]} == want
+    # Per-pair kl_mean values of every frozen pair, under its frozen labels.
+    assert len(out["per_pair"]) == 30
+    assert out["per_pair"][0] == {"task_id": "t0", "low": "t0-lo", "high": "t0-hi", "low_kl_mean": 0.3,
+                                  "high_kl_mean": 0.1, "kl_mean_order": "flipped"}
+    assert [p["kl_mean_order"] for p in out["per_pair"][9:12]] == ["flipped", "tied", "kept"]
+    assert out["per_pair"][11]["high_kl_mean"] == 0.2
+    with pytest.raises(ValueError, match="every frozen pair is tied"):
+        did_kl_mean(rows, [{**p, "low_kl_mean": 0.1, "high_kl_mean": 0.1} for p in pairs])
     # Covariates are low minus high, so they flip with the pair: the adjusted fit sees the negated diffs.
     diff = {p["task_id"]: p["diff"] for p in pairs}
     cov = {t: {k: -v for k, v in d.items()} if t in flipped else d for t, d in diff.items()}
     relabelled = [{**r, "prefix": {"low": "high", "high": "low"}[r["prefix"]]} if r["task_id"] in flipped else r
-                  for r in rows]
+                  for r in rows if r["task_id"] != "t10"]
     assert out["adjusted"] == did_test(relabelled, covariates=cov, n_boot=500)["adjusted"]
 
 

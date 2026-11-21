@@ -529,25 +529,37 @@ def did_q4(rows, pairs, **kw):
 
 def did_kl_mean(rows, pairs, **kw):
     """docs/04's secondary kl_mean result on the same replays: the Q3_K_M DiD with each pair's low and high
-    prefix set by kl_mean instead of the chosen score.
+    prefix set by kl_mean instead of the chosen score (owner answer on #12: relabel, report the flips
+    and the per-pair values, drop and count ties).
 
-    Order is (kl_mean, attempt_id), as in select_pairs, so ties go the same way. A reordered pair
-    swaps its runs, its rows' prefix labels and attempt ids, and the sign of its covariate diff
-    (COVARIATE_CONVENTION is low minus high). None for pairs frozen without low_kl_mean (before
-    this field existed). kw goes to did_test.
+    A pair whose high run has the lower kl_mean is flipped: it swaps its runs, its rows' prefix labels
+    and attempt ids, and the sign of its covariate diff (COVARIATE_CONVENTION is low minus high). A
+    pair tied on kl_mean has no kl_mean order, so it and its rows leave the test and are counted; no
+    attempt_id tie-break. per_pair gives both kl_mean values of every frozen pair, under its frozen
+    labels. None for pairs frozen without low_kl_mean (before this field existed). kw goes to did_test.
     """
     if any("low_kl_mean" not in p for p in pairs):
         return None
-    flipped = {p["task_id"] for p in pairs if (p["high_kl_mean"], p["high"]) < (p["low_kl_mean"], p["low"])}
+    order = {p["task_id"]: "tied" if p["low_kl_mean"] == p["high_kl_mean"]
+             else "flipped" if p["high_kl_mean"] < p["low_kl_mean"] else "kept" for p in pairs}
+    flipped = {t for t, o in order.items() if o == "flipped"}
+    tied = sorted(t for t, o in order.items() if o == "tied")
+    if len(tied) == len(pairs):
+        raise ValueError("every frozen pair is tied on kl_mean")
     swap = {"low": "high", "high": "low"}
     new_pairs = [{**p, "low": p["high"], "high": p["low"], "low_kl_mean": p["high_kl_mean"],
                   "high_kl_mean": p["low_kl_mean"], "diff": {k: -v for k, v in p["diff"].items()}}
-                 if p["task_id"] in flipped else p for p in pairs]
+                 if p["task_id"] in flipped else p for p in pairs if p["task_id"] not in tied]
     new_rows = [{**r, "prefix": swap.get(r.get("prefix"), r.get("prefix")), "low_attempt_id": r.get("high_attempt_id"),
-                 "high_attempt_id": r.get("low_attempt_id")} if r.get("task_id") in flipped else r for r in rows]
+                 "high_attempt_id": r.get("low_attempt_id")} if r.get("task_id") in flipped else r
+                for r in rows if r.get("task_id") not in tied]
     out = did_test(new_rows, pairs=new_pairs, **kw)
-    return {**out, "secondary": True, "order": "kl_mean", "n_pairs_reordered": len(flipped),
-            "pairs_reordered": sorted(flipped)}
+    return {**out, "secondary": True, "order": "kl_mean", "n_pairs_frozen": len(pairs),
+            "n_pairs_reordered": len(flipped), "pairs_reordered": sorted(flipped),
+            "n_pairs_tied": len(tied), "pairs_tied": tied,
+            "per_pair": [{"task_id": p["task_id"], "low": p["low"], "high": p["high"],
+                          "low_kl_mean": p["low_kl_mean"], "high_kl_mean": p["high_kl_mean"],
+                          "kl_mean_order": order[p["task_id"]]} for p in pairs]}
 
 
 def power(p_bf16, p_q3, n_tasks, seeds, effects=(MIN_EFFECT,), n_sim=1000, n_boot=2000, alpha=0.05, seed=0,

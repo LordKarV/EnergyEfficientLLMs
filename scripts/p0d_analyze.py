@@ -20,8 +20,9 @@ rows are {task_id, prefix, profile, replay_valid, low_attempt_id, high_attempt_i
 attempts}; the two ids must be the frozen pair's runs, and a replay_valid false row needs no results.
 It also writes docs/04's secondary results, which never change the decision: did_q4.json, the same
 test on the Q4_K_M continuation rows (when there are any), and did_kl_mean.json, the Q3_K_M test with
-each pair's low and high prefix set by kl_mean. All three files are removed before the test runs,
-so each one left in --out-dir comes from this run's continuations. A secondary that cannot be
+each pair's low and high prefix set by kl_mean (it counts the pairs that flip, drops and counts the
+pairs tied on kl_mean, and lists both kl_mean values of every pair). All three files are removed
+before the test runs, so each one left in --out-dir comes from this run's continuations. A secondary that cannot be
 computed from them (no Q4_K_M rows, a pair with Q4_K_M rows on one prefix only, or pairs frozen
 without kl_mean) is not written, the reason is printed, and the other files are still written.
 """
