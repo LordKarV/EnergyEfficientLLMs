@@ -105,6 +105,9 @@ def summarize(stats, decision, command=None, halves=None):
     maps a name to a mask of scored tokens (turn parity in P0b) and gets the three candidate scores
     per half for split-half reliability. The decision mask is computed over the whole run first, so
     each half scores the same positions the full-run score uses.
+
+    entropy_decision is the mean BF16 entropy over the decision positions, the P0d DiD covariate
+    (docs/04: "differences in BF16 entropy at decision positions"); entropy_mean is the whole-run mean.
     """
     kl = stats["kl"]
     n = len(kl)
@@ -124,6 +127,7 @@ def summarize(stats, decision, command=None, halves=None):
         "kl_sum_all": float(kl.sum()),
         "flip_rate": mean(stats["flip"]),
         "entropy_mean": mean(stats["entropy_p"]),
+        "entropy_decision": mean(stats["entropy_p"][decision]),
         "nll_p_mean": mean(stats["nll_p"]),
         "nll_q_mean": mean(stats["nll_q"]),
     }
