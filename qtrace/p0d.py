@@ -28,6 +28,9 @@ CONFOUNDS = ("turns", "output_tokens", "est_joules_q4", "entropy_bf16")
 COVARIATES = ("entropy", "turns", "malformed")
 MAX_ABS_RHO, MIN_SPLIT_HALF, MIN_AGREEMENT, MIN_RUNS = 0.8, 0.5, 0.5, 3
 MIN_EFFECT = 0.10
+SMALL_SAMPLE = 50  # docs/04's "fewer than about 50 qualify"
+SMALL_SAMPLE_NOTE = ("fewer than 50 tasks: the task bootstrap is liberal here (a null false-positive rate of about "
+                     "0.066-0.071 at 10 tasks in the owner's review of PR #12), and the upper bound shares this")
 # Means of 3- to 5-run task rhos sit on a lattice that contains 0.8, 0.5 and 1/3, and float sums land
 # them a few ulps to either side (rhos -1/2, 1, 1 average to 0.49999999999999994). The lattice spacing
 # is far above this, so the tolerance moves only those float errors.
@@ -353,18 +356,27 @@ def _continuation_cells(rows, profile):
 def _adjusted(did, cov):
     """OLS of per-task DiD on the covariate differences; the adjusted estimate is the intercept.
 
-    A covariate that is 0 for every pair carries no information and leaves the intercept unchanged,
-    so it is dropped and listed; any other rank deficiency leaves the estimate undefined.
+    Covariates enter in COVARIATES order, and one that does not raise the design's rank is dropped and
+    named in `dropped` with its reason: constant over the pairs (all zero, or a non-zero constant the
+    intercept absorbs) or collinear with the columns before it. The estimate is then not adjusted for
+    it. With no more tasks than coefficients the fit has no residual and the estimate is None.
     """
     x = np.array([[cov_t[k] for k in COVARIATES] for cov_t in cov], dtype=float)
-    keep = [i for i in range(len(COVARIATES)) if np.any(x[:, i] != 0)]
-    design = np.column_stack([np.ones(len(did)), x[:, keep]])
-    out = {"dropped_all_zero": [COVARIATES[i] for i in range(len(COVARIATES)) if i not in keep],
-           "convention": COVARIATE_CONVENTION}
-    if len(did) <= design.shape[1] or np.linalg.matrix_rank(design) < design.shape[1]:
-        return {**out, "estimate": None, "reason": f"{len(did)} tasks cannot identify {design.shape[1]} coefficients"}
+    design, kept, dropped = np.ones((len(did), 1)), [], {}
+    for i, k in enumerate(COVARIATES):
+        trial = np.column_stack([design, x[:, i]])
+        if np.linalg.matrix_rank(trial) > design.shape[1]:
+            design, kept = trial, kept + [k]
+        elif np.ptp(x[:, i]) == 0:
+            dropped[k] = f"constant ({x[0, i]:g}) over the pairs, so the intercept absorbs it"
+        else:
+            dropped[k] = "collinear with the intercept and the covariates before it"
+    out = {"dropped": dropped, "convention": COVARIATE_CONVENTION}
+    if len(did) <= design.shape[1]:
+        return {**out, "estimate": None,
+                "reason": f"{len(did)} tasks leave no residual degrees of freedom for {design.shape[1]} coefficients"}
     beta = np.linalg.lstsq(design, did, rcond=None)[0]
-    return {**out, "estimate": float(beta[0]), "coef": {COVARIATES[i]: float(b) for i, b in zip(keep, beta[1:])}}
+    return {**out, "estimate": float(beta[0]), "coef": {k: float(b) for k, b in zip(kept, beta[1:])}}
 
 
 def did_test(rows, covariates=None, profile=PROBE, n_boot=5000, seed=0, alpha=0.05, min_effect=MIN_EFFECT):
@@ -413,6 +425,7 @@ def did_test(rows, covariates=None, profile=PROBE, n_boot=5000, seed=0, alpha=0.
             "pair_drop_rate": len(invalid) / len(tasks), "rows_ignored_by_profile": ignored,
             "did_mean": mean, "p_one_sided": p, "upper95_one_sided": upper,
             "upper95_definition": UPPER_BOUND_DEFINITION, "adjusted": adjusted, "alpha": alpha,
+            "small_sample_note": SMALL_SAMPLE_NOTE if len(kept) < SMALL_SAMPLE else None,
             "min_effect": min_effect, "pass_rule": pass_rule, "fail_rule": fail_rule, "decision": decision,
             "n_boot": n_boot, "seed": seed, "per_task": [{"task_id": t, "did": float(d)} for t, d in zip(kept, did)]}
 

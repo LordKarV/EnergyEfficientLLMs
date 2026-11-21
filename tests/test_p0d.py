@@ -436,10 +436,34 @@ def test_adjustment_removes_a_planted_confound():
     confounded = did_test(exact_rows({t: 0.15 * x for t, x in turns.items()}), cov)
     assert confounded["did_mean"] > 0.12 and confounded["p_one_sided"] < 0.05
     assert abs(confounded["adjusted"]["estimate"]) < 0.01
-    assert confounded["adjusted"]["dropped_all_zero"] == ["malformed"]
+    assert list(confounded["adjusted"]["dropped"]) == ["malformed"]
     assert confounded["decision"] == "inconclusive"
     real = did_test(exact_rows({t: 0.2 + 0.1 * x for t, x in turns.items()}), cov)
     assert abs(real["adjusted"]["estimate"] - 0.2) < 0.01 and real["decision"] == "pass"
+
+
+def test_adjustment_drops_constant_and_collinear_covariates():
+    # A real effect at p = 0 with turns constant at 2 and malformed a multiple of entropy: both are dropped and
+    # named, and the estimate exists, so the decision is not "inconclusive" for want of an adjustment.
+    rng = np.random.default_rng(4)
+    tasks = [f"t{i}" for i in range(30)]
+    cov = {}
+    for t in tasks:
+        e = float(rng.normal())
+        cov[t] = {"entropy": e, "turns": 2, "malformed": 3 * e}
+    out = did_test(exact_rows({t: 0.3 for t in tasks}), cov)
+    adj = out["adjusted"]
+    assert set(adj["dropped"]) == {"turns", "malformed"} and "constant" in adj["dropped"]["turns"]
+    assert "collinear" in adj["dropped"]["malformed"] and set(adj["coef"]) == {"entropy"}
+    assert abs(adj["estimate"] - 0.3) < 1e-9 and out["p_one_sided"] == 0 and out["decision"] == "pass"
+    few = did_test(exact_rows({t: 0.3 for t in tasks[:4]}), {t: noise_covariates(4)[f"t{i}"] for i, t in
+                                                             enumerate(tasks[:4])})
+    assert few["adjusted"]["estimate"] is None and "degrees of freedom" in few["adjusted"]["reason"]
+
+
+def test_did_reports_the_liberal_bootstrap_below_50_tasks():
+    assert "liberal" in did_test(did_rows(20, 4, 0.6, 0.4))["small_sample_note"]
+    assert did_test(did_rows(50, 4, 0.6, 0.4))["small_sample_note"] is None
 
 
 def test_did_drops_invalid_replays_and_validates_rows():
