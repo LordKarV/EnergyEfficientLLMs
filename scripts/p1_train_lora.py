@@ -100,6 +100,7 @@ def main(argv=None):
 
     device = args.device or pick_device()
     dtype = torch.float32 if device == "cpu" else torch.bfloat16
+    sft.base_f32_tensors(model_path)  # the save_merged check, run before the GPU hours instead of after them
     none_w = idle_reading()  # before the model is loaded: nothing resident, the whole_run baseline
     # Whole-run window, closed after the save. Not a with-block: it would re-indent the whole run; on an exception
     # no train_meta.json is written, so an unclosed meter loses nothing.
