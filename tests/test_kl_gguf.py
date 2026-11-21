@@ -199,6 +199,24 @@ def test_tiny_bad_job_exits_1_and_names_it(tiny):
                                                           for e in (good, bad)])
 
 
+def test_tiny_bad_token_fails_before_any_job_is_scored(tiny, tmp_path):
+    # The helper writes each job's output as it finishes, so an output for job 0 means it was scored
+    # before the bad id in job 1 was seen (PR #11 review minor 4: fail in seconds, not after the batch).
+    good, bad = episode(vocab=VOCAB), episode(vocab=VOCAB)
+    bad["input_ids"][0, 5] = VOCAB
+    lines = []
+    for i, e in enumerate((good, bad)):
+        ids, idx = kl_gguf.check_run(i, e["input_ids"], logit_index(e["model_mask"]))
+        ids.tofile(tmp_path / f"{i}.tok")
+        idx.tofile(tmp_path / f"{i}.idx")
+        lines.append(f"{tmp_path / f'{i}.tok'} {tmp_path / f'{i}.idx'} {tmp_path / f'{i}.out'}\n")
+    (tmp_path / "jobs.txt").write_text("".join(lines))
+    r = subprocess.run([tiny["bin"], "--cpu", tiny["p"], tiny["q"], str(tmp_path / "jobs.txt")], capture_output=True,
+                       text=True, check=False)
+    assert r.returncode == 1 and "job 1: token id 320 is outside the vocabulary" in r.stderr
+    assert not (tmp_path / "0.out").exists()
+
+
 def test_tiny_different_vocabularies_fail(tiny):
     e = episode(vocab=VOCAB)
     with pytest.raises(RuntimeError, match="different vocabularies: token"):
