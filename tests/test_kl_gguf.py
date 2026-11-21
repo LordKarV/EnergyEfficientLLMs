@@ -371,8 +371,9 @@ def test_check_script_runs_on_the_tiny_models(tiny, tmp_path):
     np.savez(ep, input_ids=e["input_ids"][0].numpy(), model_mask=e["model_mask"].numpy())
     row = check.main([str(ep), "--hf", tiny["p"].removesuffix(".gguf"), "--kl-score", tiny["bin"], "--gguf-bf16",
                       tiny["p"], "--gguf-q4", tiny["q"], "--device", "cpu", "--top-k", "16",
-                      "--out", str(tmp_path / "row.json")])
+                      "--machine", "test box", "--out", str(tmp_path / "row.json")])
     assert row["n_scored"] == len(logit_index(e["model_mask"])) and len(row["pass"]) == 10
+    assert row["machine_label"] == "test box"
     assert row["noise_floor_kl"]["n_positions"] == len(row["noise_floor_positions"]) == 128
     # The script loads HF in bf16 against f32 GGUFs, so only the noise floor is checked: top-1 agreement
     # is low on a tiny model's near-tied logits.
