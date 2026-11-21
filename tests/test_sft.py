@@ -15,7 +15,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 import yaml
-from test_probe import tiny_qwen35
+from test_probe import plant_update, tiny_qwen35
 
 from qtrace import sft
 
@@ -247,6 +247,33 @@ def test_inputs_are_validated_at_the_boundary(tmp_path):
         sft.attach(tiny_qwen35(), {**TRAIN, "targets": TARGETS + ["in_proj_a"]}, 0)
 
 
+def test_save_merged_writes_the_exact_f32_merge_not_the_bf16_one(tmp_path):
+    import copy
+
+    from safetensors.torch import load_file
+
+    model = sft.attach(tiny_qwen35().to(torch.bfloat16), TRAIN, 0)  # bf16 base, as trained on the GPU
+    plant_update(model, 1e-3)  # a small update: about half of it is below half a bf16 step
+    expected, lora = {}, set()
+    for name, mod in model.named_modules():
+        if "default" in getattr(mod, "lora_A", {}):
+            key = name.removeprefix("base_model.model.") + ".weight"
+            a, b = mod.lora_A["default"].weight.float(), mod.lora_B["default"].weight.float()
+            expected[key] = mod.base_layer.weight.float() + mod.scaling["default"] * (b @ a)
+            lora.add(key)
+    expected.update({k: v.float() for k, v in model.get_base_model().state_dict().items() if k not in expected})
+    bf16_merge = copy.deepcopy(model).merge_and_unload().state_dict()
+
+    sft.save_merged(model, tmp_path / "merged")
+    saved = load_file(tmp_path / "merged" / "model.safetensors")
+    assert {v.dtype for v in saved.values()} == {torch.float32}
+    assert json.loads((tmp_path / "merged" / "config.json").read_text())["dtype"] == "float32"
+    assert lora <= set(saved) and set(saved) <= set(expected)
+    assert all(torch.equal(saved[k], expected[k]) for k in saved)  # bit-exact in f32
+    differ = [k for k in lora if not torch.equal(saved[k], bf16_merge[k].float())]
+    assert sorted(differ) == sorted(lora)
+
+
 def load_script():
     spec = importlib.util.spec_from_file_location("p1_train_lora", os.path.join(ROOT, "scripts", "p1_train_lora.py"))
     module = importlib.util.module_from_spec(spec)
@@ -292,11 +319,15 @@ def test_script_end_to_end_writes_logs_meta_and_a_merged_model(tmp_path):
     assert meta["truncated_supervised_share"] == 0.0 and meta["loss_norm"] == 32
     assert meta["targets"] == TARGETS and meta["include_gates"] is False and meta["model"] == str(ckpt)
     assert set(meta["kernels"]["in_use"]) == {"chunk_gated_delta_rule", "causal_conv1d_fn"}
+    assert meta["merged_dtype"] == "float32" and meta["update_size"]["modules"] == 4 * 3 + 3 * 3 + 1 * 4
+    assert set(meta["update_size"]["by_type"]) == set(TARGETS)  # measured on the adapter, before the merge
+    assert 0 < meta["update_size"]["carried_bf16"] <= 1.05
 
     base = AutoModelForCausalLM.from_pretrained(ckpt).state_dict()
     merged_model = AutoModelForCausalLM.from_pretrained(run / "merged")
     merged = merged_model.state_dict()
     assert merged_model.config.architectures == ["Qwen3_5ForCausalLM"]
+    assert merged_model.config.dtype == torch.float32
     assert not any("lora" in k for k in merged)
     assert not torch.equal(base["model.layers.0.linear_attn.in_proj_qkv.weight"],
                            merged["model.layers.0.linear_attn.in_proj_qkv.weight"])
@@ -320,3 +351,40 @@ def test_kernel_guard_refuses_slow_kernels_without_the_flag(tmp_path, monkeypatc
     with pytest.raises(SystemExit, match="allow-slow-kernels"):
         script.main(["--config", str(cfg_path), "--arm", "fewest_turns", "--seed", "0", "--device", "cpu"])
     assert not (tmp_path / "runs").exists()
+
+
+def test_train_meta_records_the_training_loop_cost(tmp_path, monkeypatch):
+    cfg_path, _ = write_setup(tmp_path)
+    script = load_script()
+    spans = []
+
+    class FakeMeter:
+        """Stands in for the NVML meter and notes which steps ran inside its block."""
+
+        def __enter__(self):
+            spans.append("enter")
+            self.joules, self.seconds = None, None
+            return self
+
+        def __exit__(self, *exc):
+            spans.append("exit")
+            self.joules, self.seconds = 5400.0, 7.2
+            return False
+
+    real_train = script.sft.train
+    monkeypatch.setattr(script, "EnergyMeter", FakeMeter)
+    monkeypatch.setattr(script.sft, "train", lambda *a, **k: spans.append("train") or real_train(*a, **k))
+    script.main(["--config", str(cfg_path), "--arm", "fewest_turns", "--seed", "0", "--allow-slow-kernels",
+                 "--device", "cpu"])
+    meta = json.loads((tmp_path / "runs" / "fewest_turns_seed0" / "train_meta.json").read_text())
+    assert spans == ["enter", "train", "exit"]
+    assert meta["wall_seconds"] == 7.2 and meta["gpu_joules"] == 5400.0 and meta["gpu_hours"] is None
+
+
+def test_train_meta_cost_off_cuda_is_wall_time_and_null_joules(tmp_path, monkeypatch):
+    cfg_path, _ = write_setup(tmp_path)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    load_script().main(["--config", str(cfg_path), "--arm", "fewest_turns", "--seed", "0", "--allow-slow-kernels",
+                        "--device", "cpu"])
+    meta = json.loads((tmp_path / "runs" / "fewest_turns_seed0" / "train_meta.json").read_text())
+    assert meta["wall_seconds"] > 0 and meta["gpu_joules"] is None and meta["gpu_hours"] is None

@@ -171,6 +171,20 @@ def attach(model, train_cfg, seed):
     return model
 
 
+def save_merged(model, out_dir):
+    """Fold W <- W + scaling * B @ A in float32 on the CPU and save the plain model in F32 to out_dir.
+
+    A bf16 merge rounds away the part of the update below half a bf16 step, about half of it at
+    ||dW||/||W|| = 1e-3 (issue #1, the owner's round trip), and every GGUF profile built from that file
+    inherits the loss. In f32 each saved weight is exactly W.float() + scaling * B.float() @ A.float().
+    The LoRA model is moved to the CPU in f32 in place (the GPU never holds an f32 copy); config.json
+    records dtype float32. About 16 GB on disk for the 4B. Returns the merged model.
+    """
+    merged = model.to(device="cpu", dtype=torch.float32).merge_and_unload()
+    merged.save_pretrained(out_dir)
+    return merged
+
+
 def episode_loss(model, example, loss_norm, chunk=2048):
     """Summed cross-entropy over the episode's model-written tokens divided by loss_norm (chunked logits)."""
     device = next(model.parameters()).device

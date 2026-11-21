@@ -11,6 +11,7 @@ import inspect
 import math
 import time
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
@@ -65,6 +66,43 @@ def attach_lora(model, include_gates=False, r=16, alpha=32, grad_ckpt=True, targ
         model.enable_input_require_grads()
     config = LoraConfig(r=r, lora_alpha=alpha, lora_dropout=0.0, target_modules=targets, task_type="CAUSAL_LM")
     return get_peft_model(model, config)
+
+
+def _share(num, den):
+    return num / den if den > 0 else None
+
+
+def lora_update_size(model, adapter="default"):
+    """Size of the trained LoRA update per adapted module, and how much of it a bf16 file would keep.
+
+    For each module, dW = scaling * B @ A in float32 and rel = ||dW||_F / ||W||_F, summarized by module
+    type (the last name part: q_proj, in_proj_qkv, out_proj, ...) as median, p10 and p90 (numpy's linear
+    percentiles). carried_bf16 = <bf16(W + dW) - bf16(W), dW> / ||dW||^2: 1 when a bf16 merge keeps the
+    whole update, 0 when it rounds back to W. With a bf16 base bf16(W) is W itself, so this is the share
+    the owner's round trip measured (issue #1); aggregates are the ratio of sums over modules, so a
+    module weighs by ||dW||^2. Works one module at a time in f32 on the module's device, with no full
+    model copy. carried_bf16 is None when the update is exactly zero (an untrained adapter).
+    """
+    by_type = {}
+    with torch.no_grad():
+        for name, mod in model.named_modules():
+            if adapter not in getattr(mod, "lora_A", {}):
+                continue
+            w = mod.base_layer.weight.float()
+            dw = mod.scaling[adapter] * (mod.lora_B[adapter].weight.float() @ mod.lora_A[adapter].weight.float())
+            kept = (w + dw).bfloat16().float() - w.bfloat16().float()
+            t = by_type.setdefault(name.rsplit(".", 1)[-1], {"rel": [], "num": 0.0, "den": 0.0})
+            t["rel"].append(float(dw.norm() / w.norm()))
+            t["num"] += float((kept * dw).sum())
+            t["den"] += float((dw * dw).sum())
+    out = {}
+    for kind, t in sorted(by_type.items()):
+        p10, p50, p90 = np.percentile(t["rel"], [10, 50, 90])
+        out[kind] = {"modules": len(t["rel"]), "rel_median": float(p50), "rel_p10": float(p10),
+                     "rel_p90": float(p90), "carried_bf16": _share(t["num"], t["den"])}
+    return {"modules": sum(t["modules"] for t in out.values()),
+            "carried_bf16": _share(sum(t["num"] for t in by_type.values()), sum(t["den"] for t in by_type.values())),
+            "by_type": out}
 
 
 def supervised_mask(length, frac, period=2048):
@@ -143,6 +181,7 @@ def probe_length(model, length, steps, device, vocab_size, seed=0, lr=1e-4, supe
     opt = torch.optim.AdamW(params, lr=lr)
     record = {"length": length, "steps": steps, "device": device, "loss_path": loss_path,
               "supervised_frac": supervised_frac, "n_supervised": int(sup.sum()), "chunk": chunk}
+    done = 0
     try:
         times, loss, grad_norm = [], float("nan"), 0.0
         for step in range(steps + 1):
@@ -156,6 +195,7 @@ def probe_length(model, length, steps, device, vocab_size, seed=0, lr=1e-4, supe
             loss.backward()
             grad_norm = float(torch.norm(torch.stack([p.grad.float().norm() for p in params if p.grad is not None])))
             opt.step()
+            done += 1
             _sync(device)
             if step > 0:  # step 0 is warm-up (kernel compilation, allocator growth)
                 times.append(time.perf_counter() - start)
@@ -168,4 +208,5 @@ def probe_length(model, length, steps, device, vocab_size, seed=0, lr=1e-4, supe
         record.update(status="oom", mem_gib=mem, mem_kind=kind)
     finally:
         opt.zero_grad(set_to_none=True)
+    record["optimizer_steps"] = done  # warm-up included: every step moves the adapter
     return record

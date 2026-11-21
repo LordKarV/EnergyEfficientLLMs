@@ -1,6 +1,7 @@
 """Tests for the training probe on a tiny Qwen3.5. Run:  python -m pytest tests/test_probe.py -q"""
 
 import importlib.util
+import inspect
 import json
 import os
 import sys
@@ -10,14 +11,19 @@ sys.path.insert(0, ROOT)
 
 import pytest
 import torch
+import yaml
 
+from qtrace.common import load_config
 from qtrace.probe import (
+    ATTENTION_TARGETS,
     DELTANET_TARGETS,
     GATE_TARGETS,
+    MLP_TARGETS,
     attach_lora,
     chunked_ce_loss,
     kernel_paths,
     kernel_status,
+    lora_update_size,
     probe_length,
     supervised_mask,
 )
@@ -102,6 +108,18 @@ def test_kernel_paths_report_what_transformers_resolved():
         assert not paths["causal_conv1d_fn"]["fast"]
 
 
+P1_CONFIG = os.path.join(ROOT, "configs", "p1_train.yaml")
+
+
+def test_p1_config_and_probe_defaults_agree():
+    # attach_lora's defaults are the lists the probe module documents; P1 must train the same adapter.
+    tr = load_config(P1_CONFIG)["train"]
+    defaults = inspect.signature(attach_lora).parameters
+    assert tr["targets"] == ATTENTION_TARGETS + MLP_TARGETS + DELTANET_TARGETS
+    assert tr["lora_r"] == defaults["r"].default and tr["lora_alpha"] == defaults["alpha"].default
+    assert tr["include_gates"] is defaults["include_gates"].default
+
+
 def load_script():
     path = os.path.join(ROOT, "scripts", "p0_training_probe.py")
     spec = importlib.util.spec_from_file_location("p0_training_probe", path)
@@ -120,7 +138,7 @@ def test_script_refuses_importable_kernels_that_are_not_in_use(tmp_path, monkeyp
     monkeypatch.setattr(script, "kernel_paths", lambda: SLOW_IN_USE)
     out = tmp_path / "probe.jsonl"
     with pytest.raises(SystemExit, match="allow-slow-kernels"):
-        script.main(["--model", str(tmp_path / "no_model"), "--out", str(out)])
+        script.main(["--model", str(tmp_path / "no_model"), "--config", P1_CONFIG, "--out", str(out)])
     assert not out.exists()
 
 
@@ -131,7 +149,97 @@ def test_script_records_kernels_in_use_in_every_row(tmp_path, monkeypatch):
     monkeypatch.setattr(torch.backends.mps, "is_available", lambda: False)
     out = tmp_path / "probe.jsonl"
     load_script().main(["--model", str(ckpt), "--lengths", "48", "64", "--steps", "1", "--chunk", "16",
-                        "--supervised-frac", "0.5", "--allow-slow-kernels", "--out", str(out)])
+                        "--supervised-frac", "0.5", "--allow-slow-kernels", "--config", P1_CONFIG, "--out", str(out)])
     rows = [json.loads(line) for line in out.read_text().splitlines()]
     assert len(rows) == 2 and all(r["status"] == "ok" for r in rows)
     assert all(r["kernels"] == {"in_use": kernel_paths(), "importable": kernel_status()} for r in rows)
+
+
+def test_script_trains_and_records_the_config_lora(tmp_path, monkeypatch):
+    ckpt = tmp_path / "ckpt"
+    tiny_qwen35().save_pretrained(ckpt)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: False)
+    cfg = tmp_path / "p1_train.yaml"
+    cfg.write_text(yaml.safe_dump({"train": {"targets": ["q_proj", "in_proj_qkv"], "include_gates": False,
+                                             "lora_r": 4, "lora_alpha": 8}}))
+    script = load_script()
+    seen, real = [], script.probe_length
+
+    def spy(model, *args, **kwargs):
+        names = {n.split(".lora_A.")[0].rsplit(".", 1)[-1] for n, _ in model.named_parameters() if ".lora_A." in n}
+        seen.append((names, model.peft_config["default"].r, model.peft_config["default"].lora_alpha))
+        return real(model, *args, **kwargs)
+
+    monkeypatch.setattr(script, "probe_length", spy)
+    out = tmp_path / "probe.jsonl"
+    base = ["--model", str(ckpt), "--lengths", "48", "--steps", "1", "--chunk", "16", "--supervised-frac", "0.5",
+            "--allow-slow-kernels", "--config", str(cfg), "--out", str(out)]
+    script.main(base)
+    script.main(base + ["--include-gates"])
+    assert seen == [({"q_proj", "in_proj_qkv"}, 4, 8), ({"q_proj", "in_proj_qkv", *GATE_TARGETS}, 4, 8)]
+    rows = [json.loads(line) for line in out.read_text().splitlines()]
+    assert [r["include_gates"] for r in rows] == [False, True]
+    assert all(r["targets"] == ["q_proj", "in_proj_qkv"] and r["lora_r"] == 4 and r["lora_alpha"] == 8
+               and r["config"] == str(cfg) for r in rows)
+
+
+def plant_update(model, rel, seed=0):
+    """Set every LoRA B so each module's scaling * B @ A has ||.||_F / ||W||_F = rel (the owner's plant, issue #1)."""
+    g = torch.Generator().manual_seed(seed)
+    with torch.no_grad():
+        for mod in model.modules():
+            if "default" not in getattr(mod, "lora_A", {}):
+                continue
+            a, b, s = mod.lora_A["default"].weight, mod.lora_B["default"].weight, mod.scaling["default"]
+            bn = torch.randn(b.shape, generator=g)
+            c = rel * mod.base_layer.weight.float().norm() / (s * (bn @ a.float())).norm()
+            b.copy_((bn * c).to(b.dtype))
+
+
+def test_lora_update_size_gives_back_a_planted_size_by_module_type():
+    torch.manual_seed(0)
+    model = attach_lora(tiny_qwen35().to(torch.bfloat16), include_gates=True, grad_ckpt=False)
+    assert lora_update_size(model)["carried_bf16"] is None  # B = 0 at init: no update yet
+    plant_update(model, 3e-3)
+    size = lora_update_size(model)
+    kinds = set(ATTENTION_TARGETS + MLP_TARGETS + DELTANET_TARGETS + GATE_TARGETS)
+    assert set(size["by_type"]) == kinds
+    assert size["modules"] == sum(t["modules"] for t in size["by_type"].values()) == 4 * 3 + 3 * 5 + 1 * 4
+    for t in size["by_type"].values():  # B is stored in bf16, so the planted size holds to its rounding
+        assert t["rel_p10"] == pytest.approx(3e-3, rel=1e-2) and t["rel_p90"] == pytest.approx(3e-3, rel=1e-2)
+        assert t["rel_p10"] <= t["rel_median"] <= t["rel_p90"]
+
+
+def test_lora_update_size_carried_share_is_near_0_below_half_a_bf16_step_and_near_1_above():
+    torch.manual_seed(0)
+    model = attach_lora(tiny_qwen35().to(torch.bfloat16), include_gates=False, grad_ckpt=False)
+    plant_update(model, 1e-5)  # far below half a bf16 step (2**-9 of each weight): rounds back to W
+    small = lora_update_size(model)
+    plant_update(model, 1e-3)  # the owner's round trip kept 0.52 of a 1e-3 update in the BF16 file
+    mid = lora_update_size(model)
+    plant_update(model, 1e-1)
+    large = lora_update_size(model)
+    assert small["carried_bf16"] < 0.05 and 0.4 < mid["carried_bf16"] < 0.65 and large["carried_bf16"] > 0.99
+    assert all(t["carried_bf16"] < 0.1 for t in small["by_type"].values())
+    assert all(t["carried_bf16"] > 0.98 for t in large["by_type"].values())
+
+
+def test_script_reports_the_update_size_after_each_row(tmp_path, monkeypatch):
+    ckpt = tmp_path / "ckpt"
+    tiny_qwen35().save_pretrained(ckpt)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: False)
+    out = tmp_path / "probe.jsonl"
+    load_script().main(["--model", str(ckpt), "--lengths", "48", "64", "--steps", "1", "--chunk", "16",
+                        "--supervised-frac", "0.5", "--allow-slow-kernels", "--config", P1_CONFIG, "--out", str(out)])
+    rows = [json.loads(line) for line in out.read_text().splitlines()]
+    assert [r["optimizer_steps"] for r in rows] == [2, 2] and [r["adapter_steps"] for r in rows] == [2, 4]
+    for r in rows:
+        size = r["update_size"]
+        assert set(size["by_type"]) == set(ATTENTION_TARGETS + MLP_TARGETS + DELTANET_TARGETS)
+        assert 0 <= size["carried_bf16"] <= 1.05
+        assert all(t["rel_median"] > 0 for t in size["by_type"].values())
+    # the adapter keeps training across rows, so the update grows
+    q = [r["update_size"]["by_type"]["q_proj"]["rel_median"] for r in rows]
+    assert q[1] > q[0]
