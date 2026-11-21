@@ -15,15 +15,18 @@ Training cost (docs/03, Metrics; owner answer on #15): train_meta.json's trainin
 whole_run (model load + train + merge + save, the primary, since break-even counts everything needed to produce
 the deployed model) and train_loop (sft.train alone, secondary). Each has wall_seconds, gpu_hours (null on CPU),
 gpu_joules (the NVML energy counter of GPU gpu_index, qtrace.energy.EnergyMeter, raw, idle draw included, GPU only)
-and gpu_joules_idle_subtracted (gpu_joules minus idle_watts times wall_seconds). idle_watts is read once before
-the run (qtrace.energy.measure_idle_watts over idle_seconds). Without a CUDA device NVML is not read: the joules
-and idle_watts are null and null_reason says why.
+and gpu_joules_idle_subtracted (gpu_joules minus the idle draw times wall_seconds). training_cost.idle has two
+idle readings (qtrace.energy.measure_idle_watts over window_s, each after settle_s of settling, as on the inference
+side): none_w before the model is loaded, subtracted from whole_run, and loaded_w with the model and adapter on the
+GPU before step 1, subtracted from train_loop (owner review on #15). Without a CUDA device NVML is not read: the
+joules and both readings are null and null_reason says why.
 """
 
 import argparse
 import json
 import os
 import sys
+import time
 
 import torch
 
@@ -36,8 +39,17 @@ from qtrace.models import pick_device
 from qtrace.probe import kernel_paths, kernel_status, lora_update_size
 
 GPU_INDEX = 0  # the g6e.16xlarge has one GPU (owner answer on #15); recorded so the record says which was metered
-IDLE_SECONDS = 10.0
+IDLE_WINDOW_S = 10.0
+IDLE_SETTLE_S = 45.0  # GPU power states lag process start and model load (docs/04's energy sub-run settle)
 NO_NVML = "torch sees no CUDA device, so the NVML energy counter was not read"
+
+
+def idle_reading():
+    """Average idle GPU watts after settling; None without CUDA (no wait then, nothing to read)."""
+    if not torch.cuda.is_available():
+        return None
+    time.sleep(IDLE_SETTLE_S)
+    return measure_idle_watts(IDLE_WINDOW_S, GPU_INDEX)
 
 
 def window_cost(meter, idle_watts, on_gpu):
@@ -88,7 +100,7 @@ def main(argv=None):
 
     device = args.device or pick_device()
     dtype = torch.float32 if device == "cpu" else torch.bfloat16
-    idle_watts = measure_idle_watts(IDLE_SECONDS, GPU_INDEX)  # before the model is loaded, so the GPU is idle
+    none_w = idle_reading()  # before the model is loaded: nothing resident, the whole_run baseline
     # Whole-run window, closed after the save. Not a with-block: it would re-indent the whole run; on an exception
     # no train_meta.json is written, so an unclosed meter loses nothing.
     run_meter = EnergyMeter(GPU_INDEX).__enter__()
@@ -101,6 +113,7 @@ def main(argv=None):
     model = sft.attach(model, tr, args.seed)
     model.print_trainable_parameters()
 
+    loaded_w = idle_reading()  # weights, adapter and CUDA context resident, before step 1: the train_loop baseline
     os.makedirs(run_dir, exist_ok=True)
     with open(os.path.join(run_dir, "loss.jsonl"), "w") as f:
         def log(rec):
@@ -135,10 +148,11 @@ def main(argv=None):
         "lora_alpha": tr["lora_alpha"], "kernels": kernels, "model": model_path, "device": device,
         "dtype": str(dtype), "merged": merged_dir, "merged_dtype": "float32", "update_size": update_size,
         "training_cost": {
-            "primary": "whole_run", "gpu_index": GPU_INDEX, "idle_watts": idle_watts, "idle_seconds": IDLE_SECONDS,
+            "primary": "whole_run", "gpu_index": GPU_INDEX,
+            "idle": {"none_w": none_w, "loaded_w": loaded_w, "settle_s": IDLE_SETTLE_S, "window_s": IDLE_WINDOW_S},
             "null_reason": None if run_meter.joules is not None else NO_NVML,
-            "whole_run": window_cost(run_meter, idle_watts, on_gpu),
-            "train_loop": window_cost(meter, idle_watts, on_gpu)},
+            "whole_run": window_cost(run_meter, none_w, on_gpu),
+            "train_loop": window_cost(meter, loaded_w, on_gpu)},
     }
     with open(os.path.join(run_dir, "train_meta.json"), "w") as f:
         json.dump(meta, f, indent=2)

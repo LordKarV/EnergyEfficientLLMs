@@ -378,31 +378,35 @@ def test_train_meta_records_whole_run_and_training_loop_cost(tmp_path, monkeypat
             self.joules, self.seconds = readings[self.n]
             return False
 
-    def fake_idle(seconds, gpu_index):
-        spans.append(("idle", seconds, gpu_index))
-        return 50.0
+    idle = iter([50.0, 80.0])  # empty GPU, then loaded
+
+    def fake_idle():
+        spans.append("idle")
+        return next(idle)
 
     def note(label, fn):
         return lambda *a, **k: spans.append(label) or fn(*a, **k)
 
     monkeypatch.setattr(script, "EnergyMeter", FakeMeter)
-    monkeypatch.setattr(script, "measure_idle_watts", fake_idle)
+    monkeypatch.setattr(script, "idle_reading", fake_idle)
     monkeypatch.setattr(script.sft, "train", note("train", script.sft.train))
+    monkeypatch.setattr(script.sft, "attach", note("attach", script.sft.attach))
     monkeypatch.setattr(script.sft, "save_merged", note("save", script.sft.save_merged))
     monkeypatch.setattr(AutoModelForCausalLM, "from_pretrained", note("load", AutoModelForCausalLM.from_pretrained))
     script.main(["--config", str(cfg_path), "--arm", "fewest_turns", "--seed", "0", "--allow-slow-kernels",
                  "--device", "cpu"])
     meta = json.loads((tmp_path / "runs" / "fewest_turns_seed0" / "train_meta.json").read_text())
-    # idle first, then the whole run spans load, train, merge and save; the loop window spans train only
-    assert spans == [("idle", script.IDLE_SECONDS, 0), "enter0", "load", "enter1", "train", "exit1", "save", "exit0"]
+    # empty-GPU idle first, then the whole run spans load, train, merge and save; the loaded idle reading comes
+    # after the adapter is attached and before the loop window, which spans train only
+    assert spans == ["idle", "enter0", "load", "attach", "idle", "enter1", "train", "exit1", "save", "exit0"]
     assert [m.gpu_index for m in meters] == [0, 0]
     cost = meta["training_cost"]
     assert cost["primary"] == "whole_run" and cost["gpu_index"] == 0 and cost["null_reason"] is None
-    assert cost["idle_watts"] == 50.0 and cost["idle_seconds"] == script.IDLE_SECONDS
+    assert cost["idle"] == {"none_w": 50.0, "loaded_w": 80.0, "settle_s": 45.0, "window_s": 10.0}
     assert cost["whole_run"] == {"wall_seconds": 20.0, "gpu_hours": None, "gpu_joules": 9000.0,
                                  "gpu_joules_idle_subtracted": 9000.0 - 50.0 * 20.0}
     assert cost["train_loop"] == {"wall_seconds": 7.2, "gpu_hours": None, "gpu_joules": 5400.0,
-                                  "gpu_joules_idle_subtracted": pytest.approx(5400.0 - 50.0 * 7.2)}
+                                  "gpu_joules_idle_subtracted": pytest.approx(5400.0 - 80.0 * 7.2)}
 
 
 def test_window_cost_gpu_hours_on_gpu_and_null_subtraction_without_idle():
@@ -416,6 +420,19 @@ def test_window_cost_gpu_hours_on_gpu_and_null_subtraction_without_idle():
     assert script.window_cost(Meter, None, True)["gpu_joules_idle_subtracted"] is None
 
 
+def test_idle_reading_settles_then_reads_and_is_null_without_cuda(monkeypatch):
+    script = load_script()
+    calls = []
+    monkeypatch.setattr(script.time, "sleep", lambda s: calls.append(("sleep", s)))
+    monkeypatch.setattr(script, "measure_idle_watts", lambda s, i: calls.append(("read", s, i)) or 61.5)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    assert script.idle_reading() == 61.5
+    assert calls == [("sleep", script.IDLE_SETTLE_S), ("read", script.IDLE_WINDOW_S, 0)]
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    calls.clear()
+    assert script.idle_reading() is None and calls == []
+
+
 def test_train_meta_cost_off_cuda_is_wall_time_and_null_joules_with_a_reason(tmp_path, monkeypatch):
     cfg_path, _ = write_setup(tmp_path)
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
@@ -423,7 +440,7 @@ def test_train_meta_cost_off_cuda_is_wall_time_and_null_joules_with_a_reason(tmp
     script.main(["--config", str(cfg_path), "--arm", "fewest_turns", "--seed", "0", "--allow-slow-kernels",
                  "--device", "cpu"])
     cost = json.loads((tmp_path / "runs" / "fewest_turns_seed0" / "train_meta.json").read_text())["training_cost"]
-    assert cost["idle_watts"] is None and cost["null_reason"] == script.NO_NVML and cost["gpu_index"] == 0
+    assert cost["idle"]["none_w"] is None and cost["idle"]["loaded_w"] is None and cost["null_reason"] == script.NO_NVML and cost["gpu_index"] == 0
     for window in ("whole_run", "train_loop"):
         assert cost[window]["wall_seconds"] > 0 and cost[window]["gpu_hours"] is None
         assert cost[window]["gpu_joules"] is None and cost[window]["gpu_joules_idle_subtracted"] is None
