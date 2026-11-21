@@ -8,7 +8,8 @@ Run on the box:
 Token-matched rerun (docs/04, Training), stopping once the supervised tokens of another run are reached:
     python scripts/p1_train_lora.py --arm qtrace --seed 0 --match-supervised-tokens <its supervised_tokens_seen>
 Writes outputs/runs/<arm>_seed<s>[_tokmatch<N>]/: loss.jsonl, train_meta.json and merged/ (model and
-tokenizer, the input of the GGUF round trip).
+tokenizer, the input of the GGUF round trip). With fake_quant.enabled in the config (the random_fq baseline,
+qtrace/fake_quant.py) the run is named <arm>_fq, so --arm random writes outputs/runs/random_fq_seed<s>/.
 """
 
 import argparse
@@ -20,7 +21,7 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from qtrace import sft
+from qtrace import fake_quant, sft
 from qtrace.common import load_config
 from qtrace.models import pick_device
 from qtrace.probe import kernel_paths, kernel_status
@@ -50,6 +51,12 @@ def main(argv=None):
     args = ap.parse_args(argv)
     cfg = load_config(args.config)
     tr, model_path = cfg["train"], cfg["model"]["path"]
+    fq_cfg = cfg.get("fake_quant") or {}
+    table = None
+    if fq_cfg.get("enabled"):  # random_fq baseline (docs/04): read the table before the model, to fail fast
+        if not fq_cfg.get("table"):
+            raise ValueError("fake_quant.enabled needs fake_quant.table (the Q4_K_M GGUF or a JSON type table)")
+        table = fake_quant.load_table(fq_cfg["table"])
     kernels = check_kernels(args.allow_slow_kernels)
 
     from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -61,7 +68,8 @@ def main(argv=None):
                           match_tokens=args.match_supervised_tokens)
     warmup = round(tr["warmup_ratio"] * len(plan))
     suffix = "" if args.match_supervised_tokens is None else f"_tokmatch{args.match_supervised_tokens}"
-    run_dir = os.path.join(cfg["paths"]["runs_dir"], f"{args.arm}_seed{args.seed}{suffix}")
+    name = args.arm if table is None else f"{args.arm}_fq"
+    run_dir = os.path.join(cfg["paths"]["runs_dir"], f"{name}_seed{args.seed}{suffix}")
     print(f"{len(examples)} runs, {len(plan)} steps, {report}")
 
     device = args.device or pick_device()
@@ -74,6 +82,7 @@ def main(argv=None):
         raise ValueError(f"token id {top} is outside the model's vocabulary ({model.config.vocab_size})")
     model = sft.attach(model, tr, args.seed)
     model.print_trainable_parameters()
+    fq_summary = None if table is None else {"table": fq_cfg["table"], **fake_quant.apply(model, table)}
 
     os.makedirs(run_dir, exist_ok=True)
     with open(os.path.join(run_dir, "loss.jsonl"), "w") as f:
@@ -100,7 +109,7 @@ def main(argv=None):
         "learning_rate": tr["learning_rate"], "warmup_steps": warmup, "grad_clip": sft.GRAD_CLIP,
         "targets": list(tr["targets"]), "include_gates": tr["include_gates"], "lora_r": tr["lora_r"],
         "lora_alpha": tr["lora_alpha"], "kernels": kernels, "model": model_path, "device": device,
-        "dtype": str(dtype), "merged": merged_dir,
+        "dtype": str(dtype), "merged": merged_dir, "fake_quant": fq_summary,
     }
     with open(os.path.join(run_dir, "train_meta.json"), "w") as f:
         json.dump(meta, f, indent=2)

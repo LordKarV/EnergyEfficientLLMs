@@ -20,6 +20,11 @@ train:
   max_tokens: null               # null = no truncation; else cut at the last turn boundary at or before it
   chunk: 2048                    # positions per logits chunk in the loss
 
+# random_fq baseline (docs/04; qtrace/fake_quant.py): on only for that run, with --arm random (writes random_fq_seed<s>)
+fake_quant:
+  enabled: false
+  table: null                    # the stock Q4_K_M GGUF of the base model, or JSON {gguf_tensor_name: ggml_type_name}
+
 paths:
   arms_dir: outputs/arms
   runs_dir: outputs/runs
