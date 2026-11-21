@@ -10,15 +10,25 @@
    "--outfile",
    "<BF16.gguf>"
   ],
+  "F32": [
+   "python",
+   "convert_hf_to_gguf.py",
+   "<hf_dir>",
+   "--outtype",
+   "f32",
+   "--no-mtp",
+   "--outfile",
+   "<F32.gguf>"
+  ],
   "Q3_K_M": [
    "llama-quantize",
-   "<BF16.gguf>",
+   "<F32.gguf>",
    "<out.gguf>",
    "Q3_K_M"
   ],
   "Q4_K_M": [
    "llama-quantize",
-   "<BF16.gguf>",
+   "<F32.gguf>",
    "<out.gguf>",
    "Q4_K_M"
   ],
@@ -26,20 +36,20 @@
    "llama-quantize",
    "--tensor-type",
    "ssm_beta_alpha=q8_0",
-   "<BF16.gguf>",
+   "<F32.gguf>",
    "<out.gguf>",
    "Q4_K_M"
   ],
   "Q8_0": [
    "llama-quantize",
-   "<BF16.gguf>",
+   "<F32.gguf>",
    "<out.gguf>",
    "Q8_0"
   ]
  },
  "llama_cpp_commit": "b1b770d90d94cad9e9ea5b993bdbc383a522fb28",
  "model": "Qwen/Qwen3.5-4B (text only, MTP dropped)",
- "note": "Tensor types depend only on tensor names and shapes, not on values, so each table holds for base and for every arm. Computed from the 4B round trip's merged_0.001 files. Select a table with profiles[record.profile]. Per-file GGUF hashes are in each record's profile_file_sha256.",
+ "note": "Tensor types depend only on tensor names and shapes, not on values, so each table holds for base and for every arm. Computed from the 4B round trip's merged_0.001 files. Select a table with profiles[record.profile]. Per-file GGUF hashes are in each record's profile_file_sha256. Always quantize from the F32 GGUF; a BF16 source rounds away small fine-tuning updates (issue #1). BF16 (and F16 if chosen) is its own conversion from <hf_dir>. argv F32 is the quantize source only, not a profile.",
  "profiles": {
   "BF16": {
    "blk.0.attn_norm.weight": {
