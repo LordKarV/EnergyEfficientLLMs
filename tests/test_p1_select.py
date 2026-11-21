@@ -17,7 +17,8 @@ from qtrace.p1_select import ARMS, STABILITY_ARMS, avg_ranks, halves, overlap, p
 
 MAL = ("misnested_tag", "wrong_name", "text_after_call", "truncated_call", "no_call_no_answer")
 RUN = {"task": "t", "turns": 5, "out": 100, "kl": 0.1, "ent": 1.0, "j": 1000.0, "mal": None, "resolved": True,
-       "profile": "BF16", "lst": "pool200", "touched": False, "end": "submitted"}
+       "profile": "BF16", "lst": "pool200", "touched": False, "end": "submitted",
+       "unc": None, "cac": None}
 _ids = iter(range(10**9))
 
 
@@ -32,7 +33,8 @@ def att(r, aid):
             "seed": 1, "sampler": {"temperature": 0.6}, "concurrency": 16, "resolved": r["resolved"],
             "grading": grading, "end_reason": r["end"], "turns": r["turns"], "tool_calls": r["turns"],
             "repairs": 0, "malformed": {**dict.fromkeys(MAL, 0), **(r["mal"] or {})},
-            "tokens": {"output": out, "input_uncached": 10 * out, "input_cached": 50 * out,
+            "tokens": {"output": out, "input_uncached": 10 * out if r["unc"] is None else r["unc"],
+                       "input_cached": 50 * out if r["cac"] is None else r["cac"],
                        "server_reported_cached": 50 * out},
             "per_turn": [], "gen_seconds": 1.0, "tool_seconds": 1.0, "wall_seconds": 2.0,
             "container_cpu_seconds": 1.0,
@@ -308,7 +310,8 @@ def test_adding_a_task_leaves_every_other_pick_unchanged():
     choice, model = {"chosen": "kl_decision"}, {"fewest_joules_fallback": False}
     small, _ = select(a1, s1, choice, model, j1, min_candidates=2)
     big, _ = select(a2[:6] + a1 + a2[6:], s1 + s2, choice, model, j1 + j2, min_candidates=2)
-    for arm in ARMS:
+    assert set(small) == set(big)
+    for arm in small:
         for seed in (0, 1, 2):
             new = picked(big, arm, seed)
             assert {t: new[t] for t in picked(small, arm, seed)} == picked(small, arm, seed), (arm, seed)
@@ -345,14 +348,14 @@ def test_joules_without_the_energy_model_is_an_error():
 def test_chosen_null_drops_the_stability_arms_and_says_h3_is_negative():
     runs = random_pool(["t1", "t2"])
     picks, summary = go(runs, chosen=None)
-    assert set(picks) == set(ARMS) - STABILITY_ARMS
+    assert set(picks) == set(ARMS) - STABILITY_ARMS - {"fewest_joules"}  # merged by P0b's overlap rule
     assert "answered negatively" in summary["h3"]
     assert all(r["score_name"] is None and r["score"] is None for r in picks["random"][0])
     assert picks["low_entropy"][0][0]["entropy_mean"] is not None
     picks, summary = go(runs, chosen=None, score_override="kl_mean")
-    assert set(picks) == set(ARMS) and summary["score"] == {"file_present": True, "file_chosen": None,
-                                                            "file_decided": True, "override": "kl_mean",
-                                                            "used": "kl_mean"}
+    assert set(picks) == set(ARMS) - {"fewest_joules"}
+    assert summary["score"] == {"file_present": True, "file_chosen": None, "file_decided": True, "override": "kl_mean",
+                                "used": "kl_mean"}
 
 
 def test_undecided_null_choice_is_an_error_not_a_negative_h3():
@@ -368,12 +371,12 @@ def test_undecided_null_choice_is_an_error_not_a_negative_h3():
     with pytest.raises(ValueError, match="undecided.*est_joules_q4 did not run"):
         run(undecided)
     picks, summary = run(undecided, score_override="kl_mean")
-    assert set(picks) == set(ARMS) and summary["score"]["file_decided"] is False
+    assert set(picks) == set(ARMS) - {"fewest_joules"} and summary["score"]["file_decided"] is False
     assert "not answered" in summary["h3"] and "answered negatively" not in summary["h3"]
     picks, summary = run(undecided, arms=sorted(set(ARMS) - STABILITY_ARMS))
     assert "answered negatively" not in summary["h3"]
     picks, summary = run({**undecided, "decided": True, "verdict": "none passed"})
-    assert set(picks) == set(ARMS) - STABILITY_ARMS and "answered negatively" in summary["h3"]
+    assert set(picks) == set(ARMS) - STABILITY_ARMS - {"fewest_joules"} and "answered negatively" in summary["h3"]
     with pytest.raises(ValueError, match="decided"):
         run({**undecided, "decided": "no"})
 
@@ -404,7 +407,7 @@ def test_a_missing_join_fails_only_for_the_arms_that_need_it():
     with pytest.raises(ValueError, match="stable needs score.*low_entropy needs entropy_mean"):
         go(runs)
     assert set(go(runs, arms=["random", "fewest_turns", "fewest_joules", "clean_format"])[0]) == {
-        "random", "fewest_turns", "fewest_joules", "clean_format"}
+        "random", "fewest_turns", "clean_format"}  # equal joules: P0b's overlap rule merges fewest_joules
     attempts, scores, joules = make([{"task": "t"}, {"task": "t"}])
     scores[1]["kl_decision"] = None  # the row exists, but the chosen score is null
     model = {"fewest_joules_fallback": False}
@@ -412,7 +415,7 @@ def test_a_missing_join_fails_only_for_the_arms_that_need_it():
         select(attempts, scores, {"chosen": "kl_decision"}, model, joules, min_candidates=2)
     picks, _ = select(attempts, scores, {"chosen": "kl_decision"}, model, joules, min_candidates=2,
                       arms=sorted(set(ARMS) - STABILITY_ARMS))
-    assert set(picks) == set(ARMS) - STABILITY_ARMS
+    assert set(picks) == set(ARMS) - STABILITY_ARMS - {"fewest_joules"}
     runs = [{"task": "t"}, {"task": "t", "j": None}]
     with pytest.raises(ValueError, match="fewest_joules.*est_joules_q4"):
         go(runs)
@@ -489,7 +492,7 @@ def test_bad_input_fails_with_a_message_naming_the_problem():
 
 # Summary and overlap.
 
-def test_overlap_table_flags_pairs_above_85_percent():
+def test_overlap_table_flags_pairs_at_or_above_85_percent():
     def rows(ids):
         return [{"task_id": f"t{i}", "attempt_id": x} for i, x in enumerate(ids)]
 
@@ -497,14 +500,68 @@ def test_overlap_table_flags_pairs_above_85_percent():
     b = rows(["x"] * 17 + ["y"] * 3)
     c = rows(["x"] * 18 + ["y"] * 2)
     pairs = {tuple(p["arms"]): p for p in overlap({"a": a, "b": b, "c": c})}
-    assert pairs[("a", "b")] == {"arms": ["a", "b"], "share_same": 0.85, "not_separable": False}
+    assert pairs[("a", "b")] == {"arms": ["a", "b"], "share_same": 0.85, "not_separable": True}  # "at least 85%"
     assert pairs[("a", "c")]["share_same"] == 0.9 and pairs[("a", "c")]["not_separable"] is True
+    assert overlap({"a": a, "d": rows(["x"] * 16 + ["y"] * 4)})[0]["not_separable"] is False
     assert pairs[("b", "c")]["share_same"] == 0.95
 
 
+def test_arm_overlap_rule_ranks_turns_tokens_joules_and_both_hero_costs():
+    # t1: turns picks r1 (300 J), output tokens r3 (200 J), joules r2 (100 J); HERO total tokens
+    # (6100, 4100, 12050) picks r2 and HERO API price (1900, 4400, 4100) picks r1. t2 agrees everywhere.
+    runs = [{"task": "t1", "turns": 2, "out": 100, "unc": 1000, "cac": 5000, "j": 300.0},
+            {"task": "t1", "turns": 5, "out": 100, "unc": 4000, "cac": 0, "j": 100.0},
+            {"task": "t1", "turns": 6, "out": 50, "unc": 3000, "cac": 9000, "j": 200.0},
+            {"task": "t2", "turns": 1, "out": 10, "unc": 10, "cac": 10, "j": 50.0},
+            {"task": "t2", "turns": 9, "out": 90, "unc": 90, "cac": 90, "j": 90.0}]
+    picks, summary = go(runs)
+    rule = summary["arm_overlap_rule"]
+    s0 = rule["by_seed"]["0"]
+    assert s0["median_joule_regret"] == {"turns": 1.0, "output_tokens": 0.5, "joules": 0.0, "hero_total_tokens": 0.0,
+                                         "hero_api_price": 1.0}
+    same = {tuple(p["arms"]): p["share_same"] for p in s0["pairs"]}
+    assert same[("turns", "joules")] == 0.5 and same[("turns", "hero_api_price")] == 1.0
+    assert same[("joules", "hero_total_tokens")] == 1.0 and same[("joules", "hero_api_price")] == 0.5
+    assert s0["merge_fewest_joules"] is False and s0["calibrated_token_mix"] is False
+    assert rule["merged"] is False and rule["note"].startswith("separate") and "fewest_joules" in picks
+    assert rule["threshold"] == 0.85 and rule["regret_threshold"] == 0.05
+
+
+def test_arm_overlap_rule_merges_fewest_joules_on_low_regret_for_every_seed():
+    # fewest_turns never picks the cheapest run, but costs only 3% more: below docs/04's 5%, so merged.
+    runs = [r for i in range(4) for r in ({"task": f"t{i}", "turns": 2, "j": 103.0},
+                                          {"task": f"t{i}", "turns": 4, "j": 100.0})]
+    picks, summary = go(runs, seeds=(0, 1))
+    rule = summary["arm_overlap_rule"]
+    for s in ("0", "1"):
+        same = {tuple(p["arms"]): p["share_same"] for p in rule["by_seed"][s]["pairs"]}
+        assert same[("turns", "joules")] == 0.0
+        assert rule["by_seed"][s]["median_joule_regret"]["turns"] == pytest.approx(0.03)
+        assert rule["by_seed"][s]["merge_fewest_joules"] is True
+    assert rule["merged"] is True and "not built for any seed" in rule["note"]
+    assert "fewest_joules" not in picks and "fewest_joules" not in summary["arms_built"]
+    assert "fewest_turns" in picks
+    # At 6% the arms stay separate.
+    picks, summary = go([{**r, "j": 106.0} if r["j"] == 103.0 else r for r in runs])
+    assert summary["arm_overlap_rule"]["merged"] is False and "fewest_joules" in picks
+
+
+def test_arm_overlap_rule_is_not_applied_under_the_energy_fallback_or_without_joules():
+    runs = [{"task": "t"}, {"task": "t"}]  # equal joules: the rule would merge
+    picks, summary = go(runs, fallback=True)
+    assert summary["arm_overlap_rule"]["merged"] is False and "fewest_joules" in picks
+    assert summary["arm_overlap_rule"]["note"].startswith("not applied")
+    assert summary["arm_overlap_rule"]["by_seed"]["0"]["merge_fewest_joules"] is True
+    picks, summary = go(runs, energy=False)
+    assert summary["arm_overlap_rule"]["by_seed"] is None and "fewest_joules" in picks
+    assert summary["arm_overlap_rule"]["note"] == "not computed: 2 candidate(s) lack est_joules_q4"
+    with pytest.raises(ValueError, match="minimum est_joules_q4 is 0.0"):
+        go([{"task": "t", "j": 0.0}, {"task": "t"}])
+
+
 def test_summary_reports_chance_rate_means_and_every_arm_pair():
-    runs = [{"task": "a", "turns": 2, "out": 10, "kl": 0.4, "j": 4.0},
-            {"task": "a", "turns": 6, "out": 30, "kl": 0.2, "j": 8.0}]
+    runs = [{"task": "a", "turns": 2, "out": 10, "kl": 0.4, "j": 8.0},
+            {"task": "a", "turns": 6, "out": 30, "kl": 0.2, "j": 4.0}]
     runs += [{"task": "b", "turns": t, "out": 20, "kl": k, "j": 2.0 * t}
              for t, k in ((4, 0.3), (5, 0.1), (7, 0.5), (8, 0.6))]
     _, summary = go(runs, seeds=(0, 1))
@@ -512,7 +569,7 @@ def test_summary_reports_chance_rate_means_and_every_arm_pair():
     assert summary["overlap"]["threshold"] == 0.85
     assert len(summary["overlap"]["by_seed"]["1"]) == len(ARMS) * (len(ARMS) - 1) // 2
     ft = summary["arms"]["fewest_turns"]["0"]
-    assert ft == {"n_tasks": 2, "mean_turns": 3.0, "mean_output_tokens": 15.0, "mean_est_joules_q4": 6.0,
+    assert ft == {"n_tasks": 2, "mean_turns": 3.0, "mean_output_tokens": 15.0, "mean_est_joules_q4": 8.0,
                   "mean_score": pytest.approx(0.35)}
     assert summary["arms"]["stable"]["1"]["mean_score"] == pytest.approx(0.15)
     assert summary["pool"]["n_tasks"] == 2 and summary["pool"]["n_candidates"] == 6
@@ -523,7 +580,8 @@ def test_summary_reports_chance_rate_means_and_every_arm_pair():
 def test_rows_have_the_agreed_keys():
     picks, _ = go([{"task": "t"}, {"task": "t"}])
     assert set(picks["qtrace"][0][0]) == {"arm", "seed", "task_id", "attempt_id", "episode_path", "turns",
-                                          "output_tokens", "est_joules_q4", "score_name", "score", "entropy_mean",
+                                          "output_tokens", "input_uncached", "input_cached", "est_joules_q4",
+                                          "score_name", "score", "entropy_mean",
                                           "malformed_total"}
     assert picks["qtrace"][0][0]["arm"] == "qtrace" and picks["qtrace"][0][0]["seed"] == 0
 
@@ -581,6 +639,7 @@ def test_script_writes_arm_files_and_summary(tmp_path):
     assert summary["fewest_joules"]["picks_as"] == "fewest_turns"
     assert summary["inputs"]["est_joules"]["present"] is False and summary["pool_runs"] == ["run-p0b"]
     assert "removed stale stable_seed7.jsonl" in res.stdout and "fewest_turns" in res.stdout
+    assert "P0b fewest_joules/fewest_turns rule: not computed" in res.stdout
     cfg["pool_runs"] = []
     (tmp_path / "cfg.yaml").write_text(yaml.safe_dump(cfg))
     res = run_script(tmp_path / "cfg.yaml")

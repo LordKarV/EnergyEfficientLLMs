@@ -9,12 +9,17 @@ task, so arms differ only in which run. Exact ties go to a draw from random.Rand
 over the candidates in attempt_id order, so a pick depends only on that task's candidates and the seed,
 never on input order or on which other tasks are in the pool. Joined values (P0d scores, P0a joule
 estimates) are checked only for the arms that rank by them; a gap there is an error, never a silent skip.
+
+summary.json also carries docs/04 P0b's arm-overlap rule (arm_overlap_rule), and select applies it: when
+fewest_joules and fewest_turns pick the same run in at least 85% of tasks, or fewest_turns' median joule
+regret is below 5%, in any seed, fewest_joules is not built for any seed.
 """
 
 import itertools
 import math
 import os
 import random
+import statistics
 from collections import Counter, defaultdict
 from fractions import Fraction
 
@@ -28,7 +33,14 @@ HELDOUT_LISTS = frozenset({"heldout100", "verified100", "inrepo_test"})
 MALFORMED = ("misnested_tag", "wrong_name", "text_after_call", "truncated_call", "no_call_no_answer")
 PROBE = "Q3_K_M"
 COST_FIELD = {"turns": "turns", "joules": "est_joules_q4"}
-NOT_SEPARABLE = 0.85
+NOT_SEPARABLE = 0.85  # inclusive: docs/04 says "at least 85%"
+REGRET_MERGE = 0.05  # strict: fewest_turns' median joule regret "below 5%" merges it with fewest_joules
+# docs/04 P0b's arm-overlap rankings. turns and joules are exactly the fewest_turns and fewest_joules rules; the
+# HERO ones are its reward cost (total tokens) and its API price (uncached + 0.1 x cached + 4 x output tokens).
+RANKINGS = ("turns", "output_tokens", "joules", "hero_total_tokens", "hero_api_price")
+RANK_KEY = {"output_tokens": lambda c: c["output_tokens"],
+            "hero_total_tokens": lambda c: c["input_uncached"] + c["input_cached"] + c["output_tokens"],
+            "hero_api_price": lambda c: c["input_uncached"] + Fraction(c["input_cached"]) / 10 + 4 * c["output_tokens"]}
 
 
 def need(rec, *keys):
@@ -157,6 +169,8 @@ def candidate(r, score_row, est_joules, score_name):
     return {"task_id": task, "attempt_id": aid, "episode_path": path,
             "turns": number(need(r, "turns"), f"attempt {aid!r} turns"),
             "output_tokens": number(need(r, "tokens", "output"), f"attempt {aid!r} tokens.output"),
+            "input_uncached": number(need(r, "tokens", "input_uncached"), f"attempt {aid!r} tokens.input_uncached"),
+            "input_cached": number(need(r, "tokens", "input_cached"), f"attempt {aid!r} tokens.input_cached"),
             "est_joules_q4": number(est_joules, f"attempt {aid!r} est_joules_q4"),
             "score": number(row.get(score_name), f"attempt {aid!r} {score_name}") if score_name else None,
             "entropy_mean": number(row.get("entropy_mean"), f"attempt {aid!r} entropy_mean"),
@@ -312,15 +326,74 @@ def arm_stats(rows):
 def overlap(picks, threshold=NOT_SEPARABLE):
     """Share of tasks where two arms pick the same run, for every pair of arms built for one seed.
 
-    picks: arm -> rows. A pair above threshold is "not separable" (docs/04, P0b): training both arms would
-    test nothing, so their hypothesis is reported as untestable.
+    picks: arm -> rows. A pair at or above threshold is "not separable" (docs/04, P0b): training both arms
+    would test nothing, so their hypothesis is reported as untestable.
     """
     pairs = []
     for a, b in itertools.combinations(picks, 2):
         chosen = {r["task_id"]: r["attempt_id"] for r in picks[a]}
         same = sum(chosen[r["task_id"]] == r["attempt_id"] for r in picks[b]) / len(picks[b])
-        pairs.append({"arms": [a, b], "share_same": same, "not_separable": same > threshold})
+        pairs.append({"arms": [a, b], "share_same": same, "not_separable": same >= threshold})
     return pairs
+
+
+def rank_pick(cands, name, seed, task_id):
+    """One RANKINGS entry's pick among one task's candidates; ties go to random.Random(f"{seed}:{name}:{task_id}")."""
+    if name in ("turns", "joules"):
+        return pick(cands, f"fewest_{name}", seed, task_id)
+    rng = random.Random(f"{seed}:{name}:{task_id}")
+    return lowest(sorted(cands, key=lambda c: c["attempt_id"]), RANK_KEY[name], rng)
+
+
+def joule_regret(c, cands):
+    """est_joules_q4 of the pick over the task's minimum, minus 1."""
+    low = min(x["est_joules_q4"] for x in cands)
+    if low <= 0:
+        raise ValueError(f"task {c['task_id']!r}: minimum est_joules_q4 is {low}, so joule regret is undefined")
+    return c["est_joules_q4"] / low - 1
+
+
+def arm_overlap_rule(by_task, seed):
+    """docs/04 P0b's arm-overlap table and fewest_joules/fewest_turns decision for one seed.
+
+    Every candidate needs est_joules_q4. merge_fewest_joules is true when the turns and joules rankings pick
+    the same run in at least NOT_SEPARABLE of tasks or the turns pick's median joule regret is below
+    REGRET_MERGE. calibrated_token_mix is true when joules and HERO's API price agree in at least
+    NOT_SEPARABLE of tasks: the selection cost is then described as a calibrated token-mix cost.
+    """
+    rows = {n: [rank_pick(by_task[t], n, seed, t) for t in sorted(by_task)] for n in RANKINGS}
+    regret = {n: statistics.median([joule_regret(c, by_task[c["task_id"]]) for c in rs]) for n, rs in rows.items()}
+    pairs = overlap(rows)
+    same = {tuple(p["arms"]): p["share_same"] for p in pairs}
+    return {"median_joule_regret": regret, "pairs": pairs,
+            "merge_fewest_joules": same[("turns", "joules")] >= NOT_SEPARABLE or regret["turns"] < REGRET_MERGE,
+            "calibrated_token_mix": same[("joules", "hero_api_price")] >= NOT_SEPARABLE}
+
+
+def overlap_rule(by_task, seeds, arms, energy):
+    """arm_overlap_rule per seed, and whether select drops fewest_joules because of it.
+
+    Not computed when a candidate lacks est_joules_q4 (check_joins already refuses that if fewest_joules
+    ranks joules). Not applied under the energy fallback, where fewest_joules already picks as fewest_turns.
+    """
+    missing = sum(c["est_joules_q4"] is None for cs in by_task.values() for c in cs)
+    if missing:
+        return {"by_seed": None, "merged": False,
+                "note": f"not computed: {missing} candidate(s) lack est_joules_q4"}
+    by_seed = {str(s): arm_overlap_rule(by_task, s) for s in seeds}
+    hit = [s for s, r in by_seed.items() if r["merge_fewest_joules"]]
+    if energy["fallback"]:
+        note = f"not applied: fewest_joules already picks as fewest_turns ({energy['reason']})"
+    elif "fewest_joules" not in arms or "fewest_turns" not in arms:
+        note = "not applied: select.arms does not ask for both fewest_joules and fewest_turns"
+    elif hit:
+        note = (f"merged: in seed(s) {', '.join(hit)} fewest_joules and fewest_turns pick the same run in at least "
+                f"{NOT_SEPARABLE:.0%} of tasks or fewest_turns' median joule regret is below {REGRET_MERGE:.0%}, so "
+                "their hypothesis is untestable; fewest_joules is not built for any seed and fewest_turns stands "
+                "for both")
+    else:
+        note = "separate: fewest_joules and fewest_turns are both built"
+    return {"by_seed": by_seed, "merged": note.startswith("merged"), "note": note}
 
 
 def h3_note(score):
@@ -349,7 +422,8 @@ def select(attempts, scores=None, score_choice=None, energy_model=None, est_joul
     was answered negatively and the stability arms are not built (score_override still builds them, and
     is recorded; an undecided null is an error, see score_info); with no joule estimates, or with
     fewest_joules_fallback set, fewest_joules picks exactly as fewest_turns (same rule and same RNG stream).
-    cost "joules" is an error in both energy cases.
+    cost "joules" is an error in both energy cases. Otherwise docs/04 P0b's overlap rule can drop
+    fewest_joules for every seed (overlap_rule); summary["arm_overlap_rule"] says why.
     """
     check_config(pool_lists, min_candidates, alpha, cost, score_override, seeds, arms)
     score = score_info(score_choice, score_override, arms)
@@ -361,6 +435,8 @@ def select(attempts, scores=None, score_choice=None, energy_model=None, est_joul
         raise ValueError(f"no task has at least {min_candidates} candidates; dropped tasks: {pool['dropped_tasks']}")
     built = [a for a in ARMS if a in arms and (score["used"] is not None or a not in STABILITY_ARMS)]
     check_joins(by_task, built, cost, energy["fallback"])
+    decision = overlap_rule(by_task, seeds, built, energy)
+    built = [a for a in built if not (decision["merged"] and a == "fewest_joules")]
 
     picks = {}
     for arm in built:
@@ -382,5 +458,7 @@ def select(attempts, scores=None, score_choice=None, energy_model=None, est_joul
         "arms": {a: {str(s): arm_stats(rows) for s, rows in picks[a].items()} for a in built},
         "overlap": {"chance_rate": sum(1 / n for n in sizes) / len(sizes), "threshold": NOT_SEPARABLE,
                     "by_seed": {str(s): overlap({a: picks[a][s] for a in built}) for s in seeds}},
+        "arm_overlap_rule": {"rankings": list(RANKINGS), "threshold": NOT_SEPARABLE, "regret_threshold": REGRET_MERGE,
+                             **decision},
     }
     return picks, summary
