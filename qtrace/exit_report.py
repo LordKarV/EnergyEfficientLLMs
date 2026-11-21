@@ -48,6 +48,9 @@ CONTAINERS_SCENARIO = "64K x 16"
 # PR #11: one BF16 vs Q3_K_M scoring of a 16.5K-token run took about 43 s, both model loads included.
 KL_SCORING = {"machine": "M5 Pro, llama.cpp b1b770d9 Metal (PR #11)", "seconds_per_run": 43.0,
               "tokens_per_run": 16500}
+# Owner's agent on PR #7 (answer 5), pending the owner: the P0b scoring and P0a diagnostic run on EC2 if the
+# projected KL-scoring hours are under about 10 h (roughly $75), otherwise on the 48 GB Mac overnight.
+KL_EC2_MAX_H = 10.0
 # Keys of the extras JSON, agreed with the harness in issue #1 / PR #7; rates_128k_x8 is proposed (audit gap 5).
 EXTRAS = ["rates", "rates_128k_x8", "peak_gpu_gib", "energy_counter", "replay_match_rate", "sampler_echo_ok",
           "per_turn_energy_ok", "concurrency"]
@@ -365,7 +368,9 @@ def kl_hours(stats, extras):
                        "point_hours": point * pairs * bf16_tokens * per_token_h,
                        "upper_hours": upper * pairs * bf16_tokens * per_token_h}
     total = {k: sum(j[k] for j in jobs.values()) for k in ("point_hours", "upper_hours")}
-    return {**m, "jobs": jobs, "total": total}
+    pick = None if not jobs else "EC2" if total["point_hours"] < KL_EC2_MAX_H else "the 48 GB Mac overnight"
+    return {**m, "jobs": jobs, "total": total,
+            "machine_recommendation": {"threshold_h": KL_EC2_MAX_H, "hours": total["point_hours"], "recommend": pick}}
 
 
 def projections(stats, extras):
@@ -487,6 +492,12 @@ def _md_kl(kl):
     if "P0b" in kl["jobs"]:
         lines += ["", (f"P0b: {kl['jobs']['P0b']['flagged_not_scored']:.0f} flagged successful runs are not scored "
                        "(never selection candidates).")]
+    r = kl["machine_recommendation"]
+    pick = (f"at {r['hours']:.1f} h (point total, on {kl['machine']}) that is {r['recommend']}, pending the owner"
+            if r["recommend"] else "no KL job is projected yet")
+    lines += ["", (f"Machine for the P0b scoring and the P0a diagnostic (owner decision): the owner's agent recommends "
+                   f"EC2 if the projected KL-scoring hours are under about {r['threshold_h']:.0f} h, otherwise the "
+                   f"48 GB Mac overnight; {pick}. The #11 acceptance criterion is judged on that backend.")]
     return lines
 
 

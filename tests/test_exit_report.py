@@ -372,6 +372,28 @@ def test_kl_scoring_counts_unflagged_successes_and_reports_the_flagged():
     assert "P0b: 960 flagged successful runs are not scored (never selection candidates)." in md
 
 
+def test_kl_machine_line_names_the_recommendation_pending_the_owner():
+    # Owner's agent on PR #7 (answer 5): EC2 if the projected KL-scoring hours are under about 10 h, otherwise
+    # the 48 GB Mac overnight; the owner decides.
+    rows = [rec("vllm", "submitted", 0, 600), rec("llama.cpp", "submitted", 0, 600)]
+    stats = attempt_stats(rows)
+
+    def machine(seconds_per_run):
+        p = projections(stats, {"kl_scoring": {"machine": "m", "seconds_per_run": seconds_per_run,
+                                               "tokens_per_run": 16500}})
+        return p["kl_scoring"]["machine_recommendation"], render_markdown(stats, [], {}, p)
+
+    low, md = machine(1.0)
+    assert low["recommend"] == "EC2" and low["hours"] < 10 and low["threshold_h"] == 10
+    assert "the owner's agent recommends EC2 if the projected KL-scoring hours are under about 10 h" in md
+    assert f"at {low['hours']:.1f} h (point total, on m) that is EC2, pending the owner" in md
+    high, md = machine(1000.0)
+    assert high["hours"] >= 10 and high["recommend"] == "the 48 GB Mac overnight"
+    assert "that is the 48 GB Mac overnight, pending the owner" in md
+    none = projections(attempt_stats([rec("vllm", "turn_limit", 0, 600)]), {})["kl_scoring"]
+    assert none["jobs"] == {} and none["machine_recommendation"]["recommend"] is None
+
+
 def test_resolve_rates_overall_and_excluding_flagged():
     # Audit gap 8 (tripwire amendment): 2 of 4 resolve, one of them flagged; excluding it, 1 of 3.
     rows = [rec("llama.cpp", "submitted", 0, 600, touched=True), rec("llama.cpp", "submitted", 0, 600),
