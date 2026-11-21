@@ -30,7 +30,8 @@ MIN_EFFECT = 0.10
 UPPER_BOUND_DEFINITION = ("95th percentile (inverted_cdf order statistic) of the task-bootstrap means: the "
                           "one-sided 95% interval is (-inf, upper]")
 COVARIATE_CONVENTION = ("each covariate is the low-score run minus the high-score run of the task's pair, in raw "
-                        "units (BF16 entropy_mean in nats, turns, malformed calls), uncentered, so the intercept "
+                        "units (BF16 entropy_decision, the mean entropy at decision positions, in nats; turns; "
+                        "malformed calls), uncentered, so the intercept "
                         "is the DiD of a pair that does not differ in any covariate")
 
 
@@ -159,6 +160,9 @@ def join_runs(attempts, scores, est_joules=None):
         entropy = _number(_field(s, "entropy_mean", what), f"{what} entropy_mean")
         if entropy is None and any(v is not None for v in score.values()):
             raise ValueError(f"{what}: entropy_mean is null but the row has KL scores")  # kl.py nulls both together
+        entropy_dec = _number(_field(s, "entropy_decision", what), f"{what} entropy_decision")
+        if (entropy_dec is None) != (score["kl_decision"] is None):
+            raise ValueError(f"{what}: entropy_decision and kl_decision must be null together")  # same mask in kl.py
         runs.append({
             "attempt_id": aid, "task_id": a["task_id"],
             "turns": _number(_field(a, "turns", what), f"{what} turns", optional=False),
@@ -167,6 +171,7 @@ def join_runs(attempts, scores, est_joules=None):
             "malformed": _number(sum(_field(a, "malformed", what).values()), f"{what} malformed", optional=False),
             "est_joules_q4": joules.get(aid),
             "entropy_bf16": entropy,
+            "entropy_decision_bf16": entropy_dec,
             "score": score,
             "q4": _scores(q4, f"{what} {AGREEMENT_PROBE}") if q4 else None,
             "even": _scores(halves["even"], f"{what} even half") if "even" in halves else None,
@@ -277,7 +282,8 @@ def select_pairs(runs, score):
         pairs.append({"task_id": task, "low": lo["attempt_id"], "high": hi["attempt_id"],
                       "low_score": lo["score"][score], "high_score": hi["score"][score],
                       "spread": hi["score"][score] - lo["score"][score], "n_runs": len(rs),
-                      "diff": {"entropy": lo["entropy_bf16"] - hi["entropy_bf16"], "turns": lo["turns"] - hi["turns"],
+                      "diff": {"entropy": lo["entropy_decision_bf16"] - hi["entropy_decision_bf16"],
+                               "turns": lo["turns"] - hi["turns"],
                                "malformed": lo["malformed"] - hi["malformed"]}})
     spreads = [p["spread"] for p in pairs]
     summary = ({"mean": float(np.mean(spreads)), "median": float(np.median(spreads)), "min": min(spreads),

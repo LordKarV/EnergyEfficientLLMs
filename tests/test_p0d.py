@@ -55,11 +55,13 @@ def attempt(aid, task, turns=10, output=3000, malformed=0, lst="pool200", profil
             "episode_path": episode_path or f"{aid}.npz"}
 
 
-def score_row(aid, task, probe, vals, halves, entropy):
+def score_row(aid, task, probe, vals, halves, entropy, entropy_decision=None):
     """A scores.jsonl row: ids, GGUF paths and every key of qtrace.kl.score_stats."""
     return {"attempt_id": aid, "task_id": task, "probe": probe, "gguf_p": "bf16.gguf", "gguf_q": f"{probe}.gguf",
             "n_scored": 1000, "n_decision": 100, "n_command": 50, **vals, "kl_sum_decision": 1.0,
-            "kl_sum_all": 10.0, "flip_rate": 0.01, "entropy_mean": entropy, "nll_p_mean": 0.3, "nll_q_mean": 0.35,
+            "kl_sum_all": 10.0, "flip_rate": 0.01, "entropy_mean": entropy,
+            "entropy_decision": entropy if entropy_decision is None else entropy_decision,
+            "nll_p_mean": 0.3, "nll_q_mean": 0.35,
             "halves": {h: {"n_scored": 500, **halves[h]} for h in ("even", "odd")}}
 
 
@@ -285,7 +287,12 @@ def test_join_rejects_unknown_attempts_duplicates_and_bad_numbers():
         join_runs([{**attempts[0], "turns": None}] + attempts[1:], scores)
     with pytest.raises(ValueError, match="entropy_mean"):
         join_runs(attempts, [{**scores[0], "entropy_mean": None}] + scores[1:])
-    join_runs(attempts, [{**scores[0], "entropy_mean": None, **dict.fromkeys(CANDIDATES)}] + scores[1:])  # empty run
+    with pytest.raises(ValueError, match="entropy_decision"):
+        join_runs(attempts, [{**scores[0], "entropy_decision": None}] + scores[1:])
+    with pytest.raises(ValueError, match="entropy_decision"):
+        join_runs(attempts, [{k: v for k, v in scores[0].items() if k != "entropy_decision"}] + scores[1:])
+    empty = {**scores[0], "entropy_mean": None, "entropy_decision": None, **dict.fromkeys(CANDIDATES)}
+    join_runs(attempts, [empty] + scores[1:])  # an empty run nulls every mean
 
 
 # Replay pairs.
@@ -298,12 +305,13 @@ def test_pairs_take_lowest_and_highest_with_attempt_id_tie_break():
         for i, (aid, s) in enumerate(runs):
             attempts.append(attempt(aid, task, turns=10 + i, malformed=i))
             vals = {c: s for c in CANDIDATES}
-            scores.append(score_row(aid, task, "Q3_K_M", vals, {"even": vals, "odd": vals}, 1.0 + i))
+            scores.append(score_row(aid, task, "Q3_K_M", vals, {"even": vals, "odd": vals}, 1.0 + i, 3.0 * i))
     p = select_pairs(join_runs(attempts, scores)[0], "kl_decision")
     by_task = {t["task_id"]: t for t in p["tasks"]}
     assert p["n_tasks"] == 2 and p["n_tasks_one_run"] == 1
     assert (by_task["x"]["low"], by_task["x"]["high"]) == ("x-a", "x-c")
-    assert by_task["x"]["diff"] == {"entropy": -1.0, "turns": -1, "malformed": -1}  # low (i=1) minus high (i=2)
+    # low (i=1) minus high (i=2); the entropy covariate is the decision-position entropy, not entropy_mean
+    assert by_task["x"]["diff"] == {"entropy": -3.0, "turns": -1, "malformed": -1}
     assert (by_task["y"]["low"], by_task["y"]["high"]) == ("y-a", "y-b") and by_task["y"]["spread"] == 0.0
     assert p["spread"]["max"] == 0.4 and p["n_tasks_zero_spread"] == 1
 
