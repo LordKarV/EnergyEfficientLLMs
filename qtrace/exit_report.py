@@ -185,6 +185,8 @@ def _stats(rows):
     has_server = n_server_missing == 0
     server_cached = sum(r["tokens"]["server_reported_cached"] for r in rows) if has_server else 0
     ctx_share = ends.get("context_limit", 0) / m if m else None
+    successes = [r for r in scored if r["resolved"]]
+    unflagged_successes = [r for r in successes if not _flagged(r)]
     wall_share = ends.get("infra_timeout", 0) / m if m else None
     hit = tok["input_cached"] / (tok["input_cached"] + tok["input_uncached"]) if tok["input_cached"] else 0.0
     return {
@@ -219,7 +221,10 @@ def _stats(rows):
         "pilot_rates": _pilot_rates(rows),
         "sampler_check": _sampler_check(rows),
         "episode_tokens_by_profile": {p: _episode_tokens(rs) for p, rs in sorted(rows_by_profile.items())},
-        "resolved_episode_tokens": _episode_tokens([r for r in scored if r["resolved"]]),
+        # KL scoring covers unflagged successes only (owner's agent on PR #7, answer 4); flagged ones are counted.
+        "unflagged_success_share": len(unflagged_successes) / m if m else None,
+        "flagged_success_share": (len(successes) - len(unflagged_successes)) / m if m else None,
+        "unflagged_success_episode_tokens": _episode_tokens(unflagged_successes),
     }
 
 
@@ -329,8 +334,9 @@ def kl_hours(stats, extras):
     """Hours of teacher-forced KL scoring: scored runs x seconds per run on the stated machine (KL_SCORING, or
     extras["kl_scoring"]), scaled linearly by the runs' mean length over the measured run's 16.5K tokens.
 
-    - P0b: every successful P0b run (4,800 x the vLLM pilot resolve rate), BF16 vs Q3_K_M. Flagged successes
-      are counted although they are never selection candidates, which errs high.
+    - P0b: every unflagged successful P0b run (4,800 x the vLLM pilot's unflagged-success share), BF16 vs
+      Q3_K_M. Flagged successes are never selection candidates, so they are not scored (owner's agent on PR #7,
+      answer 4); flagged_not_scored counts them.
     - P0b Q4_K_M probe: the same runs, BF16 vs Q4_K_M, for P0d's Q3_K_M vs Q4_K_M probe agreement (04, P0d
       score choice). 04's P0 step 3 names only BF16 and Q3_K_M, so this is listed as its own job; it errs high
       if only tasks with 3 or more successes are scored, or if the BF16 logits are reused.
@@ -342,12 +348,14 @@ def kl_hours(stats, extras):
     per_token_h = m["seconds_per_run"] / m["tokens_per_run"] / 3600
     jobs = {}
     vllm = stats.get("vllm")
-    if vllm and vllm["resolve_rate"] and vllm["resolved_episode_tokens"]:
-        runs = P0_STEPS["P0b"][1]["BF16"][0] * vllm["resolve_rate"]
-        h = runs * vllm["resolved_episode_tokens"] * per_token_h
+    if vllm and vllm["unflagged_success_share"] and vllm["unflagged_success_episode_tokens"]:
+        n = P0_STEPS["P0b"][1]["BF16"][0]
+        runs, tokens = n * vllm["unflagged_success_share"], vllm["unflagged_success_episode_tokens"]
+        h = runs * tokens * per_token_h
         for job, probe in (("P0b", "Q3_K_M"), ("P0b Q4_K_M probe", "Q4_K_M")):
-            jobs[job] = {"what": f"successful runs, BF16 vs {probe}", "runs": runs, "pairs": 1,
-                         "tokens_per_run": vllm["resolved_episode_tokens"], "point_hours": h, "upper_hours": h}
+            jobs[job] = {"what": f"unflagged successful runs, BF16 vs {probe}", "runs": runs,
+                         "flagged_not_scored": n * vllm["flagged_success_share"], "pairs": 1,
+                         "tokens_per_run": tokens, "point_hours": h, "upper_hours": h}
     bf16_tokens = stats.get("llama.cpp", {}).get("episode_tokens_by_profile", {}).get("BF16")
     if bf16_tokens:
         point, upper = P0_STEPS["P0a"][1]["BF16"]
@@ -476,6 +484,9 @@ def _md_kl(kl):
                      f"| {j['point_hours']:.1f} | {j['upper_hours']:.1f} |")
     t = kl["total"]
     lines.append(f"| total | | | | | {t['point_hours']:.1f} | {t['upper_hours']:.1f} |")
+    if "P0b" in kl["jobs"]:
+        lines += ["", (f"P0b: {kl['jobs']['P0b']['flagged_not_scored']:.0f} flagged successful runs are not scored "
+                       "(never selection candidates).")]
     return lines
 
 

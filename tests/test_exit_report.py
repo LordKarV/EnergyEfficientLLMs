@@ -344,7 +344,7 @@ def test_kl_scoring_hours_on_the_stated_machine():
     assert abs(p0b["point_hours"] - 2400 * 43 * 4000 / 16500 / 3600) < 1e-9
     # P0d's probe agreement needs the pool scored with the Q4_K_M probe too (review of eadb97e).
     q4 = k["jobs"]["P0b Q4_K_M probe"]
-    assert q4["what"] == "successful runs, BF16 vs Q4_K_M" and q4["point_hours"] == p0b["point_hours"]
+    assert q4["what"] == "unflagged successful runs, BF16 vs Q4_K_M" and q4["point_hours"] == p0b["point_hours"]
     assert abs(k["total"]["point_hours"] - 2 * p0b["point_hours"] - k["jobs"]["P0a"]["point_hours"]) < 1e-9
     p0a = k["jobs"]["P0a"]  # BF16 against each of the 4 quantized profiles, on every P0a BF16 trajectory
     assert p0a["pairs"] == 4 and abs(p0a["upper_hours"] - 900 * 4 * 43 * 4000 / 16500 / 3600) < 1e-9
@@ -353,7 +353,23 @@ def test_kl_scoring_hours_on_the_stated_machine():
     assert ec2["kl_scoring"]["machine"] == "g6e.16xlarge"
     assert abs(ec2["kl_scoring"]["jobs"]["P0b"]["point_hours"] - 2400 * 20 * 4000 / 16500 / 3600) < 1e-9
     md = render_markdown(attempt_stats(rows), [], {}, ec2)
-    assert "## KL scoring" in md and "g6e.16xlarge" in md and "| P0b Q4_K_M probe | successful runs" in md
+    assert "## KL scoring" in md and "g6e.16xlarge" in md and "| P0b Q4_K_M probe | unflagged successful runs" in md
+
+
+def test_kl_scoring_counts_unflagged_successes_and_reports_the_flagged():
+    # Owner's agent on PR #7 (answer 4): a flagged run is never a candidate, so P0b KL scoring covers unflagged
+    # successes only and the report counts the flagged ones. 2 of 5 vLLM attempts are unflagged successes; the
+    # flagged success is longer and must not enter the scored length either.
+    rows = [rec("vllm", "submitted", 0, 600)] * 2 + [rec("vllm", "turn_limit", 0, 600)] * 2
+    rows += [rec("vllm", "submitted", 0, 600, out=9000, unc=30000, touched=True)]
+    stats = attempt_stats(rows)
+    k = projections(stats, {})["kl_scoring"]
+    for job in ("P0b", "P0b Q4_K_M probe"):
+        j = k["jobs"][job]
+        assert j["runs"] == 4800 * 2 / 5 and j["flagged_not_scored"] == 4800 / 5 and j["tokens_per_run"] == 4000
+        assert abs(j["point_hours"] - 4800 * 2 / 5 * 43 * 4000 / 16500 / 3600) < 1e-9
+    md = render_markdown(stats, [], {}, projections(stats, {}))
+    assert "P0b: 960 flagged successful runs are not scored (never selection candidates)." in md
 
 
 def test_resolve_rates_overall_and_excluding_flagged():
