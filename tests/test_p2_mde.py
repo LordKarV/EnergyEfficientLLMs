@@ -164,3 +164,11 @@ def test_cli_fails_on_a_pool_attempt_without_est_joules(tmp_path):
     est.write_text("".join(json.dumps({"attempt_id": f"pBF16{a}", "est_joules_q4": 1.0}) + "\n" for a in range(5)))
     proc, _ = run_cli(tmp_path, cli_rows(), "--est-joules", str(est))
     assert proc.returncode != 0 and "1 pool attempts have no est_joules row" in proc.stderr and "pBF165" in proc.stderr
+
+
+def test_cli_fails_on_heldout_rows_from_two_runtimes(tmp_path):
+    # P0a also runs BF16 on heldout100, on llama.cpp; its attempts must not join P0b's vLLM counts.
+    p0a = [dict(r, attempt_id="a" + r["attempt_id"], runtime="llama.cpp", resolved=True)
+           for r in cli_rows() if r["list"] == "heldout100"]
+    proc, _ = run_cli(tmp_path, cli_rows() + p0a)
+    assert proc.returncode != 0 and "['llama.cpp', 'vllm']" in proc.stderr

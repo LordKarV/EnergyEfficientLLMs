@@ -5,7 +5,9 @@
         [--out outputs/p0b/mde.json]
 
 Per-task pass rates come from the heldout100 rows at --profile (P0b's BF16 by default; Q4_K_M for P0a's runs,
-whose file is then passed too). Costs come from the pool200 rows at --pool-profile, split by outcome: each
+whose file is then passed too). Those rows must all come from one runtime: P0a also runs BF16 on heldout100, on
+llama.cpp, so passing P0a's file with --profile BF16 fails rather than pooling its attempts into P0b's vLLM
+counts (docs/04 P0b criterion 3 reads P0b's 16 attempts per task). Costs come from the pool200 rows at --pool-profile, split by outcome: each
 attempt's est_joules_q4 from est_joules.jsonl when --est-joules is given, else its processed tokens (output plus
 every input token), which the output names. An attempt is resolved when resolved is true and end_reason is
 "submitted", as P2 counts it; end_reason "error" rows are left out.
@@ -31,11 +33,15 @@ def resolved(rec):
 
 def heldout_tasks(rows, profile, lst="heldout100"):
     acc = {}
+    rows = [r for r in rows if r.get("list") == lst and r.get("profile") == profile and r["end_reason"] != "error"]
+    runtimes = sorted({r["runtime"] for r in rows})
+    if len(runtimes) > 1:
+        raise ValueError(f"{lst} attempts at {profile} come from runtimes {runtimes}; pass the files of one runtime "
+                         "(P0b's vLLM run for BF16, P0a's llama.cpp runs for Q4_K_M)")
     for r in rows:
-        if r.get("list") == lst and r.get("profile") == profile and r["end_reason"] != "error":
-            a = acc.setdefault(r["task_id"], {"repo": r["repo"], "successes": 0, "attempts": 0})
-            a["successes"] += int(resolved(r))
-            a["attempts"] += 1
+        a = acc.setdefault(r["task_id"], {"repo": r["repo"], "successes": 0, "attempts": 0})
+        a["successes"] += int(resolved(r))
+        a["attempts"] += 1
     if not acc:
         raise ValueError(f"no {lst} attempts at {profile}")
     return [acc[t] for t in sorted(acc)]
