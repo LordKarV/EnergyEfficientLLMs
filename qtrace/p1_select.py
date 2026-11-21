@@ -167,10 +167,11 @@ def candidate(r, score_row, est_joules, score_name):
 def candidates(attempts, pool_lists, min_candidates, scores, joules, score_name):
     """Group the pool's candidate runs by task, with their scores and joule estimates joined.
 
-    A candidate is a BF16 attempt in a pool list that did not end in an infrastructure error, resolved,
-    and has no test-file flag (grading.test_files_touched is a required bool; absent is an error). Returns
-    (task -> candidates, report); the report counts infrastructure errors and flagged successes per pool
-    list and gives each dropped task's candidate count (0 if none resolved).
+    A candidate is a BF16 attempt in a pool list that did not end in an infrastructure error, resolved
+    (which must mean end_reason submitted; anything else raises), and has no test-file flag
+    (grading.test_files_touched is a required bool; absent is an error). Returns (task -> candidates,
+    report); the report counts infrastructure errors and flagged successes per pool list and gives each
+    dropped task's candidate count (0 if none resolved).
     """
     by_task, seen, tasks, flagged, errors = defaultdict(list), set(), set(), Counter(), Counter()
     for r in attempts:
@@ -190,6 +191,9 @@ def candidates(attempts, pool_lists, min_candidates, scores, joules, score_name)
             raise ValueError(f"attempt {aid!r}: resolved must be true or false, got {resolved!r}")
         if not resolved:
             continue
+        if r["end_reason"] != "submitted":  # the harness sets resolved only on a submitted attempt that passes grading
+            raise ValueError(f"attempt {aid!r}: resolved is true but end_reason is {r['end_reason']!r}; only a "
+                             "submitted attempt can resolve (docs/04 charges budget hits and timeouts as failures)")
         touched = need(r, "grading", "test_files_touched")  # required in every record; absent never means unflagged
         if touched is not True and touched is not False:
             raise ValueError(f"attempt {aid!r}: grading.test_files_touched must be true or false, got {touched!r}")

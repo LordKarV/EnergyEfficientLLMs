@@ -243,6 +243,15 @@ def test_infrastructure_errors_are_never_candidates_and_are_counted_per_list():
     assert go(runs + [{"task": "u"}] * 4, min_candidates=4)[1]["pool"]["dropped_tasks"] == {"t": 3}
 
 
+@pytest.mark.parametrize("end", ["turn_limit", "context_limit", "infra_timeout"])
+def test_resolved_without_submitting_is_an_error(end):
+    # docs/04 charges a scored budget hit and an infra_timeout as failures, so resolved true there is a bad record.
+    picks, _ = go([{"task": "t"}, {"task": "t"}, {"task": "t", "end": end, "resolved": False}])
+    assert len(picks["random"][0]) == 1
+    with pytest.raises(ValueError, match=f"end_reason is '{end}'"):
+        go([{"task": "t"}, {"task": "t"}, {"task": "t", "end": end}])
+
+
 @pytest.mark.parametrize("lst", ["heldout100", "verified100", "inrepo_test"])
 def test_held_out_lists_are_refused_as_pool_lists(lst):
     with pytest.raises(ValueError, match=lst):
