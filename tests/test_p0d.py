@@ -44,13 +44,12 @@ def load_script(name):
 
 
 def attempt(aid, task, turns=10, output=3000, malformed=0, lst="pool200", profile="BF16", resolved=True,
-            touched=False, episode_path=None, run_id="p0b"):
+            touched=False, episode_path=None, run_id="p0b", end_reason="submitted"):
     """An attempt record in the agreed format, with only the fields P0d reads filled in realistically."""
-    grading = {"fail_to_pass_ok": 1, "fail_to_pass_total": 1, "pass_to_pass_ok": 5, "pass_to_pass_total": 5}
-    if touched:
-        grading["test_files_touched"] = True
+    grading = {"fail_to_pass_ok": 1, "fail_to_pass_total": 1, "pass_to_pass_ok": 5, "pass_to_pass_total": 5,
+               "test_files_touched": touched}
     return {"attempt_id": aid, "run_id": run_id, "task_id": task, "list": lst, "repo": "pandas", "profile": profile,
-            "runtime": "vllm", "seed": 0, "resolved": resolved, "grading": grading, "end_reason": "submitted",
+            "runtime": "vllm", "seed": 0, "resolved": resolved, "grading": grading, "end_reason": end_reason,
             "turns": turns, "tool_calls": turns, "repairs": 0,
             "malformed": {k: (malformed if k == "wrong_name" else 0) for k in MALFORMED},
             "tokens": {"output": output, "input_uncached": 1000, "input_cached": 50_000, "server_reported_cached": 0},
@@ -396,6 +395,38 @@ def test_join_rejects_unknown_attempts_duplicates_and_bad_numbers():
     join_runs(attempts, [empty] + scores[1:], run_ids=P0B)  # an empty run nulls every mean
 
 
+def test_join_skips_and_counts_infrastructure_errors():
+    attempts, scores, joules = make_pool(n_tasks=3, runs=3)
+    # A resolved BF16 attempt that ended in error, still in an older scores file: never a run, as in p1_select.
+    attempts = [{**a, "end_reason": "error", "grading": None} if a["attempt_id"] == "task0-r0" else a
+                for a in attempts]
+    attempts.append(attempt("unscored-error", "task1", end_reason="error"))  # no score row and not "missing"
+    runs, info = join_runs(attempts, scores, joules, run_ids=P0B)
+    assert info["infra_error_excluded"] == {"pool200": 2} and len(runs) == 8
+    assert "task0-r0" not in {r["attempt_id"] for r in runs} and info["n_eligible_without_q3"] == 0
+
+
+def test_join_sums_malformed_over_the_fixed_categories():
+    attempts, scores, _ = make_pool(n_tasks=2, runs=3)
+    runs, _ = join_runs(attempts, scores, run_ids=P0B)
+    assert {r["attempt_id"]: r["malformed"] for r in runs}["task0-r0"] == attempts[0]["malformed"]["wrong_name"]
+    extra = {**attempts[0], "malformed": {**attempts[0]["malformed"], "repaired": 4}}
+    short = {**attempts[0], "malformed": {k: 0 for k in MALFORMED[1:]}}
+    for bad in (extra, short):
+        with pytest.raises(ValueError, match="malformed has keys"):
+            join_runs([bad] + attempts[1:], scores, run_ids=P0B)
+
+
+def test_tripwire_field_is_read_strictly():
+    attempts, scores, _ = make_pool(n_tasks=2, runs=3)
+    grading = {k: v for k, v in attempts[0]["grading"].items() if k != "test_files_touched"}
+    with pytest.raises(KeyError):
+        join_runs([{**attempts[0], "grading": grading}] + attempts[1:], scores, run_ids=P0B)
+    with pytest.raises(TypeError, match="must be a bool"):
+        join_runs([{**attempts[0], "grading": {**grading, "test_files_touched": None}}] + attempts[1:], scores,
+                  run_ids=P0B)
+
+
 # Replay pairs.
 
 def test_pairs_take_lowest_and_highest_with_attempt_id_tie_break():
@@ -690,6 +721,18 @@ def test_scorer_filters_batches_and_resumes(pool_dir, tmp_path, monkeypatch):
 
     calls.clear()
     assert run_scorer(mod, pool_dir, out)["scored"] == 0 and calls == []
+
+
+def test_scorer_skips_and_counts_infrastructure_errors(tmp_path):
+    mod = load_script("p0d_score_pool")
+    recs = [attempt("ok", "t0"), attempt("err", "t0", end_reason="error"),
+            attempt("err-failed", "t0", resolved=False, end_reason="error"),
+            attempt("err-p0c", "t0", run_id="p0c", end_reason="error")]  # not a P0b run: not counted
+    recs[1]["grading"] = recs[2]["grading"] = None  # an infrastructure fault may never reach the grader
+    path = tmp_path / "run.jsonl"
+    path.write_text("".join(json.dumps(r) + "\n" for r in recs))
+    runs, n_flagged, n_error = mod.pool_runs([str(path)], ["pool200"], P0B)
+    assert [r["attempt_id"] for r, _ in runs] == ["ok"] and (n_flagged, n_error) == (0, 2)
 
 
 def test_scorer_cuts_a_torn_line_and_refuses_other_ggufs(pool_dir, tmp_path, monkeypatch):

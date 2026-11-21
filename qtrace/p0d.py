@@ -26,6 +26,8 @@ HELD_OUT_LISTS = ("heldout100", "verified100", "inrepo_test")  # never part of a
 POOL_LISTS = ("pool200",)  # the default of p0d_score_pool.py --lists
 CONFOUNDS = ("turns", "output_tokens", "est_joules_q4", "entropy_bf16")
 COVARIATES = ("entropy", "turns", "malformed")
+# The issue #1 malformed categories, the same tuple as qtrace/exit_report.py (#7) and qtrace/p1_select.py (#14).
+MALFORMED = ("misnested_tag", "wrong_name", "text_after_call", "truncated_call", "no_call_no_answer")
 MAX_ABS_RHO, MIN_SPLIT_HALF, MIN_AGREEMENT, MIN_RUNS = 0.8, 0.5, 0.5, 3
 MIN_EFFECT = 0.10
 SMALL_SAMPLE = 50  # docs/04's "fewer than about 50 qualify"
@@ -44,8 +46,23 @@ COVARIATE_CONVENTION = ("each covariate is the low-score run minus the high-scor
 
 
 def flagged(rec):
-    """The grader's test-file tripwire (docs/04, "Test-file tripwire"); absent counts as false."""
-    return bool((rec.get("grading") or {}).get("test_files_touched"))
+    """The grader's test-file tripwire (docs/04, "Test-file tripwire").
+
+    grading.test_files_touched is a required bool of every attempt record, so a missing key raises
+    instead of silently turning the tripwire off.
+    """
+    v = rec["grading"]["test_files_touched"]
+    if not isinstance(v, bool):
+        raise TypeError(f"attempt {rec.get('attempt_id')!r}: grading.test_files_touched must be a bool, got {v!r}")
+    return v
+
+
+def malformed_total(rec, what):
+    """Malformed calls summed over MALFORMED; a missing or unknown category raises."""
+    m = _field(rec, "malformed", what)
+    if set(m) != set(MALFORMED):
+        raise ValueError(f"{what}: malformed has keys {sorted(m)}, expected {list(MALFORMED)}")
+    return sum(_number(m[k], f"{what} malformed.{k}", optional=False) for k in MALFORMED)
 
 
 def average_ranks(x):
@@ -117,9 +134,11 @@ def join_runs(attempts, scores, est_joules=None, lists=POOL_LISTS, *, run_ids):
     attempts with a Q3_K_M score row. Each must be a resolved BF16 attempt on one of
     `lists` (the scorer's --lists); anything else (an unknown attempt, another profile, a failure,
     another list, a duplicate row, a non-finite number) raises ValueError, since it means the scorer
-    read the wrong files. A run the test-file tripwire flagged can never be a selection candidate and
-    is excluded. info's flagged_excluded counts, per list, the resolved BF16 attempts it flagged, from
-    the attempt records, because the scorer writes no rows for them. info's n_eligible_without_q3
+    read the wrong files. A BF16 attempt on `lists` that ended in end_reason error is an infrastructure
+    fault, rerun as a fresh attempt (docs/04), so it is never a run, as in qtrace.p1_select.candidates;
+    info's infra_error_excluded counts them per list. A run the test-file tripwire flagged can never be
+    a selection candidate and is excluded. info's flagged_excluded counts, per list, the resolved BF16
+    attempts it flagged, from the attempt records, because the scorer writes no rows for them. info's n_eligible_without_q3
     counts the resolved, unflagged BF16 attempts on `lists` with no Q3_K_M row (the scorer still
     running or a row lost); choose_score must not decide while it is non-zero. est_joules:
     est_joules.jsonl rows, or None if P0a's file does not exist yet. Runs without a Q4_K_M row or an
@@ -129,7 +148,7 @@ def join_runs(attempts, scores, est_joules=None, lists=POOL_LISTS, *, run_ids):
     bad = sorted(set(lists) & set(HELD_OUT_LISTS))
     if bad:
         raise ValueError(f"{bad} are held-out lists and never enter a pool")
-    by_id, flagged_by_list, eligible, other_runs = {}, defaultdict(int), set(), {}
+    by_id, flagged_by_list, errors_by_list, eligible, other_runs = {}, defaultdict(int), defaultdict(int), set(), {}
     for a in attempts:
         aid = _field(a, "attempt_id", "attempt")
         if aid in by_id or aid in other_runs:
@@ -139,6 +158,10 @@ def join_runs(attempts, scores, est_joules=None, lists=POOL_LISTS, *, run_ids):
             other_runs[aid] = a["run_id"]
             continue
         by_id[aid] = a
+        if _field(a, "profile", what) == "BF16" and _field(a, "list", what) in lists and \
+                _field(a, "end_reason", what) == "error":
+            errors_by_list[a["list"]] += 1
+            continue
         if _field(a, "profile", what) == "BF16" and _field(a, "resolved", what) and _field(a, "list", what) in lists:
             if flagged(a):
                 flagged_by_list[a["list"]] += 1
@@ -174,6 +197,8 @@ def join_runs(attempts, scores, est_joules=None, lists=POOL_LISTS, *, run_ids):
             raise ValueError(f"{what}: list {a['list']!r} is held-out and never enters a pool")
         if a["list"] not in lists:
             raise ValueError(f"{what}: list {a['list']!r} is not one of the pool lists {list(lists)}")
+        if _field(a, "profile", what) == "BF16" and _field(a, "end_reason", what) == "error":
+            continue  # counted in infra_error_excluded; an older scores file may still hold its row
         if _field(a, "profile", what) != "BF16" or not _field(a, "resolved", what):
             raise ValueError(f"{what}: pool runs are resolved BF16 attempts (profile {a['profile']!r}, "
                              f"resolved {a['resolved']!r})")
@@ -195,7 +220,7 @@ def join_runs(attempts, scores, est_joules=None, lists=POOL_LISTS, *, run_ids):
             "turns": _number(_field(a, "turns", what), f"{what} turns", optional=False),
             "output_tokens": _number(_field(_field(a, "tokens", what), "output", what), f"{what} tokens.output",
                                      optional=False),
-            "malformed": _number(sum(_field(a, "malformed", what).values()), f"{what} malformed", optional=False),
+            "malformed": malformed_total(a, what),
             "est_joules_q4": joules.get(aid),
             "entropy_bf16": entropy,
             "entropy_decision_bf16": entropy_dec,
@@ -207,6 +232,7 @@ def join_runs(attempts, scores, est_joules=None, lists=POOL_LISTS, *, run_ids):
     q3_ids = {aid for aid, p in rows if p == PROBE}
     info = {"n_runs": len(runs), "n_tasks": len({r["task_id"] for r in runs}),
             "flagged_excluded": dict(sorted(flagged_by_list.items())),
+            "infra_error_excluded": dict(sorted(errors_by_list.items())),
             "q4_rows_without_q3": sum(1 for aid, p in rows if p == AGREEMENT_PROBE and aid not in q3_ids),
             "lists": list(lists), "run_ids": sorted(run_ids), "n_eligible_without_q3": len(eligible - q3_ids),
             "n_runs_without_q4": sum(1 for r in runs if r["q4"] is None),

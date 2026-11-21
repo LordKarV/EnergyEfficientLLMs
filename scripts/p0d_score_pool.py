@@ -5,8 +5,9 @@
         [--lists pool200] [--batch 25]
 
 Every resolved BF16 attempt on --lists whose run_id is one of the --manifest's P0b runs is scored
-(the manifest of scripts/p0_analyze.py); P0c's BF16 runs on pool200 are a different draw. A run
-flagged by the test-file tripwire is skipped and counted, because it can never be a selection
+(the manifest of scripts/p0_analyze.py); P0c's BF16 runs on pool200 are a different draw. An attempt
+that ended in end_reason error is an infrastructure fault, rerun as a fresh attempt (docs/04), so it
+is skipped and counted, as qtrace.p1_select.candidates drops it. A run flagged by the test-file tripwire is skipped and counted, because it can never be a selection
 candidate (docs/04, "Test-file tripwire"). Held-out lists are refused.
 
 Each (attempt, probe) becomes one row of --out: attempt_id, task_id, probe, gguf_p, gguf_q and the
@@ -33,15 +34,21 @@ EPISODE_KEYS = ("input_ids", "model_mask", "tool_call_positions", "command_spans
 
 
 def pool_runs(attempt_paths, lists, run_ids):
-    """(record, absolute episode path) for each run to score, and the flagged count excluded."""
-    runs, seen, n_flagged = [], set(), 0
+    """(record, absolute episode path) for each run to score, the flagged count and the error count excluded."""
+    runs, seen, n_flagged, n_error = [], set(), 0, 0
     for path in attempt_paths:
         base = os.path.dirname(os.path.abspath(path))
         for r in read_jsonl(path):
-            missing = [k for k in ("attempt_id", "run_id", "task_id", "list", "profile", "resolved") if k not in r]
+            missing = [k for k in ("attempt_id", "run_id", "task_id", "list", "profile", "end_reason", "resolved")
+                       if k not in r]
             if missing:
                 raise ValueError(f"{path}: attempt {r.get('attempt_id')!r} lacks {missing}")
-            if r["run_id"] not in run_ids or r["profile"] != "BF16" or not r["resolved"] or r["list"] not in lists:
+            if r["run_id"] not in run_ids or r["profile"] != "BF16" or r["list"] not in lists:
+                continue
+            if r["end_reason"] == "error":
+                n_error += 1
+                continue
+            if not r["resolved"]:
                 continue
             if flagged(r):
                 n_flagged += 1
@@ -52,7 +59,7 @@ def pool_runs(attempt_paths, lists, run_ids):
             if "episode_path" not in r:
                 raise ValueError(f"{path}: attempt {r['attempt_id']!r} has no episode_path")
             runs.append((r, os.path.join(base, r["episode_path"])))  # join keeps an absolute path as is
-    return runs, n_flagged
+    return runs, n_flagged, n_error
 
 
 def load_episode(path):
@@ -125,10 +132,10 @@ def score_pool(attempt_paths, binary, gguf_p, probes, lists, out, batch=25, n_ba
     bad = sorted(set(lists) & set(HELD_OUT_LISTS))
     if bad:
         raise ValueError(f"{bad} are held-out lists and never enter a pool")
-    runs, n_flagged = pool_runs(attempt_paths, lists, run_ids)
+    runs, n_flagged, n_error = pool_runs(attempt_paths, lists, run_ids)
     done = resume(out, gguf_p, probes)
     print(f"{len(runs)} pool runs, {n_flagged} flagged by the test-file tripwire excluded, "
-          f"{len(done)} rows already in {out}")
+          f"{n_error} infrastructure errors excluded, {len(done)} rows already in {out}")
     scored = 0
     for probe, gguf_q in probes.items():
         todo = [(r, ep) for r, ep in runs if (r["attempt_id"], probe) not in done]
@@ -140,7 +147,8 @@ def score_pool(attempt_paths, binary, gguf_p, probes, lists, out, batch=25, n_ba
                                 "gguf_p": gguf_p, "gguf_q": gguf_q, **st} for (r, _), st in zip(chunk, stats)])
             scored += len(chunk)
             print(f"{probe}: {s + len(chunk)}/{len(todo)}")
-    return {"kept": len(runs), "flagged_excluded": n_flagged, "already_scored": len(done), "scored": scored}
+    return {"kept": len(runs), "flagged_excluded": n_flagged, "infra_error_excluded": n_error,
+            "already_scored": len(done), "scored": scored}
 
 
 def main(argv=None):
