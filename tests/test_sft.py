@@ -4,6 +4,7 @@ import importlib.util
 import json
 import math
 import os
+import subprocess
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -22,6 +23,7 @@ from qtrace import sft
 TARGETS = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj", "in_proj_qkv", "in_proj_z",
            "out_proj"]
 TRAIN = {"targets": TARGETS, "include_gates": False, "lora_r": 4, "lora_alpha": 8}
+QWEN35_4B, LLAMA_CPP = os.environ.get("QTRACE_QWEN35_4B"), os.environ.get("QTRACE_LLAMA_CPP")
 
 
 def save_ckpt(path, seed=0):
@@ -312,6 +314,38 @@ def test_base_f32_tensors_maps_the_multimodal_names_and_refuses_other_wide_tenso
     save_file({**ckpt, "model.norm.weight": ckpt["model.norm.weight"].float()}, file, metadata={"format": "pt"})
     with pytest.raises(ValueError, match="must be exactly"):
         sft.base_f32_tensors(str(tmp_path / "ckpt"))
+
+
+def gguf_tensor_diff(path_a, path_b):
+    """Tensors of two GGUFs matched by name: names, types, shapes and data bytes (not KV metadata or order)."""
+    sys.path.insert(0, os.path.join(LLAMA_CPP, "gguf-py"))
+    from gguf import GGUFReader
+
+    ta, tb = ({t.name: t for t in GGUFReader(p).tensors} for p in (path_a, path_b))
+    both = ta.keys() & tb.keys()
+    mismatched = [n for n in both if ta[n].tensor_type != tb[n].tensor_type or list(ta[n].shape) != list(tb[n].shape)
+                  or ta[n].data.tobytes() != tb[n].data.tobytes()]
+    return {"compared": len(both), "only_in_a": sorted(ta.keys() - tb.keys()),
+            "only_in_b": sorted(tb.keys() - ta.keys()), "mismatched": sorted(mismatched)}
+
+
+@pytest.mark.skipif(not (QWEN35_4B and LLAMA_CPP), reason="needs QTRACE_QWEN35_4B (a Qwen/Qwen3.5-4B folder) and "
+                    "QTRACE_LLAMA_CPP (a llama.cpp checkout); QTRACE_STRAIGHT_GGUF reuses a straight conversion")
+def test_restored_4b_resave_converts_to_the_straight_gguf_tensor_for_tensor(tmp_path):
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    def convert(src, out):
+        subprocess.run([sys.executable, os.path.join(LLAMA_CPP, "convert_hf_to_gguf.py"), src, "--outtype", "bf16",
+                        "--no-mtp", "--outfile", out], check=True)
+        return out
+
+    straight = os.environ.get("QTRACE_STRAIGHT_GGUF") or convert(QWEN35_4B, str(tmp_path / "straight.gguf"))
+    model = AutoModelForCausalLM.from_pretrained(QWEN35_4B, dtype=torch.bfloat16)  # as the trainer loads it
+    sft.save_merged(sft.attach(model, TRAIN, 0), tmp_path / "merged", QWEN35_4B)  # LoRA B is zero: merged W = W
+    AutoTokenizer.from_pretrained(QWEN35_4B).save_pretrained(tmp_path / "merged")
+    diff = gguf_tensor_diff(convert(str(tmp_path / "merged"), str(tmp_path / "resaved.gguf")), straight)
+    print(json.dumps(diff))
+    assert diff == {"compared": 378, "only_in_a": [], "only_in_b": [], "mismatched": []}
 
 
 def load_script():
