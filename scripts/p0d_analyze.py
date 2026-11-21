@@ -130,6 +130,8 @@ def did_step(args):
     print(f"DiD {did['did_mean']:+.3f} (p one-sided {did['p_one_sided']:.4f}, "
           f"upper95 {did['upper95_one_sided']:+.3f}), adjusted {fmt(adj)}, "
           f"pair drop rate {did['pair_drop_rate']:.2f} of {did['n_pairs_selected']}: {did['decision']}")
+    if did["adjusted"] and did["adjusted"]["note"]:
+        print(did["adjusted"]["note"])
     if did["pair_tasks_without_continuations"]:
         print(f"{len(did['pair_tasks_without_continuations'])} pairs have no BF16 and Q3_K_M continuation rows")
 

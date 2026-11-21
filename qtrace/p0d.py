@@ -382,19 +382,25 @@ def _adjusted(did, cov):
     Covariates enter in COVARIATES order, and one that does not raise the design's rank is dropped and
     named in `dropped` with its reason: constant over the pairs (all zero, or a non-zero constant the
     intercept absorbs) or collinear with the columns before it. The estimate is then not adjusted for
-    it. With no more tasks than coefficients the fit has no residual and the estimate is None.
+    it. A non-zero constant is also named in `note`: the intercept then holds that covariate's effect
+    too, so the estimate is not separated from it (an all-zero one leaves nothing to separate). With no
+    more tasks than coefficients the fit has no residual and the estimate is None.
     """
     x = np.array([[cov_t[k] for k in COVARIATES] for cov_t in cov], dtype=float)
-    design, kept, dropped = np.ones((len(did), 1)), [], {}
+    design, kept, dropped, absorbed = np.ones((len(did), 1)), [], {}, []
     for i, k in enumerate(COVARIATES):
         trial = np.column_stack([design, x[:, i]])
         if np.linalg.matrix_rank(trial) > design.shape[1]:
             design, kept = trial, kept + [k]
         elif np.ptp(x[:, i]) == 0:
             dropped[k] = f"constant ({x[0, i]:g}) over the pairs, so the intercept absorbs it"
+            if x[0, i] != 0:
+                absorbed.append(k)
         else:
             dropped[k] = "collinear with the intercept and the covariates before it"
-    out = {"dropped": dropped, "convention": COVARIATE_CONVENTION}
+    note = (f"the adjusted estimate is not separated from the effect of {', '.join(absorbed)}: constant and "
+            "non-zero over the pairs, it is absorbed by the intercept" if absorbed else None)
+    out = {"dropped": dropped, "note": note, "convention": COVARIATE_CONVENTION}
     if len(did) <= design.shape[1]:
         return {**out, "estimate": None,
                 "reason": f"{len(did)} tasks leave no residual degrees of freedom for {design.shape[1]} coefficients"}

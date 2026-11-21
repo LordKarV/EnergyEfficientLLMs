@@ -476,6 +476,7 @@ def test_adjustment_removes_a_planted_confound():
     assert confounded["did_mean"] > 0.12 and confounded["p_one_sided"] < 0.05
     assert abs(confounded["adjusted"]["estimate"]) < 0.01
     assert list(confounded["adjusted"]["dropped"]) == ["malformed"]
+    assert confounded["adjusted"]["note"] is None  # all zero: no pair's runs differ in it, so nothing to separate
     assert confounded["decision"] == "inconclusive"
     real = did_test(exact_rows({t: 0.2 + 0.1 * x for t, x in turns.items()}), cov)
     assert abs(real["adjusted"]["estimate"] - 0.2) < 0.01 and real["decision"] == "pass"
@@ -494,6 +495,8 @@ def test_adjustment_drops_constant_and_collinear_covariates():
     adj = out["adjusted"]
     assert set(adj["dropped"]) == {"turns", "malformed"} and "constant" in adj["dropped"]["turns"]
     assert "collinear" in adj["dropped"]["malformed"] and set(adj["coef"]) == {"entropy"}
+    # Owner review of PR #12: a non-zero constant is absorbed by the intercept, and the result says so.
+    assert "not separated from the effect of turns" in adj["note"] and "malformed" not in adj["note"]
     assert abs(adj["estimate"] - 0.3) < 1e-9 and out["p_one_sided"] == 0 and out["decision"] == "pass"
     few = did_test(exact_rows({t: 0.3 for t in tasks[:4]}), {t: noise_covariates(4)[f"t{i}"] for i, t in
                                                              enumerate(tasks[:4])})
@@ -796,6 +799,20 @@ def test_analyze_writes_score_choice_and_did(tmp_path):
     assert did["n_tasks"] == 30 and did["decision"] in ("pass", "fail", "inconclusive")
     assert did["pair_tasks_without_continuations"] == [] and did["adjusted"]["estimate"] is not None
     assert did["score"] == "kl_mean" and did["n_pairs_selected"] == 30
+
+
+def test_did_step_says_a_constant_covariate_is_not_separated(tmp_path, capsys):
+    out_dir = tmp_path / "p0d"
+    out_dir.mkdir()
+    pairs = [{**p, "diff": {**p["diff"], "turns": 2}} for p in frozen_pairs(20)]
+    (out_dir / "score_choice.json").write_text(json.dumps({"chosen": "kl_mean", "decided": True,
+                                                           "verdict": "chosen: kl_mean", "pairs": {"tasks": pairs}}))
+    cont = tmp_path / "continuations.jsonl"
+    cont.write_text("".join(json.dumps(r) + "\n" for r in did_rows(20, 4, 0.6, 0.4)))
+    load_script("p0d_analyze").main(["--out-dir", str(out_dir), "--continuations", str(cont), "--n-boot", "300"])
+    did = json.loads((out_dir / "did.json").read_text())
+    assert "turns" in did["adjusted"]["dropped"] and "not separated from the effect of turns" in did["adjusted"]["note"]
+    assert did["adjusted"]["note"] in capsys.readouterr().out
 
 
 def test_analyze_rerun_removes_a_stale_did_and_says_why_there_are_no_pairs(tmp_path):
