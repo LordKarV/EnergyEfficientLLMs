@@ -255,14 +255,15 @@ def candidate_stats(runs, name, have_joules=True, min_runs=MIN_RUNS):
             "failed": failed, "not_run": not_run, "pass": not failed and not not_run}
 
 
-def choose_score(runs, have_joules=True, min_runs=MIN_RUNS, missing_q3=0):
+def choose_score(runs, have_joules=True, min_runs=MIN_RUNS, *, missing_q3):
     """docs/04's rule: the first candidate, in the frozen order, that passes every check.
 
     A candidate that fails a check is skipped. One that fails none but has a check that could not run
     (an est_joules value or a Q4_K_M row missing for any run, no task with enough runs) stops the walk:
     chosen stays None and decided is False, because a later candidate may only be chosen once the
     earlier one has failed. missing_q3 (join_runs' n_eligible_without_q3) above 0 leaves the rule
-    undecided whatever the candidates show, since every check ran on part of the pool.
+    undecided whatever the candidates show, since every check ran on part of the pool. It has no
+    default, so a caller cannot skip that check by leaving it out.
     decided with chosen None answers H3 negatively and drops the stability arms before P1.
     """
     candidates = {c: candidate_stats(runs, c, have_joules, min_runs) for c in CANDIDATES}

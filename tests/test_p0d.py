@@ -136,7 +136,7 @@ def test_split_half_corrects_the_mean_of_per_task_rhos():
             h = {"even": {c: float(even[k]) for c in CANDIDATES}, "odd": {c: float(odd[k]) for c in CANDIDATES}}
             scores.append(score_row(aid, task, "Q3_K_M", {c: float(k) for c in CANDIDATES}, h, 1.0))
     runs, _ = join_runs(attempts, scores)
-    split = choose_score(runs)["candidates"]["kl_mean"]["split_half"]
+    split = choose_score(runs, missing_q3=0)["candidates"]["kl_mean"]["split_half"]
     assert split["rho"]["mean"] == 0.75 and split["rho"]["n_tasks"] == 2
     assert abs(split["spearman_brown_mean"] - 1.5 / 1.75) < 1e-12
 
@@ -154,7 +154,7 @@ def test_within_task_minimum_runs_and_constant_tasks():
 def test_rule_chooses_first_passing_candidate():
     attempts, scores, joules = make_pool()
     runs, info = join_runs(attempts, scores, joules)
-    out = choose_score(runs)
+    out = choose_score(runs, missing_q3=0)
     c = out["candidates"]
     assert c["kl_decision"]["failed"] == ["entropy_bf16"]  # tracks entropy, otherwise fine
     assert set(c["kl_command"]["failed"]) == {"split_half", "probe_agreement"}  # noise
@@ -166,20 +166,20 @@ def test_rule_chooses_first_passing_candidate():
 
 def test_rule_order_prefers_the_primary_score():
     attempts, scores, joules = make_pool(roles={c: "trait" for c in CANDIDATES})
-    out = choose_score(join_runs(attempts, scores, joules)[0])
+    out = choose_score(join_runs(attempts, scores, joules)[0], missing_q3=0)
     assert all(out["candidates"][c]["pass"] for c in CANDIDATES) and out["chosen"] == "kl_decision"
 
 
 def test_no_passing_candidate_answers_h3_negatively():
     roles = {"kl_decision": "entropy", "kl_command": "noise", "kl_mean": "noise"}
     attempts, scores, joules = make_pool(roles=roles)
-    out = choose_score(join_runs(attempts, scores, joules)[0])
+    out = choose_score(join_runs(attempts, scores, joules)[0], missing_q3=0)
     assert out["chosen"] is None and out["decided"] and "H3" in out["verdict"]
 
 
 def test_missing_joules_leaves_the_rule_undecided():
     attempts, scores, _ = make_pool(roles={c: "trait" for c in CANDIDATES})
-    out = choose_score(join_runs(attempts, scores)[0], have_joules=False)
+    out = choose_score(join_runs(attempts, scores)[0], have_joules=False, missing_q3=0)
     first = out["candidates"]["kl_decision"]
     assert first["checks"]["est_joules_q4"] is None and first["not_run"] == ["est_joules_q4"]
     assert first["pass"] is False and "not_run" in first["against"]["est_joules_q4"]
@@ -188,7 +188,7 @@ def test_missing_joules_leaves_the_rule_undecided():
 
 def test_a_definite_failure_needs_no_joules():
     attempts, scores, _ = make_pool()
-    out = choose_score(join_runs(attempts, scores)[0], have_joules=False)
+    out = choose_score(join_runs(attempts, scores)[0], have_joules=False, missing_q3=0)
     assert out["candidates"]["kl_decision"]["failed"] == ["entropy_bf16"]
     assert out["chosen"] is None and not out["decided"] and "kl_mean" in out["verdict"]  # kl_mean undecided
 
@@ -198,11 +198,11 @@ def test_partial_q4_or_joules_coverage_leaves_the_rule_undecided():
     attempts, scores, joules = make_pool()
     partial = [s for s in scores if s["probe"] == "Q3_K_M" or s["task_id"] in {"task0", "task1", "task2"}]
     runs, info = join_runs(attempts, partial, joules)
-    out = choose_score(runs)
+    out = choose_score(runs, missing_q3=0)
     assert info["n_runs_without_q4"] == 222 and out["candidates"]["kl_mean"]["not_run"] == ["probe_agreement"]
     assert out["chosen"] is None and not out["decided"] and "probe_agreement" in out["verdict"]
     runs, info = join_runs(attempts, scores, [j for j in joules if j["attempt_id"].startswith(("task0-", "task1-"))])
-    out = choose_score(runs)
+    out = choose_score(runs, missing_q3=0)
     assert info["n_runs_without_est_joules"] == 228 and out["candidates"]["kl_mean"]["not_run"] == ["est_joules_q4"]
     assert out["chosen"] is None and not out["decided"]
 
@@ -213,7 +213,7 @@ def test_partial_halves_coverage_leaves_split_half_not_run():
     keep = {"task0", "task1", "task2"}
     partial = [s if s["task_id"] in keep else {k: v for k, v in s.items() if k != "halves"} for s in scores]
     runs, info = join_runs(attempts, partial, joules)
-    out = choose_score(runs)
+    out = choose_score(runs, missing_q3=0)
     assert info["n_runs_without_halves"] == 222
     assert out["candidates"]["kl_mean"]["checks"]["split_half"] is None
     assert "not_run" in out["candidates"]["kl_mean"]["split_half"]
@@ -228,7 +228,14 @@ def test_missing_q3_rows_leave_the_rule_undecided():
     assert info["n_eligible_without_q3"] == 120
     out = choose_score(runs, missing_q3=info["n_eligible_without_q3"])
     assert out["chosen"] is None and not out["decided"] and "120" in out["verdict"]
-    assert choose_score(runs)["chosen"] == "kl_mean"  # the same runs decide once nothing is missing
+    assert choose_score(runs, missing_q3=0)["chosen"] == "kl_mean"  # the same runs decide once nothing is missing
+
+
+def test_choose_score_requires_the_missing_q3_count():
+    # Owner review of PR #12: a caller that leaves the count out must not get a decision by default.
+    attempts, scores, joules = make_pool(n_tasks=4, runs=3)
+    with pytest.raises(TypeError, match="missing_q3"):
+        choose_score(join_runs(attempts, scores, joules)[0])
 
 
 def test_runs_on_other_lists_are_not_missing_and_never_scored():
@@ -270,7 +277,7 @@ def boundary_pool(field, values):
     ("Q4_K_M", [2, 1, 4, 5, 3], "probe_agreement", 0.6, True),
 ])
 def test_rule_thresholds_at_their_boundaries(field, values, check, rho, passes):
-    c = choose_score(boundary_pool(field, values))["candidates"]["kl_mean"]
+    c = choose_score(boundary_pool(field, values), missing_q3=0)["candidates"]["kl_mean"]
     stat = {"split_half": c["split_half"]["rho"], "entropy_bf16": c["against"]["entropy_bf16"],
             "probe_agreement": c["probe_agreement"]}[check]
     assert stat["mean"] == pytest.approx(rho) and c["checks"][check] is passes
@@ -321,7 +328,7 @@ def test_tasks_below_three_runs_count_for_pairs_but_not_for_the_rule():
     a1, s1, j1 = make_pool(n_tasks=10, runs=6)
     a2, s2, j2 = make_pool(n_tasks=5, runs=2, seed=1, task_prefix="pair")
     runs, _ = join_runs(a1 + a2, s1 + s2, j1 + j2)
-    turns = choose_score(runs)["candidates"]["kl_mean"]["against"]["turns"]
+    turns = choose_score(runs, missing_q3=0)["candidates"]["kl_mean"]["against"]["turns"]
     assert turns["n_tasks"] == 10 and turns["n_tasks_too_few_runs"] == 5
     assert select_pairs(runs, "kl_mean")["n_tasks"] == 15
 
