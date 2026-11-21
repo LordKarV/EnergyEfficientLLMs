@@ -284,13 +284,19 @@ def test_bf16_throughput_ratio_for_the_optional_p0b_rule():
 
 
 def test_kl_scoring_hours_on_the_stated_machine():
-    # Audit gap 7: 2 of 4 vLLM attempts resolve, each 4,000 tokens long (output + ideal uncached input).
-    rows = [rec("vllm", "submitted", 0, 600)] * 2 + [rec("vllm", "turn_limit", 0, 600)] * 2
+    # Audit gap 7: 2 of 4 vLLM attempts resolve, each 4,000 tokens long (output + ideal uncached input). The
+    # failed ones are longer, as runs that hit a limit usually are, and must not enter the P0b length.
+    rows = [rec("vllm", "submitted", 0, 600)] * 2 + [rec("vllm", "turn_limit", 0, 600, out=5000, unc=20000)] * 2
     rows += [rec("llama.cpp", "submitted", 0, 600)]
     k = projections(attempt_stats(rows), {})["kl_scoring"]
     assert k["seconds_per_run"] == 43.0 and k["tokens_per_run"] == 16500 and "M5 Pro" in k["machine"]
     p0b = k["jobs"]["P0b"]
-    assert p0b["runs"] == 2400 and abs(p0b["point_hours"] - 2400 * 43 * 4000 / 16500 / 3600) < 1e-9
+    assert p0b["runs"] == 2400 and p0b["tokens_per_run"] == 4000
+    assert abs(p0b["point_hours"] - 2400 * 43 * 4000 / 16500 / 3600) < 1e-9
+    # P0d's probe agreement needs the pool scored with the Q4_K_M probe too (review of eadb97e).
+    q4 = k["jobs"]["P0b Q4_K_M probe"]
+    assert q4["what"] == "successful runs, BF16 vs Q4_K_M" and q4["point_hours"] == p0b["point_hours"]
+    assert abs(k["total"]["point_hours"] - 2 * p0b["point_hours"] - k["jobs"]["P0a"]["point_hours"]) < 1e-9
     p0a = k["jobs"]["P0a"]  # BF16 against each of the 4 quantized profiles, on every P0a BF16 trajectory
     assert p0a["pairs"] == 4 and abs(p0a["upper_hours"] - 900 * 4 * 43 * 4000 / 16500 / 3600) < 1e-9
     ec2 = projections(attempt_stats(rows), {"kl_scoring": {"machine": "g6e.16xlarge", "seconds_per_run": 20.0,
@@ -298,7 +304,7 @@ def test_kl_scoring_hours_on_the_stated_machine():
     assert ec2["kl_scoring"]["machine"] == "g6e.16xlarge"
     assert abs(ec2["kl_scoring"]["jobs"]["P0b"]["point_hours"] - 2400 * 20 * 4000 / 16500 / 3600) < 1e-9
     md = render_markdown(attempt_stats(rows), [], {}, ec2)
-    assert "## KL scoring" in md and "g6e.16xlarge" in md
+    assert "## KL scoring" in md and "g6e.16xlarge" in md and "| P0b Q4_K_M probe | successful runs" in md
 
 
 def test_resolve_rates_overall_and_excluding_flagged():

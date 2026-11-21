@@ -309,6 +309,9 @@ def kl_hours(stats, extras):
 
     - P0b: every successful P0b run (4,800 x the vLLM pilot resolve rate), BF16 vs Q3_K_M. Flagged successes
       are counted although they are never selection candidates, which errs high.
+    - P0b Q4_K_M probe: the same runs, BF16 vs Q4_K_M, for P0d's Q3_K_M vs Q4_K_M probe agreement (04, P0d
+      score choice). 04's P0 step 3 names only BF16 and Q3_K_M, so this is listed as its own job; it errs high
+      if only tasks with 3 or more successes are scored, or if the BF16 logits are reused.
     - P0a diagnostic: every P0a BF16 trajectory (600, 900 with the top-up) against each of the 4 quantized
       profiles, at the llama.cpp BF16 pilot length.
     The per-run figure includes both model loads, which a batched call amortizes, so this errs high too.
@@ -320,8 +323,9 @@ def kl_hours(stats, extras):
     if vllm and vllm["resolve_rate"] and vllm["resolved_episode_tokens"]:
         runs = P0_STEPS["P0b"][1]["BF16"][0] * vllm["resolve_rate"]
         h = runs * vllm["resolved_episode_tokens"] * per_token_h
-        jobs["P0b"] = {"what": "successful runs, BF16 vs Q3_K_M", "runs": runs, "pairs": 1,
-                       "tokens_per_run": vllm["resolved_episode_tokens"], "point_hours": h, "upper_hours": h}
+        for job, probe in (("P0b", "Q3_K_M"), ("P0b Q4_K_M probe", "Q4_K_M")):
+            jobs[job] = {"what": f"successful runs, BF16 vs {probe}", "runs": runs, "pairs": 1,
+                         "tokens_per_run": vllm["resolved_episode_tokens"], "point_hours": h, "upper_hours": h}
     bf16_tokens = stats.get("llama.cpp", {}).get("episode_tokens_by_profile", {}).get("BF16")
     if bf16_tokens:
         point, upper = P0_STEPS["P0a"][1]["BF16"]
@@ -437,7 +441,10 @@ def _md_projections(projections):
 def _md_kl(kl):
     lines = ["", "## KL scoring", "", (f"Machine: {kl['machine']}, {kl['seconds_per_run']:.0f} s per "
              f"{kl['tokens_per_run']}-token run, scaled linearly by run length. Not instance-hours unless the "
-             "machine is the g6e."), "", "| step | what | runs | pairs per run | tokens per run | point h | upper h |",
+             "machine is the g6e."), "", ("04's P0 step 3 names KL scoring at BF16 and Q3_K_M only, while the P0d "
+             "score choice needs the Q3_K_M vs Q4_K_M probe agreement on the P0b pool, so the Q4_K_M probe is its "
+             "own row (owner question: the whole pool, or only tasks with 3 or more successes?)."), "",
+             "| step | what | runs | pairs per run | tokens per run | point h | upper h |",
              "|---|---|---|---|---|---|---|"]
     for step, j in kl["jobs"].items():
         lines.append(f"| {step} | {j['what']} | {j['runs']:.0f} | {j['pairs']} | {j['tokens_per_run']:.0f} "
