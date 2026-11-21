@@ -1,11 +1,14 @@
 """Tests for the frozen P0 task lists. Run:  python -m pytest tests/test_tasklists.py -q"""
 
+import json
 import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from qtrace.tasklists import HELDOUT_REPOS, POOL_REPOS, allocate, build_lists, stratified_sample
+
+LISTS = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "task_lists")
 
 
 def fake_rows(per_repo=60):
@@ -49,3 +52,23 @@ def test_build_lists_rejects_duplicate_task_ids():
         assert "duplicate" in str(err)
     else:
         raise AssertionError("duplicate task ids were accepted")
+
+
+def test_heldout691_is_every_heldout_task():
+    rows = fake_rows()
+    lists = build_lists(rows, ["v-1"], seed=7, inrepo_size=1, pool_size=1, heldout_size=10, verified_size=1)
+    every = lists["heldout691"]
+    assert every["ids"] == sorted(tid for tid, repo in rows if repo in HELDOUT_REPOS)
+    assert every["size"] == 60 * len(HELDOUT_REPOS)
+    assert set(lists["heldout100"]["ids"]) <= set(every["ids"])
+
+
+def test_frozen_heldout691_matches_04_and_contains_heldout100():
+    with open(os.path.join(LISTS, "heldout691.json")) as f:
+        every = json.load(f)
+    with open(os.path.join(LISTS, "heldout100.json")) as f:
+        held = json.load(f)
+    assert every["size"] == len(every["ids"]) == len(set(every["ids"])) == 691
+    assert set(every["by_repo"]) == set(HELDOUT_REPOS)
+    assert set(held["ids"]) <= set(every["ids"])
+    assert every["sources"] == held["sources"]

@@ -19,6 +19,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from qtrace.tasklists import HELDOUT_REPOS, POOL_REPOS, build_lists
 
 SEED = 20261119
+HELDOUT_ALL_SIZE = 691  # docs/04 "Task sets"
 R2E = ("R2E-Gym/R2E-Gym-Subset", "2e8108ff942f24fcb5686badfaf7f9a8808566d5")
 VERIFIED = ("princeton-nlp/SWE-bench_Verified", "c104f840cc67f8b6eec6f759ebc8b2693d585d4a")
 OUT = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "task_lists")
@@ -50,6 +51,8 @@ def main():
     verified = [r["instance_id"] for r in read_columns(fs, *VERIFIED, ["instance_id"])]
 
     lists = build_lists(rows, verified, SEED, inrepo_size=args.inrepo_size)
+    if lists["heldout691"]["size"] != HELDOUT_ALL_SIZE:
+        raise SystemExit(f"held-out repos have {lists['heldout691']['size']} tasks, 04 says {HELDOUT_ALL_SIZE}")
     os.makedirs(OUT, exist_ok=True)
     for name, payload in lists.items():
         payload["sources"] = {"r2e_gym": f"{R2E[0]}@{R2E[1]}", "swe_bench_verified": f"{VERIFIED[0]}@{VERIFIED[1]}"}

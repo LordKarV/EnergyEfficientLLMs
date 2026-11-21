@@ -60,17 +60,20 @@ def _summary(name, ids, rows, seed, size_note):
 
 
 def build_lists(rows, verified_ids, seed, inrepo_size=300, pool_size=200, heldout_size=100, verified_size=100):
-    """Build inrepo_test, pool200, heldout100 and verified100.
+    """Build inrepo_test, pool200, heldout100, heldout691 and verified100.
 
     rows: (task_id, repo_name) pairs for R2E-Gym. inrepo_test is drawn first from the pool repos
     and excluded from pool200, as 04 requires. heldout100 comes only from the held-out repos.
+    heldout691 is every held-out-repo task (P2 runs on all of them), so it is not sampled.
     """
     ids = [task_id for task_id, _ in rows]
     if len(ids) != len(set(ids)):
         raise ValueError("duplicate task ids in R2E-Gym rows")
     inrepo = stratified_sample(_by_repo(rows, POOL_REPOS), inrepo_size, f"{seed}:inrepo_test")
     pool = stratified_sample(_by_repo(rows, POOL_REPOS, exclude=set(inrepo)), pool_size, f"{seed}:pool200")
-    held = stratified_sample(_by_repo(rows, HELDOUT_REPOS), heldout_size, f"{seed}:heldout100")
+    held_by_repo = _by_repo(rows, HELDOUT_REPOS)
+    held = stratified_sample(held_by_repo, heldout_size, f"{seed}:heldout100")
+    every_held = [task_id for repo in sorted(held_by_repo) for task_id in sorted(held_by_repo[repo])]
     rng = random.Random(f"{seed}:verified100")
     verified = sorted(rng.sample(sorted(verified_ids), verified_size))
     return {
@@ -78,5 +81,7 @@ def build_lists(rows, verified_ids, seed, inrepo_size=300, pool_size=200, heldou
                                 "working default 300; the owner sets the final size (04, Owner decisions)"),
         "pool200": _summary("pool200", pool, rows, seed, "fixed by 04"),
         "heldout100": _summary("heldout100", held, rows, seed, "fixed by 04"),
+        "heldout691": _summary("heldout691", every_held, rows, seed,
+                               "every held-out-repo task, a superset of heldout100; 04 gives 691"),
         "verified100": _summary("verified100", verified, rows, seed, "fixed by 04"),
     }
