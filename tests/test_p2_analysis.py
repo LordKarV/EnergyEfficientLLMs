@@ -49,14 +49,14 @@ CHOSEN = {"chosen": "kl_decision", "decided": True}
 
 
 def rec(aid, task, model, profile, resolved, joules, seed=0, lst="heldout691", turns=2, end=None, cpu=10.0,
-        conc=16, measured=None, cached=0.0, malformed=None, tool_s=1.0, tool_j=None, flagged=False):
+        conc=16, measured=None, cached=0.0, malformed=None, tool_s=1.0, tool_j=None, flagged=False, grammar=False):
     """One attempt; joules (= output tokens), cached input tokens (processed but free under EM) and the measured
     gen_energy_j and tool_energy_j are spread evenly over its turns, each with tool_s tool seconds."""
     per_turn = [{"turn": i, "output_tokens": joules / turns, "input_uncached": 0, "input_cached": cached / turns,
                  "gen_s": 1.0, "tool_s": tool_s, "gen_energy_j": None if measured is None else measured / turns,
                  "tool_energy_j": None if tool_j is None else tool_j / turns} for i in range(turns)]
     return {"attempt_id": aid, "task_id": task, "list": lst, "repo": task.split("/")[0], "profile": profile,
-            "model": model, "seed": seed, "resolved": resolved,
+            "model": model, "seed": seed, "resolved": resolved, "grammar": grammar,
             "end_reason": end or ("submitted" if resolved else "turn_limit"), "turns": turns,
             "tokens": {"output": joules, "input_uncached": 0, "input_cached": cached}, "per_turn": per_turn,
             "tool_seconds": tool_s * turns, "grading": {"test_files_touched": flagged},
@@ -418,6 +418,10 @@ def edit(recs, k, **kw):
     (lambda r: edit(r, 0, malformed={}), "p2", "missing field malformed.misnested_tag"),
     (lambda r: [x for x in r if x["model"] != "random_seed0"], "p2", r"models \['random_seed0'\] have no attempts"),
     (lambda r: edit(r, 0, tool_seconds=99.0), "p2", "not the per-turn tool_s sum"),
+    (lambda r: edit(r, 0, tool_seconds=2.0 + 1e-6), "p2", "not the per-turn tool_s sum"),  # the harness sums exactly
+    (lambda r: [{k: v for k, v in x.items() if k != "grammar"} for x in r], "p2", "grammar must be true or false"),
+    (lambda r: edit(r, 0, grammar=0), "p2", "grammar must be true or false"),
+    (lambda r: edit(r, 0, list="estimator_check30"), "p2", "--estimator-check input"),
     (lambda r: edit(r, 0, grading={"resolved": False}), "p2", "grading.test_files_touched must be true or false"),
 ])
 def test_validation_errors(mutate, phase, match):
@@ -478,9 +482,10 @@ def test_scripts_end_to_end_and_missing_margin(tmp_path):
     assert res.returncode != 0 and "untrained arms" in res.stderr  # fewest_joules has P1 rows here
 
     recs, manifest = build(["fewest_turns", "random", "base"], scaled({"fewest_turns": 0.8}), seeds=(0, 1))
-    write_jsonl(tmp_path / "p2.jsonl", recs)
+    write_jsonl(tmp_path / "p2.jsonl", recs + grammar_copy(recs, {"fewest_turns": 0.9 / 0.8}))
     erows, _ = est_rows({"fewest_turns": 1.0, "random": 1.0, "base": 1.0})
-    write_jsonl(tmp_path / "est.jsonl", [{**r, "attempt_id": "e-" + r["attempt_id"]} for r in erows])
+    write_jsonl(tmp_path / "est.jsonl", [{**r, "attempt_id": "e-" + r["attempt_id"], "list": "estimator_check30"}
+                                         for r in erows])
     (tmp_path / "m2.json").write_text(json.dumps(manifest))
     common = ["--models", tmp_path / "m2.json", "--energy-model", tmp_path / "em.json", "--headline", head]
     res = run("p2_analyze.py", tmp_path / "p2.jsonl", *common, "--estimator-check", tmp_path / "est.jsonl",
@@ -488,7 +493,9 @@ def test_scripts_end_to_end_and_missing_margin(tmp_path):
     assert res.returncode == 0, res.stderr
     out = json.loads((tmp_path / "p2" / "analysis.json").read_text())
     assert out["primary"]["T"] == pytest.approx(math.log(0.8)) and out["estimator_check"]["stands"]
-    assert out["turn_cap_frontier"] is not None and "| primary |" in (tmp_path / "p2" / "analysis.md").read_text()
+    md = (tmp_path / "p2" / "analysis.md").read_text()
+    assert out["turn_cap_frontier"] is not None and "| primary |" in md and "| H4 (grammar rows) |" in md
+    assert out["h4"]["contrasts"][0]["keeps_sign"] and "keeps sign: True" in md
 
     cfg.write_text(yaml.safe_dump({**CFG, "guard_margin": None}))
     for res in (run("p1_pick_headline.py", tmp_path / "p1.jsonl", *common[:4], "--score-choice", tmp_path / "sc.json",
@@ -684,3 +691,82 @@ def test_tripwire_rates_in_pick_and_arm_table():
     recs, manifest = build(["fewest_turns", "random"], lambda *a: {"resolved": True, "joules": 100.0, "flagged": True})
     rows = analyze(recs, manifest, EM, "fewest_turns", CFG)["arms"]
     assert all(r["tripwire"]["flagged_share"] == 1 and r["tripwire"]["resolve_rate_unflagged"] is None for r in rows)
+
+
+def test_p2_lists():
+    recs, manifest = build(["fewest_turns", "random"], scaled({}), n=2)
+    for lst in ("heldout691", "heldout100", "some_frozen_subset"):
+        assert load([{**r, "list": lst} for r in recs], manifest, EM, "p2")["n_rows"] == len(recs)
+    for lst in ("pool200", "inrepo_test", "verified100"):
+        for phase in ("p2", "estimator"):
+            with pytest.raises(ValueError, match="P2 rows are tasks of the held-out repos"):
+                load(edit(recs, 0, list=lst), manifest, EM, phase)
+    erows, emanifest = est_rows({"fewest_turns": 1.0, "random": 1.0, "base": 1.0})
+    erows = [{**r, "list": "estimator_check30"} for r in erows]
+    with pytest.raises(ValueError, match="--estimator-check input"):
+        load(erows, emanifest, EM, "p2")
+    assert estimator_check(load(erows, emanifest, EM, "estimator"), "fewest_turns", CFG)["stands"]
+    main, manifest = build(["fewest_turns", "random", "base"], scaled({"fewest_turns": 0.8}), seeds=(0, 1))
+    out = analyze(main, manifest, EM, "fewest_turns", CFG,
+                  estimator_rows=[{**r, "attempt_id": "e-" + r["attempt_id"]} for r in erows])
+    assert out["estimator_check"]["stands"]
+
+
+def grammar_copy(recs, factor_by_arm, profiles=(Q4,)):
+    """Grammar-constrained reruns of recs at profiles, joules scaled per arm."""
+    return [{**r, "attempt_id": "g-" + r["attempt_id"], "grammar": True,
+             "tokens": {**r["tokens"], "output": r["tokens"]["output"] * factor_by_arm.get(r["model"].split("_seed")[0], 1)},
+             "per_turn": [{**t, "output_tokens": t["output_tokens"] * factor_by_arm.get(r["model"].split("_seed")[0], 1)}
+                          for t in r["per_turn"]]}
+            for r in recs if r["profile"] in profiles]
+
+
+def test_grammar_rows_stay_out_of_the_main_analysis():
+    recs, manifest = build(["fewest_turns", "random", "base"], scaled({"fewest_turns": 0.8}), seeds=(0, 1))
+    erows, _ = est_rows({"fewest_turns": 1.0, "random": 1.02, "base": 1.0})
+    erows = [{**r, "attempt_id": "e-" + r["attempt_id"]} for r in erows]
+    # Grammar rows that would move every number: the headline spends 3x random's joules under grammar.
+    noisy = grammar_copy(recs, {"fewest_turns": 3.0}, profiles=(Q4, BF))
+    cfg = {**CFG, "h4_contrasts": [["headline", "random"]]}
+    plain = analyze(recs, manifest, EM, "fewest_turns", cfg, estimator_rows=erows)
+    mixed = analyze(recs + noisy, manifest, EM, "fewest_turns", cfg,
+                    estimator_rows=erows + grammar_copy(erows, {"fewest_turns": 2.0}))
+    for k in ("primary", "families", "arms", "b_metrics", "tokens_ratio_contrasts", "estimator_check",
+              "turn_cap_frontier", "claim_A", "n_rows"):
+        assert mixed[k] == plain[k], k
+    assert plain["h4"] is None and mixed["n_rows_grammar"] == len(noisy)
+    p1recs, p1manifest = p1()
+    pick = pick_headline(p1recs + grammar_copy(p1recs, {"fewest_turns": 0.01}, profiles=(Q4, BF)), p1manifest, EM,
+                         CHOSEN, {"score": "kl_decision", "decision": "pass"}, CFG, "pass")
+    assert pick["headline"] == "stable"
+
+
+@pytest.mark.parametrize("factor, keeps", [(0.9, True), (1.1, False)])
+def test_h4_contrast_on_grammar_rows(factor, keeps):
+    recs, manifest = build(["fewest_turns", "random"], scaled({"fewest_turns": 0.8}), seeds=(0, 1))
+    g = grammar_copy(recs, {"fewest_turns": factor / 0.8})  # under grammar the headline spends factor x random's
+    out = analyze(recs + g, manifest, EM, "fewest_turns", {**CFG, "h4_contrasts": [["headline", "random"]]})
+    (c,) = out["h4"]["contrasts"]
+    assert (c["arm"], c["comparator"], c["profile"], c["n_tasks"]) == ("fewest_turns", "random", Q4, 20)
+    assert c["T"] == pytest.approx(math.log(factor)) and c["without_grammar"]["T"] == pytest.approx(math.log(0.8))
+    assert c["keeps_sign"] is keeps and c["effect_ratio"] == pytest.approx(math.log(factor) / math.log(0.8))
+    assert c["supported"] is keeps and c["wins"] is keeps and c["holm_p"] == c["gpu"]["p_one_sided"]
+    assert out["primary"]["T"] == pytest.approx(math.log(0.8))
+    assert "H4" in out["h4"]["reading"]
+
+
+def test_h4_holm_and_required_contrast():
+    def fn(arm, s, prof, repo, i):
+        f = {"fewest_turns": (0.7, 1.25, 0.8, 1.15, 0.95)[i], "fewest_joules": (0.75, 1.2, 0.85, 1.1, 0.9)[i]}
+        return True, f.get(arm, 1.0) * base_joules(repo, i)
+    recs, manifest = build(["fewest_turns", "fewest_joules", "random"], fn)
+    cfg = {**CFG, "h4_contrasts": [["headline", "random"], ["fewest_joules", "random"]]}
+    h4 = analyze(recs + grammar_copy(recs, {}), manifest, EM, "fewest_turns", cfg)["h4"]
+    raw = [c["gpu"]["p_one_sided"] for c in h4["contrasts"]]
+    assert len(raw) == 2 and 0 < min(raw) < 0.5
+    assert [c["holm_p"] for c in h4["contrasts"]] == pytest.approx(holm(raw))
+    with pytest.raises(ValueError, match=r"h4_contrasts must include \[headline, random\]"):
+        check_config({**CFG, "h4_contrasts": [["fewest_joules", "random"]]}, upper_bound=False)
+    g = grammar_copy([r for r in recs if r["model"] != "random_seed0"], {})
+    with pytest.raises(ValueError, match="H4 needs grammar rows of fewest_turns and random at Q4_K_M"):
+        analyze(recs + g, manifest, EM, "fewest_turns", cfg)

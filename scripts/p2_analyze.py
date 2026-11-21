@@ -5,9 +5,10 @@
         [--estimator-check outputs/attempts/<concurrency-1 run>.jsonl ...] [--config configs/p2_analysis.yaml] \
         [--out-dir outputs/p2]
 
-The attempt files hold the held-out-repo runs, one attempt per task per seed model per profile.
+The attempt files hold the held-out-repo runs, one attempt per task per seed model per profile, plus H4's
+grammar-constrained runs (grammar: true), which only the H4 family reads.
 --estimator-check holds the separate concurrency-1 Q4_K_M runs of the headline arm, random and base (one seed
-model each) with per-turn counter reads. The config's guard_margin, host_cpu_tdp_w and host_vcpus must be set.
+model each) with per-turn counter reads, on estimator_check30 or another held-out list. The config's guard_margin, host_cpu_tdp_w and host_vcpus must be set.
 """
 
 import argparse
@@ -69,6 +70,9 @@ def markdown(out):
              "|" + "---|" * 14, contrast_row("primary", p)]
     for fam, f in out["families"].items():
         lines += [contrast_row(fam, c) for c in f["contrasts"]]
+    h4 = out["h4"]
+    if h4:
+        lines += [contrast_row("H4 (grammar rows)", c) for c in h4["contrasts"]]
     lines += ["", (f"Primary, two-stage (seed, then task) bootstrap: p {ts['p_one_sided']:.4f}, upper95 T "
                    f"{fmt(ts['upper95_one_sided'])}. Sign holds in {sign['n_same_sign']} of {sign['n_repos']} repos "
                    f"(needs {sign['min_repos']}). Without infra_timeout attempts: ratio {fmt(sens['ratio'])}."), "",
@@ -81,6 +85,11 @@ def markdown(out):
         lines += ["", (f"{c['family']} secondary, Q4_K_M/BF16 processed tokens per resolved task: {c['arm']} "
                        f"{fmt(c['arm_ratio'])} vs {c['comparator']} {fmt(c['comparator_ratio'])}, ratio "
                        f"{fmt(c['ratio_of_ratios'])}, 95% [{fmt(lo)}, {fmt(hi)}].")]
+    if h4:
+        lines += ["", f"H4: {h4['reading']}"]
+        lines += [(f"- {c['arm']} vs {c['comparator']} at {c['profile']}: T {fmt(c['T'])} with grammar, "
+                   f"{fmt(c['without_grammar']['T'])} without; keeps sign: {c['keeps_sign']}; effect ratio "
+                   f"{fmt(c['effect_ratio'])}; survives: {c['supported']}.") for c in h4["contrasts"]]
     est, fr = out["estimator_check"], out["turn_cap_frontier"]
     if est:
         pairs = "; ".join(f"{k} {est['pairs'][k]['ratio']:.3f}, 95% [{est['pairs'][k]['ratio_ci95'][0]:.3f}, "

@@ -20,8 +20,8 @@ host_vcpus: null
 
 # Secondary contrasts [arm, comparator] by hypothesis family (docs/03, The question). Each runs at every
 # profile where both arms and random have attempts, with Holm within the family. The resolve-rate guard is
-# always against random (docs/04: it applies to every hypothesis), not against the comparator. H4 (grammar)
-# needs a run label the attempt records do not have yet. The per-task length covariate docs/04 names for
+# always against random (docs/04: it applies to every hypothesis), not against the comparator. The per-task
+# length covariate docs/04 names for
 # H2/H3 is not applied: it is measured on pool tasks, and these contrasts are over held-out tasks.
 families:
   H1a: [[fewest_turns, random]]
@@ -29,6 +29,11 @@ families:
   H2: [[qtrace, fewest_turns]]
   H3: [[stable, low_entropy], [stable, clean_format], [short_stable, short_unstable], [long_stable, long_unstable]]
   H5: [[qtrace, fewest_joules]]
+
+# H4 (docs/03): these contrasts rerun on the grammar-constrained rows (records with grammar: true) at every
+# profile they ran at, each compared with the same contrast without grammar on the same tasks, with Holm within
+# H4. "headline" is the P1 pick; [headline, random] at Q4_K_M (docs/03 Cost option b) is required.
+h4_contrasts: [[headline, random]]
 
 # Energy claims (docs/04, Energy upper bound): a win counts only if it also holds under the upper bound.
 upper_bound_required: [H1b, H5]

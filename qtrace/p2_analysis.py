@@ -21,6 +21,10 @@ side (T >= 0), a one-sided 95% bound is the 95th (or, for the guard, the 5th) in
 the draws and a two-sided 95% interval the 2.5th and 97.5th. A draw where an arm resolves nothing gives that
 arm JPR = inf; a draw where both do is undefined, counted, and put on the null side.
 
+Grammar: every attempt record has a bool grammar, true only for H4's grammar-constrained runs. The primary, the
+families, the arm table, the B metrics, the estimator check, the frontier and the P1 pick use grammar false rows
+only; grammar true rows enter only h4() (H4_READING).
+
 Not here: the per-task length covariate docs/04 (Selection) asks for in the H2/H3 analysis, because that length
 difference is between runs selected on pool tasks, and the contrasts are over held-out tasks, so it has no
 per-task value here (each arm's mean turns and processed tokens are in the arm table); the training-cost
@@ -55,6 +59,13 @@ SIGN_MIN_REPOS = 3  # docs/04: the sign should hold in at least 3 of the 4 held-
 ESTIMATOR_BAND = (0.95, 1.05)  # docs/04 estimator check: the exponentiated 95% CI within +/-5%
 TOKEN_RATIO_FAMILIES = ("H1a", "H2")  # docs/03: their secondary is a smaller Q4_K_M/BF16 tokens-per-resolved ratio
 NOT_SEPARABLE_WHY = "P0b arm overlap: not separable from another arm, so not trained (docs/04 P0b)"
+H4_READING = (
+    "H4 (docs/03: the differences between arms survive grammar-constrained tool calls) is read per configured "
+    "contrast and profile as: on the grammar true rows the contrast wins (one-sided test of T < 0 with Holm within "
+    "H4 below alpha, and the resolve-rate guard against random under grammar passes; the upper bound too when "
+    "upper_bound_required names H4), and T keeps the sign it has without grammar on the same tasks. The ratio of "
+    "the effects, T with grammar / T without, is reported and not tested: no threshold for how much of a gain may "
+    "be formatting is pre-registered.")
 
 
 def _q(x, q):
@@ -205,15 +216,63 @@ def families(data, cfg, cpu_w):
                 arr = arrays(data, [(arm, prof) for arm in arms], cfg["infra_error_cap"], cpu_w)
                 tested.append(contrast(arr, (a, prof), (b, prof), cfg))
         needs_ub = fam in cfg["upper_bound_required"]
-        judged = []
-        for c, p, pu in zip(tested, holm([c["gpu"]["p_one_sided"] for c in tested]),
-                            holm([c["upper_bound"]["p_one_sided"] for c in tested])):
-            wins, holds = p < cfg["alpha"] and c["guard"]["pass"], pu < cfg["alpha"] and c["guard"]["pass"]
-            judged.append({**c, "holm_p": p, "holm_p_upper_bound": pu, "wins": wins, "holds_under_upper_bound": holds,
-                           "supported": wins and (holds or not needs_ub)})
+        judged = _judge(tested, needs_ub, cfg)
         out[fam] = {"upper_bound_required": needs_ub, "n_tested": len(judged), "contrasts": judged,
                     "untested": untested}
     return out
+
+
+def _judge(tested, needs_ub, cfg):
+    """Holm within one family, on the GPU and the upper-bound p-values, and the win and support of each contrast."""
+    judged = []
+    for c, p, pu in zip(tested, holm([c["gpu"]["p_one_sided"] for c in tested]),
+                        holm([c["upper_bound"]["p_one_sided"] for c in tested])):
+        wins, holds = p < cfg["alpha"] and c["guard"]["pass"], pu < cfg["alpha"] and c["guard"]["pass"]
+        judged.append({**c, "holm_p": p, "holm_p_upper_bound": pu, "wins": wins, "holds_under_upper_bound": holds,
+                       "supported": wins and (holds or not needs_ub)})
+    return judged
+
+
+def _sign(t):
+    return 0 if t is None else np.sign(float(t))  # float() reads js()'s "inf" / "-inf"
+
+
+def h4(data, gdata, headline, cfg, cpu_w):
+    """docs/03 H4 on the grammar true rows (gdata) against the grammar false rows (data), read as H4_READING.
+
+    Each h4_contrasts pair ("headline" is the P1 pick) runs at every profile where both arms and random have
+    grammar rows, on the tasks those groups ran both with and without grammar, so the two effects are on the same
+    tasks. Holm runs within H4. supported is the H4_READING verdict for the contrast. Fails when headline and
+    random have no grammar rows at Q4_K_M, the contrast docs/03 Cost option b names.
+    """
+    pairs = dict.fromkeys(tuple(headline if x == "headline" else x for x in p) for p in cfg["h4_contrasts"])
+    have, main = present(gdata), present(data)
+    if any((arm, PRIMARY) not in have for arm in (headline, "random")):
+        raise ValueError(f"H4 needs grammar rows of {headline} and random at {PRIMARY}")
+    tested, untested = [], []
+    for a, b in pairs:
+        for prof in sorted({p for _, p in have}):
+            arms = list(dict.fromkeys((a, b, "random")))
+            missing = [arm for arm in arms if (arm, prof) not in have or (arm, prof) not in main]
+            if a == b or missing:
+                untested.append({"arm": a, "comparator": b, "profile": prof, "missing_arms": missing})
+                continue
+            groups, cap = [(arm, prof) for arm in arms], cfg["infra_error_cap"]
+            on = arrays(gdata, groups, cap, cpu_w)
+            off = arrays(data, groups, cap, cpu_w, only=on["tasks"])
+            if len(off["tasks"]) < len(on["tasks"]):  # a task with an infrastructure error without grammar
+                on = arrays(gdata, groups, cap, cpu_w, only=off["tasks"])
+            c_on, c_off = (contrast(x, (a, prof), (b, prof), cfg) for x in (on, off))
+            t_on, t_off = (None if c["T"] is None else float(c["T"]) for c in (c_on, c_off))
+            finite = t_on is not None and t_off is not None and math.isfinite(t_on) and math.isfinite(t_off)
+            tested.append({**c_on, "without_grammar": {k: c_off[k] for k in ("n_tasks", "jpr", "T", "ratio", "gpu",
+                                                                              "guard")},
+                           "keeps_sign": bool(_sign(t_off) != 0 and _sign(t_on) == _sign(t_off)),
+                           "effect_ratio": js(t_on / t_off) if finite and t_off != 0 else None})
+    judged = [{**c, "supported": c["supported"] and c["keeps_sign"]}
+              for c in _judge(tested, "H4" in cfg["upper_bound_required"], cfg)]
+    return {"reading": H4_READING, "n_rows": gdata["n_rows"], "n_tested": len(judged), "contrasts": judged,
+            "untested": untested}
 
 
 def _ratio_draws(W, A, B, X):
@@ -516,8 +575,8 @@ def pick_headline(records, manifest, energy_model, score_choice, did, cfg, p0a_v
 def analyze(records, manifest, energy_model, headline, cfg, estimator_rows=None):
     """The P2 analysis: the primary test (headline vs random at Q4_K_M, detail and the infra_timeout sensitivity),
     the hypothesis families with Holm, the arm table, B metrics per arm at Q4_K_M and BF16, the H1a/H2 tokens-ratio
-    contrasts, the estimator check
-    (when its rows are given) and the turn-cap frontier (when base ran), and the claim-A summary. Claim A on
+    contrasts, the estimator check (when its rows are given), the turn-cap frontier (when base ran), the claim-A
+    summary, all on grammar false rows, and H4 on the grammar true rows (None when there are none). Claim A on
     estimates also needs the primary's sign in at least 3 of the 4 held-out repos (docs/04)."""
     cfg = check_config(cfg, upper_bound=True)
     if headline is None:
@@ -525,6 +584,7 @@ def analyze(records, manifest, energy_model, headline, cfg, estimator_rows=None)
     if headline not in HEADLINE_ARMS:
         raise ValueError(f"headline {headline!r} is not one of the arms the P1 rule picks from, {HEADLINE_ARMS}")
     data = load(records, manifest, energy_model, "p2")
+    gdata = load(records, manifest, energy_model, "p2", every_model=False, grammar=True)
     batched = energy_model.get("batched") or {}
     if type(batched.get("below_85pct")) is not bool:
         raise ValueError("energy_model.json batched.below_85pct must be true or false: docs/04 (P0a, batched "
@@ -548,17 +608,20 @@ def analyze(records, manifest, energy_model, headline, cfg, estimator_rows=None)
          if (arm, PRIMARY) in have and (arm, REFERENCE) in have and ("random", REFERENCE) in have}
     est = None
     if estimator_rows is not None:
-        est = estimator_check(load(estimator_rows, manifest, energy_model, "p2", every_model=False), headline, cfg)
+        est = estimator_check(load(estimator_rows, manifest, energy_model, "estimator", every_model=False),
+                              headline, cfg)
     frontier = turn_cap_frontier(data, headline, energy_model, cfg) if ("base", PRIMARY) in have else None
     claim = {"primary_wins": primary["wins"], "holds_under_upper_bound": primary["holds_under_upper_bound"],
              "sign_holds": primary["sign_holds"]["holds"],
              "frontier_pass": None if frontier is None else frontier["pass"],
              "estimator_stands": None if est is None else est["stands"]}
     claim["claimed_on_estimates"] = all(v is True for v in claim.values())
-    return {"headline": headline, "energy": energy, "n_rows": data["n_rows"],
+    return {"headline": headline, "energy": energy, "n_rows": data["n_rows"], "n_rows_grammar": gdata["n_rows"],
             "n_reruns_used": data["n_reruns_used"],
             "n_resolved_after_budget_hit": data["n_resolved_after_budget_hit"],
             "primary": primary, "families": families(data, cfg, cpu_w), "arms": arm_table(data, cfg, cpu_w),
-            "b_metrics": b, "tokens_ratio_contrasts": tokens_ratio_contrasts(data, cfg), "estimator_check": est, "turn_cap_frontier": frontier, "claim_A": claim,
+            "b_metrics": b, "tokens_ratio_contrasts": tokens_ratio_contrasts(data, cfg), "estimator_check": est,
+            "turn_cap_frontier": frontier, "claim_A": claim,
+            "h4": h4(data, gdata, headline, cfg, cpu_w) if gdata["n_rows"] else None,
             "settings": {k: cfg[k] for k in ("guard_margin", "infra_error_cap", "n_boot", "seed", "alpha",
                                              "host_cpu_tdp_w", "host_vcpus")}}

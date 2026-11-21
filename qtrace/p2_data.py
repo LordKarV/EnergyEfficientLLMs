@@ -4,6 +4,9 @@ Attempt records are in the issue #1 format. A models manifest maps each record's
 {arm, seed}: seed is the training seed, arm "base" is the untouched model and "base_nothink" the same model
 with thinking off (docs/03 Baselines). A base entry may give seed null, and then its replicates are the
 attempts' sampling seeds, because the base model has no training seed but P2 runs it 3 times like the arms.
+Every record carries a required bool `grammar`: true only for H4's grammar-constrained runs (docs/03
+Baselines). load() indexes one side of it, so grammar rows enter H4 only and every other statistic uses
+grammar false rows.
 Joules come from energy_model.json (#13): per profile, the raw generation-window model plus that profile's
 idle_w x tool_seconds, the provisional whole-attempt quantity its ranking block names.
 Everything is checked here, once, and an input that would make a statistic quietly wrong fails with a message
@@ -23,9 +26,13 @@ ARMS = ("random", "fewest_turns", "fewest_joules", "stable", "qtrace", "low_entr
 BASE_ARMS = ("base", "base_nothink")  # untrained, so no training seed
 ARM_NAMES = frozenset(ARMS) | set(BASE_ARMS) | {"random_fq"}
 POOL_REPOS = ("pandas", "numpy", "pillow", "orange3", "aiohttp", "tornado")  # qtrace/tasklists.py (#3)
-# #3's frozen lists that hold no task of the 4 held-out repos. heldout100 is a subset of them; #3 has no
-# list name for all 691, so a P2 row is recognized by its repo.
+# #3's frozen lists that hold no task of the 4 held-out repos. A P2 row is on heldout691 (all 691 held-out
+# tasks), its subset heldout100, or another list of the held-out repos (a secondary-tier subset), so it is
+# recognized by its repo and any of those list names.
 NOT_HELDOUT_LISTS = frozenset({"pool200", "inrepo_test", "verified100"})
+# The estimator check's 30 tasks, drawn from heldout691 minus heldout100 (owner's procedure, frozen before P1).
+# Those concurrency-1 runs are a separate input, so the main P2 input refuses this list.
+ESTIMATOR_LIST = "estimator_check30"
 END_REASONS = ("submitted", "turn_limit", "context_limit", "infra_timeout", "error")
 MALFORMED = ("misnested_tag", "wrong_name", "text_after_call", "truncated_call", "no_call_no_answer")  # issue #1
 TURN_FIELDS = ("output_tokens", "input_uncached", "input_cached", "gen_s", "tool_s")
@@ -60,8 +67,10 @@ def js(x):
 
 
 def check_config(cfg, upper_bound):
-    """The analysis settings, checked, as a new dict with infra_error_cap (0.05), families ({}) and
-    upper_bound_required ([]) filled in. guard_margin has no default: docs/04 sets it from P0b's measured SE."""
+    """The analysis settings, checked, as a new dict with infra_error_cap (0.05), families ({}),
+    h4_contrasts ([[headline, random]]) and upper_bound_required ([]) filled in. guard_margin has no default:
+    docs/04 sets it from P0b's measured SE. h4_contrasts may name "headline" (the P1 pick) and must include
+    [headline, random], the H4 contrast docs/03 Cost option b runs."""
     if cfg.get("guard_margin") is None:
         raise ValueError("guard_margin is required (docs/04: set from P0b's measured standard error, frozen before P1)")
     margin = number(cfg["guard_margin"], "guard_margin", positive=True)
@@ -86,11 +95,19 @@ def check_config(cfg, upper_bound):
             if (not isinstance(pair, (list, tuple)) or len(pair) != 2 or not set(pair) <= ARM_NAMES
                     or pair[0] == pair[1]):
                 raise ValueError(f"family {fam}: each contrast is [arm, comparator] of two known arms, got {pair!r}")
+    h4 = [list(p) for p in cfg.get("h4_contrasts") or [["headline", "random"]]]
+    for pair in h4:
+        if len(pair) != 2 or not set(pair) <= ARM_NAMES | {"headline"} or pair[0] == pair[1]:
+            raise ValueError(f"h4_contrasts: each contrast is [arm, comparator] of two known arms or headline, "
+                             f"got {pair!r}")
+    if ["headline", "random"] not in h4:
+        raise ValueError(f"h4_contrasts must include [headline, random] (docs/03 H4), got {h4!r}")
     ub_required = list(cfg.get("upper_bound_required") or ())
-    unknown = set(ub_required) - set(families)
+    unknown = set(ub_required) - set(families) - {"H4"}
     if unknown:
         raise ValueError(f"upper_bound_required names families that are not configured: {sorted(unknown)}")
-    return {**cfg, "infra_error_cap": cap, "families": families, "upper_bound_required": ub_required}
+    return {**cfg, "infra_error_cap": cap, "families": families, "h4_contrasts": h4,
+            "upper_bound_required": ub_required}
 
 
 def check_manifest(manifest):
@@ -145,9 +162,12 @@ def _check_phase(rec, phase, lst, repo):
     if phase == "p1" and (lst != "inrepo_test" or repo not in POOL_REPOS):
         raise ValueError(f"attempt {rec['attempt_id']!r}: P1 rows are inrepo_test tasks of the pool repos, "
                          f"got list {lst!r}, repo {repo!r}")
-    if phase == "p2" and (repo not in HELDOUT_REPOS or lst in NOT_HELDOUT_LISTS):
+    if phase in ("p2", "estimator") and (repo not in HELDOUT_REPOS or lst in NOT_HELDOUT_LISTS):
         raise ValueError(f"attempt {rec['attempt_id']!r}: P2 rows are tasks of the held-out repos {HELDOUT_REPOS}, "
                          f"got list {lst!r}, repo {repo!r}")
+    if phase == "p2" and lst == ESTIMATOR_LIST:
+        raise ValueError(f"attempt {rec['attempt_id']!r}: {ESTIMATOR_LIST} rows go in the --estimator-check input, "
+                         "not the P2 attempts")
 
 
 def summarize(rec, entry):
@@ -168,7 +188,9 @@ def summarize(rec, entry):
             raise ValueError(f"{where} turn {i}: missing {missing}")
     tool_s = sum(number(t["tool_s"], f"{where} turn {i} tool_s") for i, t in enumerate(per_turn))
     tool_seconds = number(need(rec, "tool_seconds"), f"{where} tool_seconds")
-    if not math.isclose(tool_s, tool_seconds, rel_tol=1e-6, abs_tol=1e-3):
+    # The harness writes tool_seconds as sum(per_turn[].tool_s) in turn order, the sum taken here, so the two are
+    # equal; 1e-9 is the owner's suggested tolerance.
+    if not math.isclose(tool_s, tool_seconds, rel_tol=1e-9, abs_tol=1e-9):
         raise ValueError(f"{where}: tool_seconds {tool_seconds} is not the per-turn tool_s sum {tool_s}")
     # docs/04 Test-file tripwire; a required field (format pin), so a missing flag is an error, never "unflagged".
     if type(need(rec, "grading").get("test_files_touched")) is not bool:
@@ -196,10 +218,14 @@ def summarize(rec, entry):
             "malformed": malformed, "rec": rec}
 
 
-def load(records, manifest, energy_model, phase, every_model=True):
+def load(records, manifest, energy_model, phase, every_model=True, grammar=False):
     """Check attempt rows and index them as cells[(arm, rep, profile)][task_id] -> summarize() output.
 
-    phase "p1" accepts only inrepo_test rows of the pool repos, "p2" only rows of the held-out repos. A cell
+    phase "p1" accepts only inrepo_test rows of the pool repos, "p2" only rows of the held-out repos and not the
+    estimator check's list, "estimator" (the --estimator-check input) held-out rows including that list. Every
+    record must have a bool grammar; only rows whose grammar equals the argument are indexed, so the main
+    analysis (grammar false) and H4 (grammar true) never share a row. Attempt ids are unique over all records. A
+    cell
     entry is None when every attempt there ended in an infrastructure error; an error attempt next to a
     finished one is the rerun docs/04 asks for, and the finished one is used. Fails on duplicate attempt
     ids, unknown models, a profile without an energy model, more than one finished attempt per task per seed
@@ -209,11 +235,11 @@ def load(records, manifest, energy_model, phase, every_model=True):
     tier runs a held-out subset), and arrays() uses the tasks the groups share. The task lists themselves are
     not an input, so a task no cell of its list ran is not caught.
     """
-    if phase not in ("p1", "p2"):
-        raise ValueError(f"phase must be 'p1' or 'p2', got {phase!r}")
+    if phase not in ("p1", "p2", "estimator"):
+        raise ValueError(f"phase must be 'p1', 'p2' or 'estimator', got {phase!r}")
     check_manifest(manifest)
     energy = energy_settings(energy_model)
-    seen, repo_of, rows, models = set(), {}, defaultdict(list), set()
+    seen, repo_of, rows, models, n_other = set(), {}, defaultdict(list), set(), 0
     lists, list_tasks = defaultdict(set), defaultdict(set)  # task lists per cell, tasks per task list
     for rec in records:
         aid = need(rec, "attempt_id")
@@ -223,6 +249,8 @@ def load(records, manifest, energy_model, phase, every_model=True):
         task, lst, repo, profile, model, end = (need(rec, k) for k in ("task_id", "list", "repo", "profile", "model",
                                                                       "end_reason"))
         need(rec, "seed")
+        if type(rec.get("grammar")) is not bool:
+            raise ValueError(f"attempt {aid!r}: grammar must be true or false, got {rec.get('grammar')!r}")
         if end not in END_REASONS:
             raise ValueError(f"attempt {aid!r}: end_reason {end!r} is not one of {END_REASONS}")
         _check_phase(rec, phase, lst, repo)
@@ -231,6 +259,9 @@ def load(records, manifest, energy_model, phase, every_model=True):
         if model not in manifest:
             raise ValueError(f"attempt {aid!r}: model {model!r} is not in the models manifest")
         profile_model(energy_model, profile, aid)
+        if rec["grammar"] is not grammar:
+            n_other += 1
+            continue
         m = manifest[model]
         rep = m["seed"] if m["seed"] is not None else f"sampling{rec['seed']}"
         rows[m["arm"], rep, profile, task].append(rec)
@@ -262,7 +293,8 @@ def load(records, manifest, energy_model, phase, every_model=True):
         if len({frozenset(r) for r in by_profile.values()}) > 1:
             seen_reps = {p: sorted(map(str, r)) for p, r in by_profile.items()}
             raise ValueError(f"incomplete design: {arm} has different seed models per profile: {seen_reps}")
-    return {"cells": dict(cells), "repo": repo_of, "n_rows": len(seen), "n_reruns_used": n_reruns,
+    return {"cells": dict(cells), "repo": repo_of, "n_rows": len(seen) - n_other, "n_rows_other_grammar": n_other,
+            "n_reruns_used": n_reruns,
             "n_resolved_after_budget_hit": n_budget, "energy": energy}
 
 
@@ -277,7 +309,7 @@ def reps_of(data, arm, profile):
                   key=lambda r: (isinstance(r, str), r))
 
 
-def arrays(data, groups, cap, cpu_w=None, drop_timeouts=False):
+def arrays(data, groups, cap, cpu_w=None, drop_timeouts=False, only=None):
     """Seed-level arrays [S, n] per (arm, profile) group, on the tasks every group ran and can use.
 
     Keys: E (estimated whole-attempt GPU joules), G (its generation-window part), I (idle-subtracted, None when a
@@ -285,7 +317,8 @@ def arrays(data, groups, cap, cpu_w=None, drop_timeouts=False):
     (resolved), F (test-file tripwire flag), P (processed tokens), reps (seed models, in row order). A task is
     dropped for every group when any seed model of any group has only an infrastructure-error attempt on it; more
     than `cap` of the tasks dropped is an error. drop_timeouts also drops tasks with an infra_timeout attempt
-    (docs/04's sensitivity analysis; everywhere else they are charged as failures).
+    (docs/04's sensitivity analysis; everywhere else they are charged as failures). only, when given, limits the
+    tasks to that set (H4 compares grammar on and off on the same tasks).
     """
     cells = {}
     for g in groups:
@@ -293,7 +326,8 @@ def arrays(data, groups, cap, cpu_w=None, drop_timeouts=False):
         if not reps:
             raise ValueError(f"no attempts for arm {g[0]!r} at {g[1]}")
         cells[g] = (reps, [data["cells"][g[0], r, g[1]] for r in reps])
-    every = sorted(set.intersection(*(set(c) for _, cs in cells.values() for c in cs)))
+    every = set.intersection(*(set(c) for _, cs in cells.values() for c in cs))
+    every = sorted(every if only is None else every & set(only))
     errors = {t for _, cs in cells.values() for c in cs for t in every if c[t] is None}
     if len(errors) > cap * len(every):
         raise ValueError(f"{len(errors)} of {len(every)} tasks have an unrerun infrastructure error in "
