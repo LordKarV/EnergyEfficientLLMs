@@ -10,13 +10,18 @@ the CUDA run that decides it (PR #11 review, should-fix 2), is CRITERION below, 
 - run means of NLL and entropy: relative change <= 1%
 - top-1 agreement between runtimes >= 98%
 - noise floor: mean KL(HF BF16 || GGUF BF16) <= 10% of kl_mean(Q4_K_M), the smaller of the two P0d
-  probes' signals, measured on the same episode with the same helper call
+  probes' signals, on the same episode; the mean is of the exact KL over a seeded sample of
+  NOISE_FLOOR_POSITIONS scored positions (below)
 
-The noise floor needs the GGUF distribution at every scored position without writing 248,320 floats
-per position, so the helper dumps its top-k ids and log-probabilities (kl_score --top-k) and the KL is
-taken over the k tokens plus one cell for the rest. By the data-processing inequality that is a lower
-bound on the full KL; tail_mass_hf reports how much HF probability the tail cell holds, so the bound's
-tightness is visible.
+The noise floor is a ceiling, so it is judged on the exact KL, not on a lower bound. The exact KL
+needs the GGUF's whole distribution (248,320 log-probabilities per position), so a second helper call
+dumps it (kl_score --top-k n_vocab) at NOISE_FLOOR_POSITIONS scored positions drawn with
+NOISE_FLOOR_SEED, and the criterion's mean is the mean over that sample. That call asks for logits at
+fewer positions per batch than the scoring run, which can move llama.cpp's kernels (qtrace/kl_gguf.py);
+the result is still GGUF BF16 against HF BF16. Over every scored position the row also reports
+noise_floor_kl_topk: the KL over the GGUF's top-k tokens plus one cell for the rest, a lower bound on
+the full KL by the data-processing inequality, with tail_mass_hf, the HF probability in that cell.
+These two are informative and are not judged.
 
     python scripts/check_kl_runtime.py EPISODE.npz --hf models/Qwen3.5-4B --kl-score bin/kl_score \
         --gguf-bf16 bf16.gguf --gguf-q4 q4_k_m.gguf [--device cuda] [--out row.json]
@@ -48,6 +53,8 @@ CRITERION = {
     "top1_agreement": 0.98,
     "noise_floor_over_q4_kl_mean": 0.10,
 }
+NOISE_FLOOR_POSITIONS = 128  # positions with the exact KL; declared with CRITERION
+NOISE_FLOOR_SEED = 0
 
 
 @torch.no_grad()
@@ -75,13 +82,17 @@ def summary(x):
             "mean": float(np.mean(x))}
 
 
-def judge(gguf, hf, q4_kl_mean):
-    """Every declared number and whether it meets CRITERION."""
+def judge(gguf, hf, q4_kl_mean, kl_exact):
+    """Every declared number and whether it meets CRITERION.
+
+    kl_exact: the exact KL(HF || GGUF) at the noise-floor sample; its mean is the judged noise floor.
+    hf["kl_floor"] is the top-k lower bound at every position, reported only.
+    """
     d_nll, d_ent = summary(np.abs(gguf["nll_p"] - hf["nll"])), summary(np.abs(gguf["entropy_p"] - hf["entropy"]))
     rel = {k: float(abs(gguf[g].mean() - hf[h].mean()) / abs(hf[h].mean()))
            for k, g, h in (("nll", "nll_p", "nll"), ("entropy", "entropy_p", "entropy"))}
     top1 = float((gguf["topk_ids"][:, 0] == hf["argmax"]).mean())
-    floor = summary(hf["kl_floor"])
+    floor = summary(kl_exact)
     ratio = floor["mean"] / q4_kl_mean
     c = CRITERION
     passes = {f"abs_dnll_{q}": d_nll[q] <= c["abs_dnll"][q] for q in ("median", "p99", "max")}
@@ -90,7 +101,9 @@ def judge(gguf, hf, q4_kl_mean):
     passes |= {"top1_agreement": top1 >= c["top1_agreement"],
                "noise_floor_over_q4_kl_mean": ratio <= c["noise_floor_over_q4_kl_mean"]}
     return {"abs_dnll": d_nll, "abs_dentropy": d_ent, "rel_mean_change": rel, "top1_agreement": top1,
-            "noise_floor_kl": floor, "tail_mass_hf": summary(hf["tail_mass_hf"]), "q4_kl_mean": q4_kl_mean,
+            "noise_floor_kl": {**floor, "n_positions": len(kl_exact)},
+            "noise_floor_kl_topk": summary(hf["kl_floor"]), "tail_mass_hf": summary(hf["tail_mass_hf"]),
+            "q4_kl_mean": q4_kl_mean,
             "noise_floor_over_q4_kl_mean": ratio, "criterion": CRITERION, "pass": passes,
             "all_pass": all(passes.values())}
 
@@ -112,6 +125,10 @@ def main(argv=None):
 
     t = time.time()
     g, = compare_gguf(args.kl_score, args.gguf_bf16, args.gguf_q4, [(ids, idx)], top_k=args.top_k)
+    sub = torch.from_numpy(np.sort(np.random.default_rng(NOISE_FLOOR_SEED).choice(
+        len(idx), min(NOISE_FLOOR_POSITIONS, len(idx)), replace=False)))
+    full, = compare_gguf(args.kl_score, args.gguf_bf16, args.gguf_q4, [(ids, idx[sub])],
+                         top_k=g["runtime"]["n_vocab"])
     gguf_s = time.time() - t
     gguf = {k: v.numpy() for k, v in g.items() if k != "runtime"}
 
@@ -119,12 +136,17 @@ def main(argv=None):
     t = time.time()
     model = AutoModelForCausalLM.from_pretrained(args.hf, dtype=torch.bfloat16).to(args.device).eval()
     with torch.no_grad():
-        hf = hf_stats(model.lm_head, hidden_at(model, ids[None], idx), ids[idx + 1], g["topk_ids"], g["topk_logprob"])
+        hidden, targets = hidden_at(model, ids[None], idx), ids[idx + 1]
+        hf = hf_stats(model.lm_head, hidden, targets, g["topk_ids"], g["topk_logprob"])
+        # chunk 16: each chunk holds [chunk, n_vocab] float64 log-probabilities and their gather
+        kl_exact = hf_stats(model.lm_head, hidden[sub.to(hidden.device)], targets[sub], full["topk_ids"], full["topk_logprob"],
+                            chunk=16)["kl_floor"]
     hf_s = time.time() - t
 
     row = {"episode": os.path.basename(args.episode), "n_tokens": len(ids), "n_scored": len(idx),
            "gguf_bf16": os.path.basename(args.gguf_bf16), "gguf_q4": os.path.basename(args.gguf_q4),
-           "top_k": args.top_k, **judge(gguf, hf, float(gguf["kl"].mean())), "runtime": g["runtime"],
+           "top_k": args.top_k, "noise_floor_positions": idx[sub].tolist(), "noise_floor_seed": NOISE_FLOOR_SEED,
+           **judge(gguf, hf, float(gguf["kl"].mean()), kl_exact), "runtime": g["runtime"],
            "hf_device": args.device, "torch": torch.__version__, "machine": platform.platform(),
            "seconds": {"gguf": round(gguf_s, 1), "hf": round(hf_s, 1)}}
     print(json.dumps(row, indent=1))

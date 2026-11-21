@@ -340,8 +340,10 @@ def test_runtime_criterion_flags_each_failure():
     hf = {"nll": np.full(n, 0.5), "entropy": np.full(n, 0.5), "argmax": pos, "kl_floor": np.full(n, 1e-4),
           "tail_mass_hf": np.zeros(n)}
     gguf = {"nll_p": hf["nll"] + 1e-3, "entropy_p": hf["entropy"].copy(), "topk_ids": pos[:, None]}
-    ok = check.judge(gguf, hf, q4_kl_mean=0.019)
-    assert ok["all_pass"] and ok["noise_floor_over_q4_kl_mean"] == pytest.approx(1e-4 / 0.019)
+    exact = np.full(128, 2e-4)
+    ok = check.judge(gguf, hf, 0.019, exact)
+    assert ok["all_pass"] and ok["noise_floor_over_q4_kl_mean"] == pytest.approx(2e-4 / 0.019)
+    assert ok["noise_floor_kl"]["n_positions"] == 128 and ok["noise_floor_kl_topk"]["mean"] == pytest.approx(1e-4)
     cases = {
         "abs_dnll_median": {"nll_p": hf["nll"] + 0.02 * alt},
         "abs_dnll_p99": {"nll_p": hf["nll"] + 0.5 * few},
@@ -354,9 +356,11 @@ def test_runtime_criterion_flags_each_failure():
         "top1_agreement": {"topk_ids": (pos + (pos < 30))[:, None]},  # 3% disagree
     }
     for key, change in cases.items():
-        assert {k for k, v in check.judge({**gguf, **change}, hf, 0.019)["pass"].items() if not v} == {key}, key
-    low_signal = check.judge(gguf, hf, q4_kl_mean=1e-4)["pass"]
-    assert {k for k, v in low_signal.items() if not v} == {"noise_floor_over_q4_kl_mean"}
+        assert {k for k, v in check.judge({**gguf, **change}, hf, 0.019, exact)["pass"].items() if not v} == {key}, key
+    # The ceiling is judged on the exact KL: a top-k lower bound far under 10% must not pass it.
+    for q4, kl_exact in ((1e-4, exact), (0.019, np.full(128, 0.01))):
+        failed = {k for k, v in check.judge(gguf, hf, q4, kl_exact)["pass"].items() if not v}
+        assert failed == {"noise_floor_over_q4_kl_mean"}
     assert set(cases) | {"noise_floor_over_q4_kl_mean"} == set(ok["pass"])
 
 
@@ -369,6 +373,7 @@ def test_check_script_runs_on_the_tiny_models(tiny, tmp_path):
                       tiny["p"], "--gguf-q4", tiny["q"], "--device", "cpu", "--top-k", "16",
                       "--out", str(tmp_path / "row.json")])
     assert row["n_scored"] == len(logit_index(e["model_mask"])) and len(row["pass"]) == 10
+    assert row["noise_floor_kl"]["n_positions"] == len(row["noise_floor_positions"]) == 128
     # The script loads HF in bf16 against f32 GGUFs, so only the noise floor is checked: top-1 agreement
     # is low on a tiny model's near-tied logits.
     assert row["noise_floor_over_q4_kl_mean"] < 0.1
