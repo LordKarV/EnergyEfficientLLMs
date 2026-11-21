@@ -121,13 +121,15 @@ def test_empty_run_is_not_scored_as_stable():
     empty = {k: torch.zeros(0) for k in ("kl", "flip", "entropy_p", "nll_p", "nll_q")}
     s = summarize(empty, torch.zeros(0, dtype=torch.bool))
     assert s["kl_mean"] is None and s["kl_decision"] is None and s["n_scored"] == 0
+    assert s["entropy_mean"] is None and s["entropy_decision"] is None
 
 
 def test_summarize_reports_decision_and_whole_run():
     stats = {"kl": torch.tensor([1.0, 2.0, 3.0, 4.0]), "flip": torch.tensor([0.0, 1.0, 0.0, 0.0]),
-             "entropy_p": torch.tensor([0.1, 0.2, 0.3, 0.4]), "nll_p": torch.zeros(4), "nll_q": torch.zeros(4)}
+             "entropy_p": torch.tensor([0.1, 0.2, 0.3, 0.5]), "nll_p": torch.zeros(4), "nll_q": torch.zeros(4)}
     s = summarize(stats, torch.tensor([False, True, False, True]))
     assert s["kl_mean"] == 2.5 and s["kl_decision"] == 3.0
+    assert abs(s["entropy_mean"] - 0.275) < 1e-6 and abs(s["entropy_decision"] - 0.35) < 1e-6  # positions 1 and 3
     assert s["kl_sum_all"] == 10.0 and s["kl_sum_decision"] == 6.0
     assert s["n_scored"] == 4 and s["n_decision"] == 2 and s["flip_rate"] == 0.25
 
