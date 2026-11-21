@@ -7,7 +7,9 @@ run's attempts (the pilot, the energy sub-run, P0d continuations):
     {"P0b": ["run-..."], "P0a": ["run-..."], "P0c": ["run-..."]}
 Records with end_reason "error" are dropped (04 reruns them as fresh attempts) and duplicate
 attempt ids are dropped; both are counted per gate. Attempt counts per task and profile are
-checked against the design (P0b 16, P0a 3, P0c 4).
+checked against the design (P0b 16, P0a 3, P0c 4). Every gate also reports its result excluding
+flagged attempts (test-file tripwire), the flagged share per profile, and a sensitivity analysis
+excluding infra_timeout hits (04).
 """
 
 import argparse
@@ -18,7 +20,16 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from qtrace.common import read_jsonl
-from qtrace.p0_analysis import clean, design_mismatches, p0a_factors, p0a_primary, p0b_report, p0c_breakage
+from qtrace.p0_analysis import (
+    clean,
+    design_mismatches,
+    flagged,
+    flagged_share,
+    p0a_factors,
+    p0a_primary,
+    p0b_report,
+    p0c_breakage,
+)
 
 DESIGN = {"P0b": 16, "P0a": 3, "P0c": 4}
 
@@ -28,30 +39,45 @@ def gate_rows(rows, run_ids, lst):
     return [r for r in picked if lst is None or r["list"] == lst], dropped
 
 
+def unflagged(rows):
+    return [r for r in rows if not flagged(r)]
+
+
+def no_timeouts(rows):
+    return [r for r in rows if r["end_reason"] != "infra_timeout"]
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("attempts", nargs="+")
     ap.add_argument("--manifest", required=True)
     ap.add_argument("--inrepo-size", type=int, required=True, help="set by the owner (04, Owner decisions)")
+    ap.add_argument("--min-candidates", type=int, default=4, help="P0b fallback 1 sets 2 (04, P0b)")
     ap.add_argument("--n-boot", type=int, default=5000)
     ap.add_argument("--seed", type=int, default=20261119)
     ap.add_argument("--out", default="outputs/p0/gates.json")
     args = ap.parse_args()
 
     rows = [r for path in args.attempts for r in read_jsonl(path)]
-    manifest = json.load(open(args.manifest))
+    with open(args.manifest) as f:
+        manifest = json.load(f)
     gates = {}
 
     if "P0b" in manifest:
         sel, dropped = gate_rows(rows, manifest["P0b"], None)
-        gates["P0b"] = {**p0b_report(sel, inrepo_size=args.inrepo_size), "dropped": dropped,
-                        "design_mismatches": design_mismatches(sel, DESIGN["P0b"])}
+        sens = p0b_report(no_timeouts(sel), inrepo_size=args.inrepo_size, min_candidates=args.min_candidates)
+        gates["P0b"] = {**p0b_report(sel, inrepo_size=args.inrepo_size, min_candidates=args.min_candidates),
+                        "flagged_share": flagged_share(sel),
+                        "sensitivity_excluding_infra_timeout": {k: v for k, v in sens.items()
+                                                                if k not in ("per_task", "tasks_below_design_attempts")},
+                        "dropped": dropped, "design_mismatches": design_mismatches(sel, DESIGN["P0b"])}
     if "P0a" in manifest:
         sel, dropped = gate_rows(rows, manifest["P0a"], "heldout100")
-        no_timeouts = [r for r in sel if r.get("end_reason") != "infra_timeout"]
         gates["P0a"] = {"primary": p0a_primary(sel, n_boot=args.n_boot, seed=args.seed),
+                        "primary_excluding_flagged": p0a_primary(unflagged(sel), n_boot=args.n_boot, seed=args.seed),
+                        "flagged_share": flagged_share(sel),
                         "factors": p0a_factors(sel),
-                        "sensitivity_excluding_infra_timeout": p0a_primary(no_timeouts, n_boot=args.n_boot,
+                        "sensitivity_excluding_infra_timeout": p0a_primary(no_timeouts(sel), n_boot=args.n_boot,
                                                                            seed=args.seed),
                         "dropped": dropped, "design_mismatches": design_mismatches(sel, DESIGN["P0a"])}
     if "P0c" in manifest:
@@ -59,8 +85,12 @@ def main():
             raise SystemExit("P0c bins tasks by P0b's success counts; add P0b's run ids to the manifest")
         counts = {t: v["successes"] for t, v in gates["P0b"]["per_task"].items()}
         sel, dropped = gate_rows(rows, manifest["P0c"], "pool200")
-        gates["P0c"] = {p: p0c_breakage(sel, counts, p, n_boot=args.n_boot, seed=args.seed)
+        kw = {"n_boot": args.n_boot, "seed": args.seed}
+        gates["P0c"] = {p: {**p0c_breakage(sel, counts, p, **kw),
+                            "excluding_flagged": p0c_breakage(unflagged(sel), counts, p, **kw),
+                            "sensitivity_excluding_infra_timeout": p0c_breakage(no_timeouts(sel), counts, p, **kw)}
                         for p in ("Q4_K_M", "Q3_K_M") if any(r["profile"] == p for r in sel)}
+        gates["P0c"]["flagged_share"] = flagged_share(sel)
         gates["P0c"]["dropped"] = dropped
         gates["P0c"]["design_mismatches"] = design_mismatches(sel, DESIGN["P0c"])
 

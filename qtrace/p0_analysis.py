@@ -5,6 +5,7 @@ records of the gate's own runs (selected by run_id, see scripts/p0_analyze.py). 
 end_reason "error" are infrastructure faults that 04 reruns as fresh attempts, so they are dropped
 and counted; infra_timeout stays in as a failure, with a sensitivity analysis that excludes it.
 Bootstraps resample tasks, keep every attempt and profile of a task together, and are seeded.
+grading.test_files_touched is a required bool in every record and is read strictly.
 """
 
 import math
@@ -22,9 +23,16 @@ def processed_tokens(rec):
 
 
 def clean(rows):
-    """Drop infrastructure errors (rerun as fresh attempts) and duplicate attempt ids; count both."""
+    """Drop infrastructure errors (rerun as fresh attempts) and duplicate attempt ids; count both.
+
+    Raises on a resolved record whose end_reason is not "submitted": 04 charges a budget hit or an
+    infra_timeout as a failure, so such a record means the harness graded a run it should not have.
+    """
     seen, kept, dropped = set(), [], Counter()
     for r in rows:
+        if r["resolved"] and r["end_reason"] != "submitted":
+            raise ValueError(f"attempt {r.get('attempt_id')!r} is resolved with end_reason {r['end_reason']!r}; "
+                             "resolved requires end_reason 'submitted'")
         if r.get("end_reason") == "error":
             dropped["error"] += 1
             continue
@@ -128,8 +136,20 @@ def p0a_factors(rows, quantized="Q4_K_M", base="BF16"):
 
 
 def flagged(rec):
-    """The grader's test-file tripwire (04, "Test-file tripwire")."""
-    return bool((rec.get("grading") or {}).get("test_files_touched"))
+    """The grader's test-file tripwire (04, "Test-file tripwire"). A missing key raises, never reads as False."""
+    v = rec["grading"]["test_files_touched"]
+    if not isinstance(v, bool):
+        raise TypeError(f"attempt {rec.get('attempt_id')!r}: grading.test_files_touched must be a bool, got {v!r}")
+    return v
+
+
+def flagged_share(rows):
+    """profile -> share of its attempts that tripped the test-file tripwire (#9 reporting rule)."""
+    n, k = Counter(), Counter()
+    for r in rows:
+        n[r["profile"]] += 1
+        k[r["profile"]] += flagged(r)
+    return {p: k[p] / n[p] for p in sorted(n)}
 
 
 def p0b_report(rows, inrepo_size, pool_total=3887, heldout_total=691, min_candidates=4, design=16):
@@ -137,10 +157,10 @@ def p0b_report(rows, inrepo_size, pool_total=3887, heldout_total=691, min_candid
 
     Pool successes count unflagged runs only, because flagged runs can never be selection candidates.
     """
-    def successes(lst):
+    def successes(lst, skip_flagged=False):
         acc = defaultdict(lambda: [0, 0, None])
         for r in rows:
-            if r["list"] == lst and r["profile"] == "BF16":
+            if r["list"] == lst and r["profile"] == "BF16" and not (skip_flagged and flagged(r)):
                 a = acc[r["task_id"]]
                 a[0] += int(bool(r["resolved"]) and not (lst == "pool200" and flagged(r)))
                 a[1] += 1
@@ -159,6 +179,8 @@ def p0b_report(rows, inrepo_size, pool_total=3887, heldout_total=691, min_candid
     share = ge4 / ge1 if ge1 else 0.0
     projected = (ge4 / n) * (pool_total - inrepo_size) if n else 0.0
     held_pass1 = float(np.mean([s / k for s, k, _ in held.values()])) if held else None
+    held_ex = successes("heldout100", skip_flagged=True)  # flagged attempts leave the denominator too
+    held_pass1_ex = float(np.mean([s / k for s, k, _ in held_ex.values()])) if held_ex else None
     short = sorted(t for t, (_, k, _) in {**pool, **held}.items() if k < design)
     return {
         "pool": {"n_tasks": n, "n_ge1": ge1, "n_ge4": ge4, "by_repo": dict(by_repo),
@@ -169,6 +191,7 @@ def p0b_report(rows, inrepo_size, pool_total=3887, heldout_total=691, min_candid
         "criteria": {"share_ge4_among_solvable": share},
         "projected_pool": projected,
         "heldout_mean_pass1": held_pass1,
+        "heldout_mean_pass1_excluding_flagged": held_pass1_ex,
         "heldout_expected_resolves": None if held_pass1 is None else held_pass1 * heldout_total,
         "rl_share_mixed": mixed / n if n else 0.0,
         "pass": {"c1": share > 0.5, "c2": projected >= 500,

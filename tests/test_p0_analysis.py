@@ -8,8 +8,20 @@ import sys
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
-from qtrace.p0_analysis import (clean, design_mismatches, p0a_factors, p0a_primary, p0a_verdict, p0b_report,
-                                p0c_breakage, processed_tokens)
+import pytest
+
+from qtrace.p0_analysis import (
+    clean,
+    design_mismatches,
+    flagged,
+    flagged_share,
+    p0a_factors,
+    p0a_primary,
+    p0a_verdict,
+    p0b_report,
+    p0c_breakage,
+    processed_tokens,
+)
 
 _ids = iter(range(10**9))
 
@@ -19,6 +31,7 @@ def rec(task, profile, resolved, out=100, unc=900, cached=4000, lst="heldout100"
     end_reason = end_reason or ("submitted" if resolved else "turn_limit")
     return {"attempt_id": f"a{next(_ids)}", "run_id": run_id, "task_id": task, "profile": profile,
             "resolved": resolved, "list": lst, "runtime": runtime, "repo": repo, "end_reason": end_reason,
+            "grading": {"test_files_touched": False},
             "tokens": {"output": out, "input_uncached": unc, "input_cached": cached}}
 
 
@@ -165,3 +178,84 @@ def test_p0b_counts_only_unflagged_successes():
     rep = p0b_report(rows, inrepo_size=300)
     assert rep["per_task"]["p0"]["successes"] == 3 and rep["pool"]["n_ge4"] == 0
     assert rep["pool"]["flagged_successes_excluded"] == 3
+
+
+def test_clean_rejects_resolved_without_submission():
+    # Integration finding: a scored-budget hit or infra_timeout is a failure (04), whatever the grader said.
+    for reason in ("turn_limit", "context_limit", "infra_timeout", "error"):
+        with pytest.raises(ValueError, match="resolved"):
+            clean([rec("t0", "BF16", True, end_reason=reason)])
+
+
+def test_flagged_reads_the_tripwire_strictly():
+    # Integration finding: a record without grading.test_files_touched must not read as "not flagged".
+    r = rec("t0", "BF16", True)
+    assert flagged(r) is False and flagged({**r, "grading": {"test_files_touched": True}}) is True
+    with pytest.raises(KeyError):
+        flagged({**r, "grading": {"fail_to_pass_ok": 1}})
+    with pytest.raises(KeyError):
+        flagged({k: v for k, v in r.items() if k != "grading"})
+    with pytest.raises(TypeError):
+        flagged({**r, "grading": None})
+    with pytest.raises(TypeError, match="bool"):
+        flagged({**r, "grading": {"test_files_touched": None}})
+
+
+def test_flagged_share_and_heldout_excluding_flagged():
+    rows = [rec("h0", "BF16", a < 8, lst="heldout100", runtime="vllm") for a in range(16)]
+    for r in rows[:4]:  # 4 of the 8 successes touched test files
+        r["grading"] = {"test_files_touched": True}
+    rows.append(rec("h0", "Q4_K_M", False))
+    assert flagged_share(rows) == {"BF16": 4 / 16, "Q4_K_M": 0.0}
+    rep = p0b_report(rows, inrepo_size=300)
+    assert rep["heldout_mean_pass1"] == 0.5 and rep["heldout_mean_pass1_excluding_flagged"] == 4 / 12
+
+
+def _cli(tmp_path, rows, manifest, *extra):
+    path = tmp_path / "a.jsonl"
+    path.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+    (tmp_path / "m.json").write_text(json.dumps(manifest))
+    out = tmp_path / "g.json"
+    subprocess.run([sys.executable, os.path.join(ROOT, "scripts", "p0_analyze.py"), str(path), "--manifest",
+                    str(tmp_path / "m.json"), "--inrepo-size", "300", "--n-boot", "50", "--out", str(out), *extra],
+                   check=True, capture_output=True)
+    return json.loads(out.read_text())
+
+
+def test_cli_min_candidates_reaches_p0b(tmp_path):
+    # Integration finding: the P0b fallback (min_candidates 2) must be settable without editing code.
+    rows = [rec(f"p{i}", "BF16", a < 3, lst="pool200", runtime="vllm", repo="pandas", run_id="p0b")
+            for i in range(5) for a in range(16)]
+    assert _cli(tmp_path, rows, {"P0b": ["p0b"]})["P0b"]["pool"]["n_ge4"] == 0
+    g = _cli(tmp_path, rows, {"P0b": ["p0b"]}, "--min-candidates", "2")["P0b"]
+    assert g["pool"]["n_ge4"] == 5 and g["sensitivity_excluding_infra_timeout"]["pool"]["n_ge4"] == 5
+
+
+def test_cli_reports_flagged_and_infra_timeout_variants(tmp_path):
+    # Integration findings: #9's excluding-flagged reporting rule and 04's infra_timeout sensitivity
+    # for every gate, not only P0a.
+    import random
+    rng = random.Random(11)
+    rows = []
+    for i in range(30):
+        k = rng.choice([0, 2, 6, 12])
+        rows += [rec(f"p{i}", "BF16", a < k, lst="pool200", runtime="vllm", run_id="p0b") for a in range(16)]
+        rows += [rec(f"p{i}", prof, rng.random() < (0.8 if k >= 4 else 0.3) * (0.5 if prof != "BF16" else 1),
+                     lst="pool200", run_id="p0c") for prof in ("BF16", "Q4_K_M") for _ in range(4)]
+    for i in range(10):
+        rows += [rec(f"h{i}", "BF16", a < 5, runtime="vllm", run_id="p0b") for a in range(16)]
+        rows += [rec(f"h{i}", prof, rng.random() < 0.5, run_id="p0a") for prof in ("BF16", "Q4_K_M") for _ in range(3)]
+    p0c_q4 = [r for r in rows if r["run_id"] == "p0c" and r["profile"] == "Q4_K_M" and r["resolved"]]
+    for r in p0c_q4[:3]:
+        r["grading"] = {"test_files_touched": True}
+    rows.append(rec("h0", "BF16", False, runtime="vllm", run_id="p0b", end_reason="infra_timeout"))
+    g = _cli(tmp_path, rows, {"P0b": ["p0b"], "P0a": ["p0a"], "P0c": ["p0c"]})
+    assert g["P0a"]["primary_excluding_flagged"]["verdict"] and g["P0a"]["flagged_share"]["Q4_K_M"] == 0.0
+    assert g["P0b"]["flagged_share"] == {"BF16": 0.0} and "heldout_mean_pass1_excluding_flagged" in g["P0b"]
+    sens = g["P0b"]["sensitivity_excluding_infra_timeout"]
+    assert sens["heldout_mean_pass1"] == 0.3125
+    assert abs(g["P0b"]["heldout_mean_pass1"] - (9 * 5 / 16 + 5 / 17) / 10) < 1e-12  # the timeout charged as a failure
+    assert g["P0c"]["flagged_share"]["Q4_K_M"] == 3 / 120 and g["P0c"]["flagged_share"]["BF16"] == 0.0
+    q4 = g["P0c"]["Q4_K_M"]
+    assert q4["excluding_flagged"]["L_total"] > q4["L_total"]  # dropping flagged Q4 successes widens the gap
+    assert q4["sensitivity_excluding_infra_timeout"]["L_total"] == q4["L_total"]
