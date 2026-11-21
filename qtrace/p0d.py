@@ -509,18 +509,22 @@ def did_test(rows, covariates=None, profile=PROBE, n_boot=5000, seed=0, alpha=0.
 
 
 def did_q4(rows, pairs, **kw):
-    """docs/04's secondary Q4_K_M result: did_test with profile Q4_K_M on the frozen pairs with Q4_K_M rows.
+    """docs/04's secondary Q4_K_M result: did_test with profile Q4_K_M on every frozen pair.
 
-    Q4_K_M continuations run "if budget allows", possibly on part of the pairs, so the test runs on
-    the pairs that have any Q4_K_M row and says how many of the frozen pairs that is. None without
-    Q4_K_M rows. kw goes to did_test.
+    As in the primary test, a frozen pair with neither Q4_K_M rows nor a dropped replay makes the
+    decision "incomplete", so a test run while the Q4_K_M continuations are part-way never reads as
+    a result on whichever pairs finished first. The numbers are still those of the pairs with rows.
+    BF16 rows of a pair without Q4_K_M rows are left out, so that pair counts as missing; its
+    replay_valid false rows are kept, so a failed replay counts as a drop. None without Q4_K_M rows.
+    kw goes to did_test.
     """
     tasks = {r.get("task_id") for r in rows if r.get("profile") == AGREEMENT_PROBE}
     if not tasks:
         return None
-    sub = [p for p in pairs if p["task_id"] in tasks]
-    out = did_test([r for r in rows if r.get("task_id") in tasks], pairs=sub, profile=AGREEMENT_PROBE, **kw)
-    return {**out, "secondary": True, "n_pairs_frozen": len(pairs), "n_pairs_with_q4_rows": len(sub)}
+    kept = [r for r in rows if r.get("task_id") in tasks or r.get("replay_valid") is False]
+    out = did_test(kept, pairs=pairs, profile=AGREEMENT_PROBE, **kw)
+    return {**out, "secondary": True, "n_pairs_frozen": len(pairs),
+            "n_pairs_with_q4_rows": sum(1 for p in pairs if p["task_id"] in tasks)}
 
 
 def did_kl_mean(rows, pairs, **kw):

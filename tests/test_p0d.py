@@ -602,14 +602,20 @@ def test_other_profile_replay_drops_leave_the_primary_test_unchanged():
     assert {**merged, "rows_ignored_by_profile": {}} == alone and alone["n_tasks"] == 30
 
 
-def test_q4_secondary_runs_on_the_pairs_with_q4_rows():
+def test_q4_secondary_is_incomplete_until_every_frozen_pair_has_q4_rows():
     pairs, rows = frozen_pairs(30), did_rows(30, 4, 0.6, 0.4)
     assert did_q4(rows, pairs) is None  # no Q4_K_M continuations: no secondary result
-    q4 = [{**r, "profile": "Q4_K_M"} for r in did_rows(30, 4, 0.7, 0.3, seed=5) if r["profile"] == "Q3_K_M"
-          and int(r["task_id"][1:]) < 20]  # budget for 20 of the 30 pairs
+    all_q4 = [{**r, "profile": "Q4_K_M"} for r in did_rows(30, 4, 0.7, 0.3, seed=5) if r["profile"] == "Q3_K_M"]
+    q4 = [r for r in all_q4 if int(r["task_id"][1:]) < 20]  # 20 of the 30 pairs done so far
     out = did_q4(rows + q4, pairs, n_boot=500)
     assert out["profile"] == "Q4_K_M" and out["secondary"] and out["n_tasks"] == 20
-    assert (out["n_pairs_frozen"], out["n_pairs_with_q4_rows"]) == (30, 20) and out["decision"] != "incomplete"
+    assert (out["n_pairs_frozen"], out["n_pairs_with_q4_rows"]) == (30, 20) and out["decision"] == "incomplete"
+    assert out["pair_tasks_without_continuations"] == sorted(f"t{i}" for i in range(20, 30))
+    # A pair whose BF16 replay failed is a drop, not a missing pair, with or without Q4_K_M rows.
+    failed = [{**r, "replay_valid": False} for r in rows if r["task_id"] == "t29" and r["profile"] == "BF16"]
+    done = did_q4([r for r in rows if r["task_id"] != "t29"] + failed + all_q4, pairs, n_boot=500)
+    assert done["n_pairs_dropped"] == 1 and done["pair_tasks_without_continuations"] == []
+    assert done["n_tasks"] == 29 and done["decision"] != "incomplete"
     # The same numbers as the primary test run on those rows relabelled Q3_K_M.
     as_q3 = [{**r, "profile": "Q3_K_M"} for r in q4] + [r for r in rows if r["profile"] == "BF16"
                                                        and int(r["task_id"][1:]) < 20]
