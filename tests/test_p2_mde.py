@@ -18,7 +18,7 @@ sys.path.insert(0, ROOT)
 import numpy as np
 
 from qtrace import p2_analysis
-from qtrace.p2_analysis import HELDOUT691_BY_REPO, guard_se, mde
+from qtrace.p2_analysis import HELDOUT691_BY_REPO, MDE_RATIOS, guard_se, mde
 from qtrace.p2_data import strat_weights
 
 Z = NormalDist().inv_cdf
@@ -50,6 +50,13 @@ def test_power_known_answer():
     assert pw[r80] == pytest.approx(0.8, abs=0.07)
     assert 0.01 <= pw[1.0] <= 0.10
     assert out["expected_resolves_per_arm_seed"] == n and out["mean_pass1"] == 1.0
+
+
+def test_ratio_grid_runs_from_half_to_one_in_steps_of_0025():
+    # Owner's agent on PR #17 (answer 4): 0.50-1.00 in steps of 0.025, so the MDE cannot fall off the grid when
+    # P0b's rates are low.
+    assert len(MDE_RATIOS) == 21 and MDE_RATIOS[0] == 0.5 and MDE_RATIOS[-1] == 1.0
+    assert np.allclose(np.diff(MDE_RATIOS), 0.025) and 0.525 in MDE_RATIOS and 0.975 in MDE_RATIOS
 
 
 def test_mde_picks_largest_passing_ratio_and_is_deterministic():

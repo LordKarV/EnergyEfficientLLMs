@@ -629,7 +629,8 @@ def analyze(records, manifest, energy_model, headline, cfg, estimator_rows=None)
 
 # P2's task count per held-out repo: #3's data/task_lists/heldout691.json by_repo.
 HELDOUT691_BY_REPO = {"coveragepy": 108, "datalad": 179, "pyramid": 189, "scrapy": 215}
-MDE_RATIOS = (0.70, 0.75, 0.80, 0.85, 0.88, 0.90, 0.92, 0.94, 0.96, 0.98, 1.0)
+# Owner's agent on PR #17 (answer 4): 0.50 to 1.00 in steps of 0.025, so the MDE stays on the grid at low rates.
+MDE_RATIOS = tuple(round(0.5 + 0.025 * i, 3) for i in range(21))
 MDE_POWER = 0.8
 
 
