@@ -227,6 +227,12 @@ def summarize(rec, entry):
             "malformed": malformed, "rec": rec}
 
 
+def arm_rep(m, rec):
+    """The (arm, seed model) cell key of a record whose manifest entry is m (module docstring)."""
+    arm = m["arm"] + TOKMATCH if m.get("token_matched") else m["arm"]
+    return arm, m["seed"] if m["seed"] is not None else f"sampling{rec['seed']}"
+
+
 def load(records, manifest, energy_model, phase, every_model=True, grammar=False):
     """Check attempt rows and index them as cells[(arm, rep, profile)][task_id] -> summarize() output.
 
@@ -271,9 +277,7 @@ def load(records, manifest, energy_model, phase, every_model=True, grammar=False
         if rec["grammar"] is not grammar:
             n_other += 1
             continue
-        m = manifest[model]
-        arm = m["arm"] + TOKMATCH if m.get("token_matched") else m["arm"]
-        rep = m["seed"] if m["seed"] is not None else f"sampling{rec['seed']}"
+        arm, rep = arm_rep(manifest[model], rec)
         rows[arm, rep, profile, task].append(rec)
         models.add(model)
         lists[arm, rep, profile].add(lst)

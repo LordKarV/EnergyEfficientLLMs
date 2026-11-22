@@ -591,7 +591,7 @@ def test_analyze_input_refusals_and_malformed_table():
     def fn(arm, *_):
         return {"resolved": True, "joules": 100.0, "malformed": {"wrong_name": int(arm == "random")}}
     recs, manifest = build(["fewest_turns", "random"], fn)
-    with pytest.raises(ValueError, match="both regimes"):
+    with pytest.raises(ValueError, match="batched.coef"):  # both regimes then: tests/test_p2_batched.py
         analyze(recs, manifest, {**EM, "batched": {"below_85pct": True}}, "fewest_turns", CFG)
     no_check = {k: v for k, v in EM.items() if k != "batched"}
     for em in (no_check, {**EM, "batched": None}, {**EM, "batched": {"below_85pct": None}}):

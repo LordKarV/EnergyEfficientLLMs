@@ -104,6 +104,17 @@ def markdown(out):
         at = "no base cap reaches" if not dom else f"base caps {[p['cap'] for p in dom]} reach"
         lines += ["", (f"Turn-cap frontier: headline uncapped RR {top['resolve_rate']:.3f} at JPR "
                        f"{fmt(top['jpr'], '.0f')}; {at} that RR at that JPR or less; pass: {fr['pass']}.")]
+    bt = out["batched_regime"]
+    if bt:
+        bp = bt["primary"]
+        lines += ["", (f"Batched regime (P0a batched and concurrency-1 picks agree on "
+                       f"{fmt(en['batched_share_same_pick'])} of tasks, below 0.85): primary on {bt['estimate']}, "
+                       f"ratio {fmt(bp['ratio'])}, p {bp['gpu']['p_one_sided']:.4f}, guard "
+                       f"{'pass' if bp['guard']['pass'] else 'FAIL'}. Run-level measured GPU totals:"), "",
+                  row("arm", "profile", "blocks", "attempts", "joules", "resolved", "J per resolved"),
+                  "|" + "---|" * 7]
+        lines += [row(r["arm"], r["profile"], r["n_blocks"], r["n_attempts"], fmt(r["joules"], ".0f"),
+                      r["n_resolved"], fmt(r["jpr"], ".0f")) for r in bt["run_level"]]
     w = out["within_repo"]
     if w:
         c = w["headline_vs_random"]

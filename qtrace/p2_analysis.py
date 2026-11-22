@@ -25,12 +25,15 @@ Grammar: every attempt record has a bool grammar, true only for H4's grammar-con
 families, the arm table, the B metrics, the estimator check, the frontier and the P1 pick use grammar false rows
 only; grammar true rows enter only h4() (H4_READING).
 
+Batched regime: when P0a's batched agreement is below 85%, docs/04 requires P2 energy in both regimes, so analyze()
+adds batched_regime (qtrace/p2_batched.py): the primary on the batched marginal estimate and run-level measured
+totals. Every claim stays on the concurrency-1 estimate, the proposed claim regime (docs/03 Metrics). analyze()
+refuses to run when energy_model.json does not record that agreement check.
+
 Not here: the per-task length covariate docs/04 (Selection) asks for in the H2/H3 analysis, because that length
 difference is between runs selected on pool tasks, and the contrasts are over held-out tasks, so it has no
 per-task value here (each arm's mean turns and processed tokens are in the arm table); the training-cost
-break-even of docs/03 Metrics, whose training joules no input here carries; and the batched energy regime, so analyze()
-refuses to run when P0a's batched agreement is below 85%, where docs/04 requires P2 energy in both regimes, or
-when energy_model.json does not record that check.
+break-even of docs/03 Metrics, whose training joules no input here carries.
 """
 
 import math
@@ -38,6 +41,7 @@ import math
 import numpy as np
 
 from qtrace.energy_model import estimate_attempt_joules
+from qtrace.p2_batched import batched_arrays, batched_fit, run_level_totals
 from qtrace.p2_data import (
     MALFORMED,
     PRIMARY,
@@ -661,7 +665,8 @@ def analyze(records, manifest, energy_model, headline, cfg, estimator_rows=None,
     the measured subset (measured_subset), the turn-cap frontier (when base ran), the claim-A summary, all on
     grammar false rows, H4 on the grammar true rows (None when there are none), and the exploratory within-repo
     split from the P1 records and manifest (within_repo(), None when they are not given). Claim A on
-    estimates also needs the primary's sign in at least 3 of the 4 held-out repos (docs/04)."""
+    estimates also needs the primary's sign in at least 3 of the 4 held-out repos (docs/04). batched_regime is
+    None unless P0a's batched agreement is below 85% (module docstring)."""
     cfg = check_config(cfg, upper_bound=True)
     if headline is None:
         raise ValueError("P1 picked no headline arm, so there is no primary test")
@@ -676,14 +681,19 @@ def analyze(records, manifest, energy_model, headline, cfg, estimator_rows=None,
         raise ValueError("energy_model.json batched.below_85pct must be true or false: docs/04 (P0a, batched "
                          "coefficients) needs the batched vs concurrency-1 pick agreement before P2 reports energy; "
                          "fit P0a with --windows")
-    if batched["below_85pct"]:
-        raise ValueError("energy_model.json batched.below_85pct is true, so docs/04 (P0a, batched coefficients) "
-                         "requires P2 energy in both regimes; the batched regime is not implemented here")
-    energy = {**data["energy"], "batched_below_85pct": False,
+    energy = {**data["energy"], "batched_below_85pct": batched["below_85pct"],
               "batched_share_same_pick": (batched.get("agreement_with_c1") or {}).get("share_same_pick")}
     cpu_w = cfg["host_cpu_tdp_w"] / cfg["host_vcpus"]
     groups = [(headline, PRIMARY), ("random", PRIMARY)]
     c = contrast(arrays(data, groups, cfg["infra_error_cap"], cpu_w), *groups, cfg, detail=True)
+    both = None
+    if batched["below_85pct"]:
+        cb = contrast(batched_arrays(data, groups, batched_fit(energy_model), cfg["infra_error_cap"]), *groups, cfg)
+        both = {"primary": {**{k: cb[k] for k in ("arm", "comparator", "profile", "n_tasks", "jpr", "resolve_rate", "T",
+                                                  "ratio", "gpu", "guard")},
+                            "wins": cb["gpu"]["p_one_sided"] < cfg["alpha"] and cb["guard"]["pass"]},
+                "run_level": run_level_totals(records, manifest, data),
+                "estimate": "batched marginal joules (estimate_batched_joules), intercept and tool windows left out"}
     sens = contrast(arrays(data, groups, cfg["infra_error_cap"], cpu_w, drop_timeouts=True), *groups, cfg)
     primary = {**c, "wins": c["gpu"]["p_one_sided"] < cfg["alpha"] and c["guard"]["pass"],
                "holds_under_upper_bound": c["upper_bound"]["p_one_sided"] < cfg["alpha"] and c["guard"]["pass"],
@@ -714,7 +724,7 @@ def analyze(records, manifest, energy_model, headline, cfg, estimator_rows=None,
     return {"headline": headline, "energy": energy, "n_rows": data["n_rows"], "n_rows_grammar": gdata["n_rows"],
             "n_reruns_used": data["n_reruns_used"],
             "n_resolved_after_budget_hit": data["n_resolved_after_budget_hit"],
-            "primary": primary, "token_matched": token_matched, "families": families(data, cfg, cpu_w, headline), "arms": arm_table(data, cfg, cpu_w),
+            "primary": primary, "batched_regime": both, "token_matched": token_matched, "families": families(data, cfg, cpu_w, headline), "arms": arm_table(data, cfg, cpu_w),
             "b_metrics": b, "tokens_ratio_contrasts": tokens_ratio_contrasts(data, cfg), "estimator_check": est,
             "measured_subset": measured, "turn_cap_frontier": frontier, "claim_A": claim,
             "h4": h4(data, gdata, headline, cfg, cpu_w) if gdata["n_rows"] else None,
