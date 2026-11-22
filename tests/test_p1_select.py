@@ -508,6 +508,11 @@ def test_p0a_awaiting_its_retest_is_an_error_when_stability_arms_are_asked_for()
         go(runs, gates=gates("maybe"))
     picks, _ = go(runs, gates=gates(None), arms=["random", "fewest_turns"])
     assert set(picks) == {"random", "fewest_turns"}
+    # A decided null score choice already answers H3, so no stability arm would be built (as in did_rule).
+    picks, summary = go(runs, chosen=None, gates=gates(None))
+    assert not STABILITY_ARMS & set(picks) and summary["kill_rules"]["p0a"]["note"].startswith("not applied")
+    with pytest.raises(ValueError, match="re-test"):
+        go(runs, chosen=None, gates=gates(None), score_override="kl_mean")
 
 
 def test_did_fail_drops_and_inconclusive_marks_the_stability_arms_exploratory():

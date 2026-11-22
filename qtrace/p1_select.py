@@ -155,25 +155,33 @@ def score_info(score_choice, override, arms):
             "override": override, "used": override or chosen}
 
 
-def p0a_rule(gates, arms):
-    """docs/04 P0a kill rule, from gates.json P0a.final_verdict (the re-test's verdict when one ran).
-
-    fail drops the robustness half: the stability arms and with them the KL term. pass and a final
-    inconclusive (B continues, Q3_K_M is the stress profile) keep them. A null final_verdict means the
-    required re-test has not run, an error while a stability arm is asked for. Without a P0a entry (or
-    without gates.json) the rule is not checked, and the summary says so.
-    """
+def p0a_verdict(gates):
+    """gates.json P0a.final_verdict (the re-test's verdict when one ran); "unchecked" without a P0a entry."""
     p0a = (gates or {}).get("P0a")
     if p0a is None:
-        return {"verdict": None, "note": "not checked: no P0a verdict (gates.json absent or without P0a)"}
+        return "unchecked"
     v = p0a.get("final_verdict", "absent")
     if v is not None and v not in P0A_VERDICTS:
         raise ValueError(f"gates.json P0a.final_verdict must be null or one of {P0A_VERDICTS}, got {v!r}; "
                          "rerun scripts/p0_analyze.py")
-    if v is None and STABILITY_ARMS & set(arms):
+    return v
+
+
+def p0a_rule(v, score, arms):
+    """docs/04 P0a kill rule, from p0a_verdict's v.
+
+    fail drops the robustness half: the stability arms and with them the KL term. pass and a final
+    inconclusive (B continues, Q3_K_M is the stress profile) keep them. A null final_verdict means the
+    required re-test has not run, an error while a stability arm would be built (asked for, with a score
+    to rank by, as in did_rule). Without a P0a entry (or without gates.json) the rule is not checked, and
+    the summary says so.
+    """
+    if v == "unchecked":
+        return {"verdict": None, "note": "not checked: no P0a verdict (gates.json absent or without P0a)"}
+    if v is None and score["used"] is not None and STABILITY_ARMS & set(arms):
         raise ValueError("gates.json P0a.final_verdict is null: the inconclusive first look needs its re-test "
                          "(P0a_topup) before P1, or drop the stability arms from select.arms")
-    note = {None: "not applied: P0a's re-test is pending, but no stability arm is asked for",
+    note = {None: "not applied: P0a's re-test is pending, but no stability arm is built",
             "pass": "passed: the stability arms are kept",
             "inconclusive": "inconclusive after the re-test: B continues (Q3_K_M is the stress profile), so the "
                             "stability arms are kept",
@@ -534,9 +542,10 @@ def select(attempts, scores=None, score_choice=None, energy_model=None, est_joul
     run first (p0a_rule, did_rule); after a P0a fail P0d's inputs are not needed and did is not read.
     """
     check_config(pool_lists, min_candidates, alpha, cost, score_override, seeds, arms)
-    p0a = p0a_rule(gates, arms)
+    v = p0a_verdict(gates)
+    score = score_info(score_choice, score_override, [a for a in arms if not (v == "fail" and a in STABILITY_ARMS)])
+    p0a = p0a_rule(v, score, arms)
     killed = p0a["verdict"] == "fail"
-    score = score_info(score_choice, score_override, [a for a in arms if not (killed and a in STABILITY_ARMS)])
     p0d = ({"decision": None, "note": "not read: P0a failed, so the stability arms are already dropped"} if killed
            else did_rule(did, score, arms))
     killed = killed or p0d["decision"] == "fail"
