@@ -360,6 +360,18 @@ def _fit_or_error(attempts, target, n_boot, seed):
         return {"error": str(err)}
 
 
+def _range_values(X):
+    """Per-turn values of the calibration-range keys for feature rows X.
+
+    output_share is output / (output + uncached), the decoded share of the tokens a turn processes; the
+    cached context has its own range. A turn with neither counts as share 0. The denominator is our
+    choice (docs/04 S2 says "output share" only), flagged for the owner.
+    """
+    o, u = X[:, TERMS.index("output")], X[:, TERMS.index("uncached")]
+    return {"output": o, "uncached": u, "context": X[:, TERMS.index("context")],
+            "output_share": o / np.maximum(o + u, 1.0)}
+
+
 def profile_report(attempts, n_boot=2000, seed=0):
     """One profile's entry in energy_model.json: both targets, the calibration range and the cache-count check.
 
@@ -369,8 +381,7 @@ def profile_report(attempts, n_boot=2000, seed=0):
     X = np.vstack([a["X"] for a in attempts])
     flags = [a["server_cached_differs"] for a in attempts]
     known = [f for f in flags if f is not None]
-    rng_of = {t: [float(X[:, TERMS.index(t)].min()), float(X[:, TERMS.index(t)].max())]
-              for t in ("output", "uncached", "context")}
+    rng_of = {t: [float(v.min()), float(v.max())] for t, v in _range_values(X).items()}
     n_turns = [len(a["raw"]) for a in attempts]
     per_turn = [f for a in attempts for f in a["turn_cached_differs"]]
     idle_refs = [a["idle_w_ref"] for a in attempts if a["idle_w_ref"] is not None]
@@ -395,6 +406,28 @@ def profile_report(attempts, n_boot=2000, seed=0):
                                                       "n_missing": sum(a["n_turns"] for a in attempts)
                                                       - len(per_turn)}},
             **{t: _fit_or_error(attempts, t, n_boot, seed) for t in TARGETS}}
+
+
+def check_range(records, report):
+    """Share of `records`' turns outside each bound of a profile_report's calibration_range (docs/04 S2).
+
+    records: attempt records with per_turn (S2 rollouts); every turn counts, measured or not. Returns
+    {n_turns, n_attempts, outside: {key: {below, above}}, any_turn}: per-turn keys give shares of turns,
+    turns_per_attempt a share of attempts, and any_turn the share of turns outside at least one per-turn
+    bound. What share calls for a re-measurement on llama.cpp Q4_K_M and a refit is the owner's.
+    """
+    if not records:
+        raise ValueError("check_range needs at least one record")
+    rng = _get(report, "calibration_range", "report")
+    X = np.array([turn_features(t, f"attempt {r.get('attempt_id')!r} turn {i}")
+                  for r in records for i, t in enumerate(_turns(r))])
+    per_turn = _range_values(X)
+    values = {**per_turn, "turns_per_attempt": np.array([len(_turns(r)) for r in records])}
+    bounds = {k: _get(rng, k, "calibration_range") for k in values}
+    beyond = {k: (v < bounds[k][0], v > bounds[k][1]) for k, v in values.items()}
+    return {"n_turns": len(X), "n_attempts": len(records),
+            "outside": {k: {"below": float(lo.mean()), "above": float(hi.mean())} for k, (lo, hi) in beyond.items()},
+            "any_turn": float(np.any([lo | hi for k, (lo, hi) in beyond.items() if k in per_turn], axis=0).mean())}
 
 
 def estimate_attempt_joules(rec, model, idle_w=None):

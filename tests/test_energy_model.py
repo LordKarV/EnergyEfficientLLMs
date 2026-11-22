@@ -20,6 +20,7 @@ from qtrace import energy_model
 from qtrace.energy_model import (
     TERMS,
     attempt_arrays,
+    check_range,
     estimate_attempt_joules,
     estimate_batched_joules,
     fit_attempts,
@@ -502,6 +503,36 @@ def test_a_broken_target_or_profile_is_reported_and_the_rest_still_fit():
 
     small = profile_report(fit_attempts(subrun(PLANT, n_tasks=1))[0]["Q4_K_M"], n_boot=0)
     assert small["n_attempts"] == 2 and all("at least 3" in small[t]["error"] for t in ("raw", "idle_subtracted"))
+
+
+def test_calibration_range_has_the_output_share_and_check_range_counts_turns_outside_it():
+    # docs/04 S2: each step, the rollouts' token mix is checked against the energy model's calibration range.
+    recs = subrun(PLANT, n_tasks=3, per_task=1)
+    rep = profile_report(fit_attempts(recs)[0]["Q4_K_M"], n_boot=0)
+    rng = rep["calibration_range"]
+    shares = [t["output_tokens"] / (t["output_tokens"] + t["input_uncached"]) for r in recs for t in r["per_turn"]]
+    assert rng["output_share"] == pytest.approx([min(shares), max(shares)])
+    n = sum(len(r["per_turn"]) for r in recs)
+    none = check_range(recs, rep)
+    assert none["n_turns"] == n and none["n_attempts"] == 3 and none["any_turn"] == 0
+    assert set(none["outside"]) == {"output", "uncached", "context", "output_share", "turns_per_attempt"}
+    assert all(v == {"below": 0.0, "above": 0.0} for v in none["outside"].values())
+
+    roll = copy.deepcopy(recs)
+    roll[0]["per_turn"][0]["input_cached"] = rng["context"][1] + 1  # past the longest calibrated context
+    roll[1]["per_turn"][0]["output_tokens"] = 0  # all prefill: below the output and output-share minimums
+    roll[2]["per_turn"] = [roll[2]["per_turn"][1]] * (rng["turns_per_attempt"][1] + 1)  # in-range turns, too many
+    n = sum(len(r["per_turn"]) for r in roll)
+    out = check_range(roll, rep)
+    assert out["outside"]["context"] == {"below": 0.0, "above": pytest.approx(1 / n)}
+    assert out["outside"]["output"]["below"] == out["outside"]["output_share"]["below"] == pytest.approx(1 / n)
+    assert out["outside"]["uncached"] == {"below": 0.0, "above": 0.0}
+    assert out["outside"]["turns_per_attempt"] == {"below": 0.0, "above": pytest.approx(1 / 3)}
+    assert out["any_turn"] == pytest.approx(2 / n)
+
+    old = {"calibration_range": {k: v for k, v in rng.items() if k != "output_share"}}  # a report from before
+    with pytest.raises(ValueError, match="output_share"):
+        check_range(recs, old)
 
 
 def test_cache_check_compares_per_request_counts_where_present():
