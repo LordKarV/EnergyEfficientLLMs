@@ -720,7 +720,9 @@ def analyze(records, manifest, energy_model, headline, cfg, estimator_rows=None,
              "frontier_pass": None if frontier is None else frontier["pass"],
              "estimator_stands": None if est is None else est["stands"]}
     claim["claimed_on_estimates"] = all(v is True for v in claim.values())
-    claim["measured_subset_wins"] = None if measured is None else measured["wins"]
+    # The fallback claim meets the same upper-bound standard as claimed_on_estimates.
+    claim["measured_subset_wins"] = (None if measured is None
+                                     else measured["wins"] and measured["holds_under_upper_bound"])
     return {"headline": headline, "energy": energy, "n_rows": data["n_rows"], "n_rows_grammar": gdata["n_rows"],
             "n_reruns_used": data["n_reruns_used"],
             "n_resolved_after_budget_hit": data["n_resolved_after_budget_hit"],

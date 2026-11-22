@@ -812,6 +812,27 @@ def test_measured_subset_contrast_when_the_estimate_fails():
     assert out["measured_subset"] is None and out["claim_A"]["measured_subset_wins"] is None
 
 
+def test_measured_subset_claim_needs_the_upper_bound():
+    main, manifest = build(["fewest_turns", "random", "base"], scaled({"fewest_turns": 0.8}), seeds=(0, 1))
+    erows, _ = est_rows({"fewest_turns": 0.8, "random": 1.0, "base": 1.0})
+    # The headline's container burns 2000 CPU-seconds (4375 J) per attempt against random's 10, and one random
+    # attempt has no attributable counter read, so its task leaves the subset.
+    erows = [{**r, "attempt_id": "e-" + r["attempt_id"], "container_cpu_seconds": 2000.0
+              if r["model"] == "fewest_turns_seed0" else 10.0} for r in erows]
+    hit = next(i for i, r in enumerate(erows) if r["model"] == "random_seed0")
+    erows[hit] = {**erows[hit], "energy": {"attributable": False}}
+    out = analyze(main, manifest, EM, "fewest_turns", CFG, estimator_rows=erows)
+    m, w = out["measured_subset"], 280.0 / 128
+    assert not out["estimator_check"]["stands"] and m["n_tasks"] == 31
+    tasks = {r["task_id"] for r in erows} - {erows[hit]["task_id"]}
+    tot = {arm: sum(sum(t["gen_energy_j"] for t in r["per_turn"]) + r["container_cpu_seconds"] * w
+                    for r in erows if r["model"] == f"{arm}_seed0" and r["task_id"] in tasks)
+           for arm in ("fewest_turns", "random")}
+    assert m["upper_bound"]["T"] == pytest.approx(math.log(tot["fewest_turns"] / tot["random"]))
+    assert m["wins"] and not m["holds_under_upper_bound"]
+    assert out["claim_A"]["measured_subset_wins"] is False
+
+
 def meta(arm, tokens, match=None):
     return {"arm": arm, "seed": 0, "supervised_tokens_seen": tokens, "match_supervised_tokens": match}
 
