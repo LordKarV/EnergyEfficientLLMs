@@ -13,7 +13,17 @@ import yaml
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
-from qtrace.p1_select import ARMS, STABILITY_ARMS, avg_ranks, halves, overlap, pick, read_attempts, select
+from qtrace.p1_select import (
+    ARMS,
+    STABILITY_ARMS,
+    avg_ranks,
+    halves,
+    overlap,
+    pick,
+    read_attempts,
+    select,
+    untestable,
+)
 
 MAL = ("misnested_tag", "wrong_name", "text_after_call", "truncated_call", "no_call_no_answer")
 RUN = {"task": "t", "turns": 5, "out": 100, "kl": 0.1, "ent": 1.0, "j": 1000.0, "mal": None, "resolved": True,
@@ -584,6 +594,21 @@ def test_overlap_table_flags_pairs_above_85_percent():
     assert pairs[("a", "c")]["share_same"] == 0.9 and pairs[("a", "c")]["not_separable"] is True
     assert overlap({"a": a, "d": rows(["x"] * 16 + ["y"] * 4)})[0]["not_separable"] is False
     assert pairs[("b", "c")]["share_same"] == 0.95
+
+
+def test_untestable_lists_every_flagged_seed_and_the_largest_share():
+    def p(a, b, share):
+        return {"arms": [a, b], "share_same": share, "not_separable": share > 0.85}
+
+    by_seed = {"0": [p("stable", "low_entropy", 0.95), p("random", "stable", 0.5)],
+               "1": [p("stable", "low_entropy", 0.9), p("random", "stable", 0.95)],
+               "2": [p("stable", "low_entropy", 0.8), p("random", "stable", 0.1)]}
+    assert untestable(by_seed) == [
+        {"arms": ["stable", "low_entropy"], "seeds": ["0", "1"], "max_share_same": 0.95,
+         "contrasts": [{"family": "H3", "arms": ["stable", "low_entropy"]}]},
+        {"arms": ["random", "stable"], "seeds": ["1"], "max_share_same": 0.95, "contrasts": []}]
+    by_seed["0"][0], by_seed["1"][0] = p("stable", "low_entropy", 0.9), p("stable", "low_entropy", 0.95)
+    assert untestable(by_seed)[0]["max_share_same"] == 0.95  # neither the first seed's share nor the smallest
 
 
 def test_not_separable_pairs_are_reported_untestable_with_their_contrasts_and_still_built():
