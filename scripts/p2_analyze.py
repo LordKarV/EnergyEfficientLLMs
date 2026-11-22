@@ -2,13 +2,15 @@
 
     python scripts/p2_analyze.py outputs/attempts/<P2 run>.jsonl ... --models outputs/p2/models.json \
         --energy-model outputs/p0a/energy_model.json --headline outputs/p1/headline.json \
-        [--estimator-check outputs/attempts/<concurrency-1 run>.jsonl ...] [--config configs/p2_analysis.yaml] \
-        [--out-dir outputs/p2]
+        [--estimator-check outputs/attempts/<concurrency-1 run>.jsonl ...] \
+        [--p1-attempts outputs/attempts/<P1 run>.jsonl ... --p1-models outputs/p1/models.json] \
+        [--config configs/p2_analysis.yaml] [--out-dir outputs/p2]
 
 The attempt files hold the held-out-repo runs, one attempt per task per seed model per profile, plus H4's
 grammar-constrained runs (grammar: true), which only the H4 family reads.
 --estimator-check holds the separate concurrency-1 Q4_K_M runs of the headline arm, random and base (one seed
-model each) with per-turn counter reads, on estimator_check30 or another held-out list. The config's guard_margin, host_cpu_tdp_w and host_vcpus must be set.
+model each) with per-turn counter reads, on estimator_check30 or another held-out list.
+--p1-attempts and --p1-models are P1's inrepo_test runs and manifest, for the exploratory within-repo split. The config's guard_margin, host_cpu_tdp_w and host_vcpus must be set.
 """
 
 import argparse
@@ -102,6 +104,12 @@ def markdown(out):
         at = "no base cap reaches" if not dom else f"base caps {[p['cap'] for p in dom]} reach"
         lines += ["", (f"Turn-cap frontier: headline uncapped RR {top['resolve_rate']:.3f} at JPR "
                        f"{fmt(top['jpr'], '.0f')}; {at} that RR at that JPR or less; pass: {fr['pass']}.")]
+    w = out["within_repo"]
+    if w:
+        c = w["headline_vs_random"]
+        lines += ["", (f"Within-repo split (inrepo_test, P1, one seed, exploratory): {c['arm']} vs random at "
+                       f"{c['profile']} on {c['n_tasks']} tasks, JPR ratio {fmt(c['ratio'])}, p "
+                       f"{c['gpu']['p_one_sided']:.4f}, RR diff vs random {c['guard']['rr_diff']:+.3f}.")]
     lines += ["", f"Claim A on estimates: {out['claim_A']['claimed_on_estimates']} ({out['claim_A']})", ""]
     return "\n".join(lines)
 
@@ -113,19 +121,23 @@ def main(argv=None):
     ap.add_argument("--energy-model", required=True)
     ap.add_argument("--headline", required=True, help="outputs/p1/headline.json from scripts/p1_pick_headline.py")
     ap.add_argument("--estimator-check", nargs="+")
+    ap.add_argument("--p1-attempts", nargs="+")
+    ap.add_argument("--p1-models")
     ap.add_argument("--config", default="configs/p2_analysis.yaml")
     ap.add_argument("--out-dir", default="outputs/p2")
     args = ap.parse_args(argv)
 
     est = [r for p in args.estimator_check for r in read_jsonl(p)] if args.estimator_check else None
+    p1 = [r for p in args.p1_attempts for r in read_jsonl(p)] if args.p1_attempts else None
     try:
         out = analyze([r for p in args.attempts for r in read_jsonl(p)], read_json(args.models),
                       read_json(args.energy_model), read_json(args.headline).get("headline"), load_config(args.config),
-                      estimator_rows=est)
+                      estimator_rows=est, p1_records=p1, p1_manifest=args.p1_models and read_json(args.p1_models))
     except ValueError as e:
         raise SystemExit(f"p2_analyze: {e}") from e
     out["inputs"] = {"attempts": args.attempts, "models": args.models, "energy_model": args.energy_model,
-                     "headline": args.headline, "estimator_check": args.estimator_check, "config": args.config}
+                     "headline": args.headline, "estimator_check": args.estimator_check,
+                     "p1_attempts": args.p1_attempts, "p1_models": args.p1_models, "config": args.config}
     os.makedirs(args.out_dir, exist_ok=True)
     with open(os.path.join(args.out_dir, "analysis.json"), "w") as f:
         json.dump(out, f, indent=1, allow_nan=False)

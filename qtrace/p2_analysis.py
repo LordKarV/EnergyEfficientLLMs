@@ -28,8 +28,7 @@ only; grammar true rows enter only h4() (H4_READING).
 Not here: the per-task length covariate docs/04 (Selection) asks for in the H2/H3 analysis, because that length
 difference is between runs selected on pool tasks, and the contrasts are over held-out tasks, so it has no
 per-task value here (each arm's mean turns and processed tokens are in the arm table); the training-cost
-break-even of docs/03 Metrics, whose training joules no input here carries; the within-repo split, which is
-P1's inrepo_test data (load(phase="p2") takes held-out rows only); and the batched energy regime, so analyze()
+break-even of docs/03 Metrics, whose training joules no input here carries; and the batched energy regime, so analyze()
 refuses to run when P0a's batched agreement is below 85%, where docs/04 requires P2 energy in both regimes, or
 when energy_model.json does not record that check.
 """
@@ -630,19 +629,33 @@ def pick_headline(records, manifest, energy_model, score_choice, did, cfg, p0a_v
             "token_match": None if train_meta is None or not best else token_match(best["arm"], train_meta)}
 
 
-def analyze(records, manifest, energy_model, headline, cfg, estimator_rows=None):
+def within_repo(records, manifest, energy_model, headline, cfg, cpu_w):
+    """docs/03 Setup: the within-repo split (inrepo_test) reported next to the primary, to show how much is repo
+    memorization. From the P1 records (load(phase="p1"), one seed model per arm): the arm table and headline vs
+    random at Q4_K_M through contrast(). Labelled exploratory (docs/04 Seeds, repos and multiplicity): one seed,
+    no Holm, no win."""
+    data = load(records, manifest, energy_model, "p1")
+    groups = [(headline, PRIMARY), ("random", PRIMARY)]
+    return {"exploratory": True, "list": "inrepo_test", "n_rows": data["n_rows"], "arms": arm_table(data, cfg, cpu_w),
+            "headline_vs_random": contrast(arrays(data, groups, cfg["infra_error_cap"], cpu_w), *groups, cfg)}
+
+
+def analyze(records, manifest, energy_model, headline, cfg, estimator_rows=None, p1_records=None, p1_manifest=None):
     """The P2 analysis: the primary test (headline vs random at Q4_K_M, detail and the infra_timeout sensitivity),
     the token-matched rerun of it (token_matched, when a token_matched model of the headline arm ran at Q4_K_M,
     else None), the hypothesis families with Holm, the arm table, B metrics per arm at Q4_K_M and BF16, the H1a/H2 tokens-ratio
     contrasts, the estimator check (when its rows are given) and, when the estimate does not stand, the primary on
     the measured subset (measured_subset), the turn-cap frontier (when base ran), the claim-A summary, all on
-    grammar false rows, and H4 on the grammar true rows (None when there are none). Claim A on
+    grammar false rows, H4 on the grammar true rows (None when there are none), and the exploratory within-repo
+    split from the P1 records and manifest (within_repo(), None when they are not given). Claim A on
     estimates also needs the primary's sign in at least 3 of the 4 held-out repos (docs/04)."""
     cfg = check_config(cfg, upper_bound=True)
     if headline is None:
         raise ValueError("P1 picked no headline arm, so there is no primary test")
     if headline not in HEADLINE_ARMS:
         raise ValueError(f"headline {headline!r} is not one of the arms the P1 rule picks from, {HEADLINE_ARMS}")
+    if (p1_records is None) != (p1_manifest is None):
+        raise ValueError("the within-repo split needs both p1_records and p1_manifest")
     data = load(records, manifest, energy_model, "p2")
     gdata = load(records, manifest, energy_model, "p2", every_model=False, grammar=True)
     batched = energy_model.get("batched") or {}
@@ -692,6 +705,8 @@ def analyze(records, manifest, energy_model, headline, cfg, estimator_rows=None)
             "b_metrics": b, "tokens_ratio_contrasts": tokens_ratio_contrasts(data, cfg), "estimator_check": est,
             "measured_subset": measured, "turn_cap_frontier": frontier, "claim_A": claim,
             "h4": h4(data, gdata, headline, cfg, cpu_w) if gdata["n_rows"] else None,
+            "within_repo": None if p1_records is None else within_repo(p1_records, p1_manifest, energy_model,
+                                                                       headline, cfg, cpu_w),
             "settings": {k: cfg[k] for k in ("guard_margin", "infra_error_cap", "n_boot", "seed", "alpha",
                                              "host_cpu_tdp_w", "host_vcpus")}}
 

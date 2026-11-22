@@ -493,6 +493,7 @@ def test_scripts_end_to_end_and_missing_margin(tmp_path):
     (tmp_path / "m2.json").write_text(json.dumps(manifest))
     common = ["--models", tmp_path / "m2.json", "--energy-model", tmp_path / "em.json", "--headline", head]
     res = run("p2_analyze.py", tmp_path / "p2.jsonl", *common, "--estimator-check", tmp_path / "est.jsonl",
+              "--p1-attempts", tmp_path / "p1.jsonl", "--p1-models", tmp_path / "m1.json",
               "--config", cfg, "--out-dir", tmp_path / "p2")
     assert res.returncode == 0, res.stderr
     out = json.loads((tmp_path / "p2" / "analysis.json").read_text())
@@ -500,6 +501,7 @@ def test_scripts_end_to_end_and_missing_margin(tmp_path):
     md = (tmp_path / "p2" / "analysis.md").read_text()
     assert out["turn_cap_frontier"] is not None and "| primary |" in md and "| H4 (grammar rows) |" in md
     assert out["h4"]["contrasts"][0]["keeps_sign"] and "keeps sign: True" in md
+    assert out["within_repo"]["exploratory"] and "Within-repo split (inrepo_test" in md
 
     cfg.write_text(yaml.safe_dump({**CFG, "guard_margin": None}))
     for res in (run("p1_pick_headline.py", tmp_path / "p1.jsonl", *common[:4], "--train-meta", tmp_path / "random.json",
@@ -851,3 +853,20 @@ def test_token_matched_rerun_contrast():
                        ({"arm": "fewest_turns", "seed": 0, "token_matched": True}, "both fewest_turns seed 0")):
         with pytest.raises(ValueError, match=match):
             load(recs + tm, {**manifest, "other": bad}, EM, "p2")
+
+
+def test_within_repo_split_from_p1_records():
+    recs, manifest = build(["fewest_turns", "random"], scaled({"fewest_turns": 0.8}))
+    p1recs, p1manifest = p1()
+    out = analyze(recs, manifest, EM, "fewest_turns", CFG, p1_records=p1recs, p1_manifest=p1manifest)
+    w = out["within_repo"]
+    assert w["exploratory"] and w["n_rows"] == len(p1recs)
+    assert {(r["arm"], r["profile"]) for r in w["arms"]} == {(a, p) for a in P1_JOULES for p in (BF, Q4)}
+    c = w["headline_vs_random"]
+    assert (c["arm"], c["comparator"], c["profile"], c["n_tasks"]) == ("fewest_turns", "random", Q4, 24)
+    assert c["T"] == pytest.approx(math.log(3260 / 4060))  # (800 + 10 i) vs (1000 + 10 i) J, i = 0..3, all resolved
+    assert analyze(recs, manifest, EM, "fewest_turns", CFG)["within_repo"] is None
+    with pytest.raises(ValueError, match="P1 rows are inrepo_test"):
+        analyze(recs, manifest, EM, "fewest_turns", CFG, p1_records=recs, p1_manifest=manifest)
+    with pytest.raises(ValueError, match="p1_records and p1_manifest"):
+        analyze(recs, manifest, EM, "fewest_turns", CFG, p1_records=p1recs)
