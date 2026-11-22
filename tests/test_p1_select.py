@@ -528,6 +528,9 @@ def test_did_fail_drops_and_inconclusive_marks_the_stability_arms_exploratory():
     assert summary["kill_rules"]["exploratory"] == [] and summary["kill_rules"]["dropped"] == []
     with pytest.raises(ValueError, match="incomplete"):
         go(runs, did=did("incomplete"))
+    for kw in ({"arms": ["random", "fewest_turns"]}, {"chosen": None, "did": did("incomplete", score=None)}):
+        _, summary = go(runs, **{"did": did("incomplete"), **kw})
+        assert summary["kill_rules"]["p0d_did"]["note"].startswith("not applied")
     with pytest.raises(ValueError, match="did.json tests score 'kl_mean'"):
         go(runs, did=did("pass", score="kl_mean"))
     with pytest.raises(ValueError, match="decision"):
