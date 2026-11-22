@@ -2,6 +2,7 @@
 
     python scripts/p1_pick_headline.py outputs/attempts/<P1 run>.jsonl ... --models outputs/p1/models.json \
         --energy-model outputs/p0a/energy_model.json --p0a-verdict pass|fail|inconclusive \
+        --train-meta outputs/runs/<arm>_seed0/train_meta.json ... \
         [--score-choice outputs/p0d/score_choice.json] [--did outputs/p0d/did.json] \
         [--not-separable ARM ...] [--config configs/p2_analysis.yaml] [--out outputs/p1/headline.json]
 
@@ -12,6 +13,8 @@ qtrace (docs/03 kill rule). Otherwise P0d's score_choice.json, required then (an
 score), decides whether they are eligible. --not-separable names eligible arms P0b's arm-overlap rule
 flagged as not separable and P1 did not train (docs/04 P0b); they are dropped. The config's
 guard_margin must be set, though the pick itself does not use it, so P1 cannot start before it is frozen.
+--train-meta: the P1 runs' train_meta.json files (at least the headline arm's and random's); the output's
+token_match says whether docs/04's token-matched rerun of the headline arm is required.
 """
 
 import argparse
@@ -41,6 +44,7 @@ def main(argv=None):
     ap.add_argument("--score-choice")
     ap.add_argument("--did")
     ap.add_argument("--not-separable", nargs="+", default=[], choices=HEADLINE_ARMS)
+    ap.add_argument("--train-meta", nargs="+", required=True)
     ap.add_argument("--config", default="configs/p2_analysis.yaml")
     ap.add_argument("--out", default="outputs/p1/headline.json")
     args = ap.parse_args(argv)
@@ -48,12 +52,13 @@ def main(argv=None):
     try:
         out = pick_headline([r for p in args.attempts for r in read_jsonl(p)], read_json(args.models),
                             read_json(args.energy_model), read_json(args.score_choice), read_json(args.did),
-                            load_config(args.config), args.p0a_verdict, args.not_separable)
+                            load_config(args.config), args.p0a_verdict, args.not_separable,
+                            [read_json(p) for p in args.train_meta])
     except ValueError as e:
         raise SystemExit(f"p1_pick_headline: {e}") from e
     out["inputs"] = {"attempts": args.attempts, "models": args.models, "energy_model": args.energy_model,
                      "p0a_verdict": args.p0a_verdict, "score_choice": args.score_choice, "did": args.did,
-                     "not_separable": args.not_separable,
+                     "not_separable": args.not_separable, "train_meta": args.train_meta,
                      "config": args.config}
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     with open(args.out, "w") as f:
@@ -68,6 +73,11 @@ def main(argv=None):
         print(f"{arm:14} dropped: {why}")
     print(f"headline: {out['headline'] or 'none (' + out['reason'] + ')'}"
           + (f", tied with {out['tied_with']}" if out["tied_with"] else ""), "->", args.out)
+    tm = out["token_match"]
+    if tm:
+        print(f"supervised tokens: {tm['arm']} {tm['arm_supervised_tokens']}, random {tm['random_supervised_tokens']}; "
+              + (f"token-matched rerun required: --arm {tm['arm']} --match-supervised-tokens "
+                 f"{tm['match_supervised_tokens']}" if tm["rerun_required"] else "no token-matched rerun"))
 
 
 if __name__ == "__main__":

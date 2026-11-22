@@ -472,11 +472,15 @@ def test_scripts_end_to_end_and_missing_margin(tmp_path):
     (tmp_path / "m1.json").write_text(json.dumps(manifest))
     (tmp_path / "sc.json").write_text(json.dumps({"chosen": None, "decided": True}))
     head = tmp_path / "headline.json"
-    common = ["--models", tmp_path / "m1.json", "--energy-model", tmp_path / "em.json"]
+    for arm, n in (("fewest_turns", 1200), ("random", 1000)):
+        (tmp_path / f"{arm}.json").write_text(json.dumps(meta(arm, n)))
+    common = ["--models", tmp_path / "m1.json", "--energy-model", tmp_path / "em.json", "--train-meta",
+              tmp_path / "fewest_turns.json", tmp_path / "random.json"]
     res = run("p1_pick_headline.py", tmp_path / "p1.jsonl", *common, "--score-choice", tmp_path / "sc.json",
               "--p0a-verdict", "pass", "--config", cfg, "--out", head)
     assert res.returncode == 0, res.stderr
     assert json.loads(head.read_text())["headline"] == "fewest_turns"
+    assert json.loads(head.read_text())["token_match"]["rerun_required"] and "--match-supervised-tokens 1000" in res.stdout
     res = run("p1_pick_headline.py", tmp_path / "p1.jsonl", *common, "--score-choice", tmp_path / "sc.json",
               "--p0a-verdict", "pass", "--not-separable", "fewest_joules", "--config", cfg, "--out", head)
     assert res.returncode != 0 and "untrained arms" in res.stderr  # fewest_joules has P1 rows here
@@ -498,8 +502,8 @@ def test_scripts_end_to_end_and_missing_margin(tmp_path):
     assert out["h4"]["contrasts"][0]["keeps_sign"] and "keeps sign: True" in md
 
     cfg.write_text(yaml.safe_dump({**CFG, "guard_margin": None}))
-    for res in (run("p1_pick_headline.py", tmp_path / "p1.jsonl", *common[:4], "--score-choice", tmp_path / "sc.json",
-                    "--p0a-verdict", "pass", "--config", cfg),
+    for res in (run("p1_pick_headline.py", tmp_path / "p1.jsonl", *common[:4], "--train-meta", tmp_path / "random.json",
+                    "--score-choice", tmp_path / "sc.json", "--p0a-verdict", "pass", "--config", cfg),
                 run("p2_analyze.py", tmp_path / "p2.jsonl", *common, "--config", cfg)):
         assert res.returncode != 0 and "guard_margin is required" in res.stderr
 
@@ -804,3 +808,46 @@ def test_measured_subset_contrast_when_the_estimate_fails():
     out = analyze(main, manifest, EM, "fewest_turns", CFG, estimator_rows=est({"fewest_turns": 1.0, "random": 1.0,
                                                                               "base": 1.0}))
     assert out["measured_subset"] is None and out["claim_A"]["measured_subset_wins"] is None
+
+
+def meta(arm, tokens, match=None):
+    return {"arm": arm, "seed": 0, "supervised_tokens_seen": tokens, "match_supervised_tokens": match}
+
+
+def test_pick_reports_whether_the_token_matched_rerun_is_required():
+    recs, manifest = p1()
+    passed = {"score": "kl_decision", "decision": "pass"}
+    def pick(metas):
+        return pick_headline(recs, manifest, EM, CHOSEN, passed, CFG, "pass", train_meta=metas)["token_match"]
+    # stable is the pick; the matched rerun of a stable rerun (match_supervised_tokens set) is not P1's own run.
+    tm = pick([meta("stable", 1200), meta("random", 1000), meta("stable", 1000, match=1000), meta("qtrace", 5)])
+    assert tm == {"arm": "stable", "arm_supervised_tokens": 1200, "random_supervised_tokens": 1000,
+                  "rerun_required": True, "match_supervised_tokens": 1000}
+    assert pick([meta("stable", 1000), meta("random", 1000)])["rerun_required"] is False
+    assert pick(None) is None
+    for metas, match in (([meta("random", 1000)], "no train_meta.json for stable"),
+                         ([meta("stable", 9), meta("stable", 8), meta("random", 1)], "two train_meta.json for stable"),
+                         ([meta("stable", 1.5), meta("random", 1)], "supervised_tokens_seen")):
+        with pytest.raises(ValueError, match=match):
+            pick(metas)
+
+
+def test_token_matched_rerun_contrast():
+    def fn(f):
+        return lambda arm, s, prof, repo, i: (True, f.get(arm, 1.0) * base_joules(repo, i))
+    recs, manifest = build(["fewest_turns", "random"], fn({"fewest_turns": 0.8}), seeds=(0, 1))
+    tm, _ = build(["fewest_turns"], fn({"fewest_turns": 0.9}), profiles=(Q4,))
+    tm = [{**r, "model": "ft_tokmatch", "attempt_id": "tm-" + r["attempt_id"]} for r in tm]
+    manifest = {**manifest, "ft_tokmatch": {"arm": "fewest_turns", "seed": 0, "token_matched": True}}
+    out = analyze(recs + tm, manifest, EM, "fewest_turns", CFG)
+    c = out["token_matched"]
+    assert (c["arm"], c["comparator"], c["profile"], c["n_tasks"]) == ("fewest_turns_tokmatch", "random", Q4, 20)
+    assert c["T"] == pytest.approx(math.log(0.9)) and c["wins"]
+    assert out["primary"]["T"] == pytest.approx(math.log(0.8))  # the rerun stays out of the headline arm's cells
+    assert analyze(recs, {m: v for m, v in manifest.items() if m != "ft_tokmatch"}, EM, "fewest_turns",
+                   CFG)["token_matched"] is None
+    for bad, match in (({"arm": "fewest_turns", "seed": 0, "token_matched": 1}, "token_matched must be"),
+                       ({"arm": "base", "seed": None, "token_matched": True}, "token_matched must be"),
+                       ({"arm": "fewest_turns", "seed": 0, "token_matched": True}, "both fewest_turns seed 0")):
+        with pytest.raises(ValueError, match=match):
+            load(recs + tm, {**manifest, "other": bad}, EM, "p2")

@@ -43,6 +43,7 @@ from qtrace.p2_data import (
     MALFORMED,
     PRIMARY,
     REFERENCE,
+    TOKMATCH,
     arrays,
     check_config,
     js,
@@ -546,7 +547,30 @@ def p0d_dropped(score_choice, did):
     raise ValueError(f"did.json decision must be pass, fail or inconclusive, got {decision!r}")
 
 
-def pick_headline(records, manifest, energy_model, score_choice, did, cfg, p0a_verdict, not_separable=()):
+def token_match(headline, train_meta):
+    """docs/04 Training: "If the headline arm saw more supervised tokens than random, one token-matched rerun of
+    that contrast is added." train_meta: the P1 runs' train_meta.json contents (scripts/p1_train_lora.py);
+    token-matched reruns among them (match_supervised_tokens set) are skipped. The rerun trains the headline arm
+    with --match-supervised-tokens set to random's supervised_tokens_seen."""
+    seen = {}
+    for m in train_meta:
+        if m.get("match_supervised_tokens") is None and m.get("arm") in (headline, "random"):
+            if m["arm"] in seen:
+                raise ValueError(f"two train_meta.json for {m['arm']} without match_supervised_tokens; P1 trains one")
+            n = m.get("supervised_tokens_seen")
+            if isinstance(n, bool) or not isinstance(n, int) or n <= 0:
+                raise ValueError(f"train_meta.json of {m['arm']}: supervised_tokens_seen must be a positive integer, "
+                                 f"got {n!r}")
+            seen[m["arm"]] = n
+    for arm in (headline, "random"):
+        if arm not in seen:
+            raise ValueError(f"no train_meta.json for {arm} among the P1 runs given")
+    return {"arm": headline, "arm_supervised_tokens": seen[headline], "random_supervised_tokens": seen["random"],
+            "rerun_required": seen[headline] > seen["random"], "match_supervised_tokens": seen["random"]}
+
+
+def pick_headline(records, manifest, energy_model, score_choice, did, cfg, p0a_verdict, not_separable=(),
+                  train_meta=None):
     """docs/03 P1 rule: among HEADLINE_ARMS minus those P0a or P0d dropped, the lowest estimated Q4_K_M JPR whose
     BF16 resolve rate is not clearly below random's (clearly below: the two-sided 95% upper bound of RR_arm -
     RR_random at BF16 is below 0). Controls are never eligible; an arm that resolves nothing at Q4_K_M cannot be
@@ -557,7 +581,9 @@ def pick_headline(records, manifest, energy_model, score_choice, did, cfg, p0a_v
     p0a_verdict is P0a's final gate verdict. On "fail" the docs/03 kill rule drops the robustness half, the
     stability arms included, so P0d's inputs are not read and may be None. not_separable names the eligible arms
     P0b's arm-overlap rule flagged as not separable and P1 did not train (docs/04 P0b); they are dropped, and
-    they must have no P1 rows. Any other eligible arm without rows is an error.
+    they must have no P1 rows. Any other eligible arm without rows is an error. With train_meta (the P1 runs'
+    train_meta.json contents), token_match says whether the headline needs the token-matched rerun (token_match());
+    without it, or with no headline, token_match is None.
 
     The tripwire numbers cover every (arm, profile) with rows, controls and dropped arms included, each on its
     own tasks (docs/04 Test-file tripwire: every P1 resolve rate)."""
@@ -600,12 +626,14 @@ def pick_headline(records, manifest, energy_model, score_choice, did, cfg, p0a_v
             "n_boot": cfg["n_boot"], "seed": cfg["seed"], "p0a_verdict": p0a_verdict, "energy": data["energy"],
             "tripwire": {f"{a}/{p}": _tripwire(arrays(data, [(a, p)], cfg["infra_error_cap"])["groups"][a, p])
                          for a, p in sorted(present(data))},
-            "reason": None if best else "no eligible arm"}
+            "reason": None if best else "no eligible arm",
+            "token_match": None if train_meta is None or not best else token_match(best["arm"], train_meta)}
 
 
 def analyze(records, manifest, energy_model, headline, cfg, estimator_rows=None):
     """The P2 analysis: the primary test (headline vs random at Q4_K_M, detail and the infra_timeout sensitivity),
-    the hypothesis families with Holm, the arm table, B metrics per arm at Q4_K_M and BF16, the H1a/H2 tokens-ratio
+    the token-matched rerun of it (token_matched, when a token_matched model of the headline arm ran at Q4_K_M,
+    else None), the hypothesis families with Holm, the arm table, B metrics per arm at Q4_K_M and BF16, the H1a/H2 tokens-ratio
     contrasts, the estimator check (when its rows are given) and, when the estimate does not stand, the primary on
     the measured subset (measured_subset), the turn-cap frontier (when base ran), the claim-A summary, all on
     grammar false rows, and H4 on the grammar true rows (None when there are none). Claim A on
@@ -635,7 +663,13 @@ def analyze(records, manifest, energy_model, headline, cfg, estimator_rows=None)
                "holds_under_upper_bound": c["upper_bound"]["p_one_sided"] < cfg["alpha"] and c["guard"]["pass"],
                "sensitivity_without_infra_timeout": {k: sens[k] for k in ("n_tasks", "n_tasks_dropped_infra_timeout",
                                                                           "T", "ratio", "gpu", "guard")}}
-    have = present(data)
+    have, tm = present(data), (headline + TOKMATCH, PRIMARY)
+    token_matched = None
+    if tm in have:  # docs/04 Training: the token-matched rerun of the primary contrast, when P1 required one
+        c = contrast(arrays(data, [tm, groups[1]], cfg["infra_error_cap"], cpu_w), tm, groups[1], cfg)
+        token_matched = {**c, "wins": c["gpu"]["p_one_sided"] < cfg["alpha"] and c["guard"]["pass"],
+                         "holds_under_upper_bound": c["upper_bound"]["p_one_sided"] < cfg["alpha"]
+                         and c["guard"]["pass"]}
     b = {arm: b_metrics(data, arm, cfg) for arm in sorted({a for a, _ in have})
          if (arm, PRIMARY) in have and (arm, REFERENCE) in have and ("random", REFERENCE) in have}
     est = measured = None
@@ -654,7 +688,7 @@ def analyze(records, manifest, energy_model, headline, cfg, estimator_rows=None)
     return {"headline": headline, "energy": energy, "n_rows": data["n_rows"], "n_rows_grammar": gdata["n_rows"],
             "n_reruns_used": data["n_reruns_used"],
             "n_resolved_after_budget_hit": data["n_resolved_after_budget_hit"],
-            "primary": primary, "families": families(data, cfg, cpu_w, headline), "arms": arm_table(data, cfg, cpu_w),
+            "primary": primary, "token_matched": token_matched, "families": families(data, cfg, cpu_w, headline), "arms": arm_table(data, cfg, cpu_w),
             "b_metrics": b, "tokens_ratio_contrasts": tokens_ratio_contrasts(data, cfg), "estimator_check": est,
             "measured_subset": measured, "turn_cap_frontier": frontier, "claim_A": claim,
             "h4": h4(data, gdata, headline, cfg, cpu_w) if gdata["n_rows"] else None,

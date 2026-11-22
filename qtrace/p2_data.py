@@ -4,6 +4,9 @@ Attempt records are in the issue #1 format. A models manifest maps each record's
 {arm, seed}: seed is the training seed, arm "base" is the untouched model and "base_nothink" the same model
 with thinking off (docs/03 Baselines). A base entry may give seed null, and then its replicates are the
 attempts' sampling seeds, because the base model has no training seed but P2 runs it 3 times like the arms.
+An entry may add token_matched: true for a token-matched rerun (docs/04 Training,
+scripts/p1_train_lora.py --match-supervised-tokens); load() indexes it as arm "<arm>_tokmatch", so it never
+mixes with the arm's own seed models.
 Every record carries a required bool `grammar`: true only for H4's grammar-constrained runs (docs/03
 Baselines). load() indexes one side of it, so grammar rows enter H4 only and every other statistic uses
 grammar false rows.
@@ -37,6 +40,7 @@ END_REASONS = ("submitted", "turn_limit", "context_limit", "infra_timeout", "err
 MALFORMED = ("misnested_tag", "wrong_name", "text_after_call", "truncated_call", "no_call_no_answer")  # issue #1
 TURN_FIELDS = ("output_tokens", "input_uncached", "input_cached", "gen_s", "tool_s")
 PRIMARY, REFERENCE = "Q4_K_M", "BF16"
+TOKMATCH = "_tokmatch"  # suffix of a token-matched rerun's arm in load()'s cells
 WHOLE_ATTEMPT = "whole_attempt_raw_joules"  # energy_model.json ranking.quantity (#13, provisional endpoint)
 
 
@@ -112,21 +116,25 @@ def check_config(cfg, upper_bound):
 
 
 def check_manifest(manifest):
-    """model value -> {arm, seed}. Two models for one (arm, seed) fail: either could be the one analyzed."""
+    """model value -> {arm, seed[, token_matched]}. Two models for one (arm, seed, token_matched) fail: either could
+    be the one analyzed."""
     if not isinstance(manifest, dict) or not manifest:
         raise ValueError("the models manifest must be a non-empty {model: {arm, seed}} mapping")
     seen = {}
     for model, m in manifest.items():
-        arm, seed = (m or {}).get("arm"), (m or {}).get("seed")
+        arm, seed, tm = (m or {}).get("arm"), (m or {}).get("seed"), (m or {}).get("token_matched", False)
         if arm not in ARM_NAMES:
             raise ValueError(f"model {model!r}: unknown arm {arm!r}; the arms are {sorted(ARM_NAMES)}")
         if (seed is None and arm not in BASE_ARMS
                 or seed is not None and (isinstance(seed, bool) or not isinstance(seed, int))):
             raise ValueError(f"model {model!r}: seed must be an integer training seed (null only for base), "
                              f"got {seed!r}")
-        if (arm, seed) in seen:
-            raise ValueError(f"models {seen[arm, seed]!r} and {model!r} are both {arm} seed {seed}")
-        seen[arm, seed] = model
+        if type(tm) is not bool or tm and arm in BASE_ARMS:
+            raise ValueError(f"model {model!r}: token_matched must be true or false, and false for base, got {tm!r}")
+        if (arm, seed, tm) in seen:
+            raise ValueError(f"models {seen[arm, seed, tm]!r} and {model!r} are both {arm} seed {seed}"
+                             + (" token-matched" if tm else ""))
+        seen[arm, seed, tm] = model
 
 
 def energy_settings(energy_model):
@@ -264,10 +272,11 @@ def load(records, manifest, energy_model, phase, every_model=True, grammar=False
             n_other += 1
             continue
         m = manifest[model]
+        arm = m["arm"] + TOKMATCH if m.get("token_matched") else m["arm"]
         rep = m["seed"] if m["seed"] is not None else f"sampling{rec['seed']}"
-        rows[m["arm"], rep, profile, task].append(rec)
+        rows[arm, rep, profile, task].append(rec)
         models.add(model)
-        lists[m["arm"], rep, profile].add(lst)
+        lists[arm, rep, profile].add(lst)
         list_tasks[lst].add(task)
     unused = sorted(set(manifest) - models)
     if every_model and unused:

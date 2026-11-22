@@ -68,6 +68,8 @@ def markdown(out):
              row("test", "contrast", "profile", "tasks", "JPR arm", "JPR comp", "ratio", "p", "Holm p",
                  "RR diff vs random (lower95)", "guard", "UB ratio / p", "wins", "supported"),
              "|" + "---|" * 14, contrast_row("primary", p)]
+    if out["token_matched"]:
+        lines.append(contrast_row("primary, token-matched", out["token_matched"]))
     for fam, f in out["families"].items():
         lines += [contrast_row(fam, c) for c in f["contrasts"]]
     h4 = out["h4"]
