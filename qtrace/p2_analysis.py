@@ -335,17 +335,18 @@ def b_metrics(data, arm, cfg):
     return out
 
 
-def tokens_ratio_contrasts(data, cfg):
+def tokens_ratio_contrasts(data, cfg, headline):
     """docs/03 secondary endpoints of H1a and H2: the arm has a smaller Q4_K_M/BF16 ratio of processed tokens per
-    resolved task than its comparator. Per configured pair of those families whose arms both ran at both
-    profiles (others are left out), the arm's ratio over the comparator's on the tasks the four groups share,
+    resolved task than its comparator. Per configured pair of those families ("headline" is the P1 pick, as in
+    families()) whose arms differ and both ran at both profiles (others are left out), the arm's ratio over the comparator's on the tasks the four groups share,
     with a two-sided 95% interval from stratified task draws shared by both arms. A draw where both ratios are
     undefined goes to +inf, as in _ratio_draws. Reported only: no test, Holm or guard."""
     have, out = present(data), []
     for fam in TOKEN_RATIO_FAMILIES:
-        for a, b in cfg["families"].get(fam, []):
+        for pair in cfg["families"].get(fam, []):
+            a, b = (headline if x == "headline" else x for x in pair)
             groups = [(x, p) for x in (a, b) for p in (PRIMARY, REFERENCE)]
-            if any(g not in have for g in groups):
+            if a == b or any(g not in have for g in groups):
                 continue
             arr = arrays(data, groups, cfg["infra_error_cap"])
             G, one = arr["groups"], np.ones((1, len(arr["tasks"])))
@@ -727,7 +728,7 @@ def analyze(records, manifest, energy_model, headline, cfg, estimator_rows=None,
             "n_reruns_used": data["n_reruns_used"],
             "n_resolved_after_budget_hit": data["n_resolved_after_budget_hit"],
             "primary": primary, "batched_regime": both, "token_matched": token_matched, "families": families(data, cfg, cpu_w, headline), "arms": arm_table(data, cfg, cpu_w),
-            "b_metrics": b, "tokens_ratio_contrasts": tokens_ratio_contrasts(data, cfg), "estimator_check": est,
+            "b_metrics": b, "tokens_ratio_contrasts": tokens_ratio_contrasts(data, cfg, headline), "estimator_check": est,
             "measured_subset": measured, "turn_cap_frontier": frontier, "claim_A": claim,
             "h4": h4(data, gdata, headline, cfg, cpu_w) if gdata["n_rows"] else None,
             "within_repo": None if p1_records is None else within_repo(p1_records, p1_manifest, energy_model,

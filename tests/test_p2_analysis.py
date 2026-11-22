@@ -338,6 +338,11 @@ def test_tokens_ratio_contrast():
     assert (c["family"], c["arm"], c["comparator"], c["n_tasks"]) == ("H1a", "fewest_turns", "random", 20)
     assert c["arm_ratio"] == pytest.approx(1.0) and c["comparator_ratio"] == pytest.approx(1.5)
     assert c["ratio_of_ratios"] == pytest.approx(1 / 1.5) and c["ci95"] == pytest.approx([1 / 1.5, 1 / 1.5])
+    # "headline" is the pick here too; a pair that names the pick twice is left out.
+    cfg = {**CFG, "families": {"H1a": [["headline", "random"], ["headline", "fewest_turns"]]},
+           "upper_bound_required": []}
+    (h,) = analyze(recs, manifest, EM, "fewest_turns", cfg)["tokens_ratio_contrasts"]
+    assert h == c
 
 
 def test_headline_pick_none_eligible():
