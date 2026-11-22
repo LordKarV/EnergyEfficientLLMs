@@ -535,6 +535,18 @@ def test_calibration_range_has_the_output_share_and_check_range_counts_turns_out
         check_range(recs, old)
 
 
+def test_turns_per_attempt_range_counts_unmeasured_turns():
+    # estimate_attempt_joules and check_range count every turn, so the calibration bound must too; an
+    # unmeasured turn mid-attempt keeps the per-turn token ranges (measured turns only) out of it.
+    recs = subrun(PLANT, n_tasks=4, per_task=1)
+    for r in recs:
+        r["per_turn"][1]["gen_energy_j"] = None
+    rep = profile_report(fit_attempts(recs)[0]["Q4_K_M"], n_boot=0)
+    n = [len(r["per_turn"]) for r in recs]
+    assert rep["calibration_range"]["turns_per_attempt"] == [min(n), max(n)]
+    assert all(v == {"below": 0.0, "above": 0.0} for v in check_range(recs, rep)["outside"].values())
+
+
 def test_cache_check_compares_per_request_counts_where_present():
     # docs/04 asks how often per-request cached-prompt counts differ; attempt totals can hide it.
     recs = subrun(PLANT, n_tasks=3)

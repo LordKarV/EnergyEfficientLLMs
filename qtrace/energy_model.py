@@ -382,7 +382,8 @@ def profile_report(attempts, n_boot=2000, seed=0):
     flags = [a["server_cached_differs"] for a in attempts]
     known = [f for f in flags if f is not None]
     rng_of = {t: [float(v.min()), float(v.max())] for t, v in _range_values(X).items()}
-    n_turns = [len(a["raw"]) for a in attempts]
+    # Every turn, measured or not: check_range and estimate_attempt_joules count them all.
+    n_turns = [a["n_turns"] for a in attempts]
     per_turn = [f for a in attempts for f in a["turn_cached_differs"]]
     idle_refs = [a["idle_w_ref"] for a in attempts if a["idle_w_ref"] is not None]
     cpu = [a["container_cpu_seconds"] for a in attempts]
