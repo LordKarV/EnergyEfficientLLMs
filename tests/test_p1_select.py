@@ -468,6 +468,77 @@ def test_missing_score_choice_is_an_error_when_stability_arms_are_asked_for():
     assert set(picks) == {"random", "fewest_turns", "low_entropy"} and summary["score"]["file_present"] is False
 
 
+# Kill rules (docs/04 Kill rules): gates.json P0a.final_verdict and did.json decision.
+
+def gates(verdict):
+    return {"P0a": {"primary": {"verdict": "inconclusive"}, "final_verdict": verdict}}
+
+
+def did(decision, score="kl_decision"):
+    return {"decision": decision, "score": score}
+
+
+def test_p0a_fail_drops_the_stability_arms_without_needing_a_score_choice():
+    runs = random_pool(["t1", "t2"])
+    picks, summary = go(runs, gates=gates("fail"))
+    assert set(picks) == set(ARMS) - STABILITY_ARMS - {"fewest_joules"}
+    rules = summary["kill_rules"]
+    assert rules["p0a"]["verdict"] == "fail" and "drops the stability arms" in rules["p0a"]["note"]
+    assert rules["dropped"] == [a for a in ARMS if a in STABILITY_ARMS] and rules["exploratory"] == []
+    attempts, scores, joules = make(runs)
+    picks, summary = select(attempts, scores, None, {"fewest_joules_fallback": True}, joules, min_candidates=2,
+                            seeds=(0,), gates=gates("fail"), did=did("pass"))
+    assert set(picks) == set(ARMS) - STABILITY_ARMS and summary["kill_rules"]["p0d_did"]["decision"] is None
+
+
+@pytest.mark.parametrize("verdict", ["pass", "inconclusive"])
+def test_p0a_pass_or_final_inconclusive_keeps_the_stability_arms(verdict):
+    picks, summary = go(random_pool(["t1", "t2"]), gates=gates(verdict))
+    assert STABILITY_ARMS <= set(picks) and summary["kill_rules"]["dropped"] == []
+    assert summary["kill_rules"]["p0a"]["verdict"] == verdict
+
+
+def test_p0a_awaiting_its_retest_is_an_error_when_stability_arms_are_asked_for():
+    runs = random_pool(["t1", "t2"])
+    with pytest.raises(ValueError, match="re-test"):
+        go(runs, gates=gates(None))
+    with pytest.raises(ValueError, match="final_verdict"):
+        go(runs, gates={"P0a": {"primary": {"verdict": "pass"}}})
+    with pytest.raises(ValueError, match="final_verdict"):
+        go(runs, gates=gates("maybe"))
+    picks, _ = go(runs, gates=gates(None), arms=["random", "fewest_turns"])
+    assert set(picks) == {"random", "fewest_turns"}
+
+
+def test_did_fail_drops_and_inconclusive_marks_the_stability_arms_exploratory():
+    runs = random_pool(["t1", "t2"])
+    picks, summary = go(runs, gates=gates("pass"), did=did("fail"))
+    assert set(picks) == set(ARMS) - STABILITY_ARMS - {"fewest_joules"}
+    assert "drops KL from selection" in summary["kill_rules"]["p0d_did"]["note"]
+    picks, summary = go(runs, did=did("inconclusive"))
+    assert STABILITY_ARMS <= set(picks) and summary["kill_rules"]["dropped"] == []
+    assert summary["kill_rules"]["exploratory"] == [a for a in ARMS if a in STABILITY_ARMS]
+    assert "out of the headline" in summary["kill_rules"]["p0d_did"]["note"]
+    _, summary = go(runs, did=did("pass"))
+    assert summary["kill_rules"]["exploratory"] == [] and summary["kill_rules"]["dropped"] == []
+    with pytest.raises(ValueError, match="incomplete"):
+        go(runs, did=did("incomplete"))
+    with pytest.raises(ValueError, match="did.json tests score 'kl_mean'"):
+        go(runs, did=did("pass", score="kl_mean"))
+    with pytest.raises(ValueError, match="decision"):
+        go(runs, did=did("maybe"))
+
+
+def test_absent_gates_and_did_are_recorded_as_not_checked():
+    picks, summary = go(random_pool(["t1", "t2"]))
+    assert STABILITY_ARMS <= set(picks)
+    _, other = go(random_pool(["t1", "t2"]), gates={"P0b": {}})
+    for s in (summary, other):
+        assert s["kill_rules"]["p0a"]["verdict"] is None and s["kill_rules"]["p0a"]["note"].startswith("not checked")
+    assert summary["kill_rules"]["p0d_did"]["decision"] is None
+    assert summary["kill_rules"]["p0d_did"]["note"].startswith("not checked")
+
+
 def test_bad_input_fails_with_a_message_naming_the_problem():
     def broken(edit, match, **kw):
         attempts, scores, joules = make([{"task": "t"}, {"task": "t"}])
@@ -505,6 +576,21 @@ def test_overlap_table_flags_pairs_above_85_percent():
     assert pairs[("a", "c")]["share_same"] == 0.9 and pairs[("a", "c")]["not_separable"] is True
     assert overlap({"a": a, "d": rows(["x"] * 16 + ["y"] * 4)})[0]["not_separable"] is False
     assert pairs[("b", "c")]["share_same"] == 0.95
+
+
+def test_not_separable_pairs_are_reported_untestable_with_their_contrasts_and_still_built():
+    # Run x has the lowest score, entropy, turns and tokens in every task, so those arms all pick it.
+    runs = [{"task": t, "turns": 3, "out": 10, "kl": 0.1, "ent": 1.0, "j": 5.0} for t in ("t1", "t2")]
+    runs += [{"task": t, "turns": 6, "out": 50, "kl": 0.5, "ent": 3.0, "j": 9.0} for t in ("t1", "t2")]
+    picks, summary = go(runs, seeds=(0, 1))
+    rows = {tuple(u["arms"]): u for u in summary["untestable"]}
+    assert rows[("stable", "low_entropy")] == {"arms": ["stable", "low_entropy"], "seeds": ["0", "1"],
+                                              "max_share_same": 1.0,
+                                              "contrasts": [{"family": "H3", "arms": ["stable", "low_entropy"]}]}
+    assert rows[("fewest_turns", "qtrace")]["contrasts"] == [{"family": "H2", "arms": ["qtrace", "fewest_turns"]}]
+    assert rows[("fewest_turns", "stable")]["contrasts"] == []
+    flagged = {tuple(p["arms"]) for ps in summary["overlap"]["by_seed"].values() for p in ps if p["not_separable"]}
+    assert set(rows) == flagged and "stable" in picks and "low_entropy" in picks
 
 
 def test_arm_overlap_rule_ranks_turns_tokens_joules_and_both_hero_costs():
@@ -684,6 +770,17 @@ def test_script_writes_arm_files_and_summary(tmp_path):
     assert summary["inputs"]["est_joules"]["present"] is False and summary["pool_runs"] == ["run-p0b"]
     assert "removed stale stable_seed7.jsonl" in res.stdout and "fewest_turns" in res.stdout
     assert "P0b fewest_joules/fewest_turns rule: not computed" in res.stdout
+    assert "gates" not in summary["inputs"] and summary["kill_rules"]["p0a"]["verdict"] is None
+    (tmp_path / "p0").mkdir()
+    (tmp_path / "p0" / "gates.json").write_text(json.dumps(gates("fail")))
+    cfg["paths"] |= {"gates": str(tmp_path / "p0" / "gates.json"), "did": str(tmp_path / "p0d" / "did.json")}
+    (tmp_path / "cfg.yaml").write_text(yaml.safe_dump(cfg))
+    res = run_script(tmp_path / "cfg.yaml")
+    assert res.returncode == 0, res.stderr
+    assert not any(n.startswith(tuple(STABILITY_ARMS)) for n in os.listdir(tmp_path / "out"))
+    summary = json.loads((tmp_path / "out" / "summary.json").read_text())
+    assert summary["kill_rules"]["p0a"]["verdict"] == "fail" and summary["inputs"]["did"]["present"] is False
+    assert "P0a kill rule: failed" in res.stdout and "untestable" in res.stdout
     cfg["pool_runs"] = []
     (tmp_path / "cfg.yaml").write_text(yaml.safe_dump(cfg))
     res = run_script(tmp_path / "cfg.yaml")

@@ -3,7 +3,8 @@
     python scripts/p1_select.py --config configs/p1_select.yaml
 
 Reads the pool runs' attempts (<attempts_dir>/<run_id>.jsonl for each id in pool_runs), the P0d scores
-and score choice, and the P0a energy model and joule estimates. Writes <out_dir>/<arm>_seed<s>.jsonl and
+and score choice, the P0a energy model and joule estimates, and, when paths.gates and paths.did are set, the P0 gates and
+P0d's DiD result for the kill rules. Writes <out_dir>/<arm>_seed<s>.jsonl and
 <out_dir>/summary.json and prints a table. A P0d or P0a file that does not exist is passed on as absent;
 qtrace/p1_select.py decides whether that is a pre-registered fallback or an error. Arm files from an
 earlier run that this run did not build are removed, so training never picks up a stale arm.
@@ -71,6 +72,13 @@ def report(summary):
           + (", ".join(close) or "none"))
     rule = summary["arm_overlap_rule"]
     print("P0b fewest_joules/fewest_turns rule:", rule["note"])
+    kill = summary["kill_rules"]
+    print("P0a kill rule:", kill["p0a"]["note"])
+    print("P0d DiD kill rule:", kill["p0d_did"]["note"])
+    for u in summary["untestable"]:
+        hyp = ", ".join(f"{c['family']} {c['arms'][0]} vs {c['arms'][1]}" for c in u["contrasts"]) or "no H1a-H5 contrast"
+        print(f"untestable: {u['arms'][0]}~{u['arms'][1]} (seeds {', '.join(u['seeds'])}): {hyp}; both built, "
+              "which to skip is an owner rule")
     for s, r in (rule["by_seed"] or {}).items():
         regret = ", ".join(f"{n} {x:.1%}" for n, x in r["median_joule_regret"].items())
         print(f"  seed {s}: median joule regret {regret}; calibrated token-mix cost: {r['calibrated_token_mix']}")
@@ -87,8 +95,10 @@ def main():
 
     attempts = [r for run in runs for r in read_attempts(os.path.join(paths["attempts_dir"], f"{run}.jsonl"))]
     inputs = {k: paths[k] for k in ("scores", "score_choice", "energy_model", "est_joules")}
+    inputs |= {k: paths[k] for k in ("gates", "did") if paths.get(k)}  # optional: unset means not checked
     picks, summary = select(attempts, load(inputs["scores"], read_jsonl), load(inputs["score_choice"], read_json),
                             load(inputs["energy_model"], read_json), load(inputs["est_joules"], read_jsonl),
+                            gates=load(inputs.get("gates", ""), read_json), did=load(inputs.get("did", ""), read_json),
                             **cfg["select"])
     summary = {**summary, "pool_runs": runs,
                "inputs": {k: {"path": p, "present": os.path.exists(p)} for k, p in inputs.items()}}

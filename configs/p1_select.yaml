@@ -11,6 +11,8 @@ paths:
   score_choice: outputs/p0d/score_choice.json   # "chosen": the score the stability arms rank by
   energy_model: outputs/p0a/energy_model.json   # fewest_joules_fallback
   est_joules: outputs/p0a/est_joules.jsonl      # est_joules_q4 per attempt
+  gates: outputs/p0/gates.json                  # optional, kill rule: P0a.final_verdict fail drops the stability arms
+  did: outputs/p0d/did.json                     # optional, kill rule: fail drops them, inconclusive keeps them exploratory
   out_dir: outputs/arms
 
 select:

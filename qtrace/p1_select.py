@@ -13,6 +13,12 @@ estimates) are checked only for the arms that rank by them; a gap there is an er
 summary.json also carries docs/04 P0b's arm-overlap rule (arm_overlap_rule), and select applies it: when
 fewest_joules and fewest_turns pick the same run in at least 85% of tasks, or fewest_turns' median joule
 regret is below 5%, in any seed, fewest_joules is not built for any seed.
+
+The docs/04 kill rules run before any arm is built (kill_rules in summary.json): a P0a fail
+(gates.json P0a.final_verdict) or a P0d DiD fail (did.json decision) drops the stability arms, and with
+them the KL term; a DiD inconclusive builds them as exploratory, out of the headline. Every arm pair
+flagged not separable is listed under "untestable" with the H1a-H5 contrasts that compare it; both arms
+are still built, since which one to skip is an owner rule (PR #14).
 """
 
 import itertools
@@ -41,6 +47,16 @@ RANKINGS = ("turns", "output_tokens", "joules", "hero_total_tokens", "hero_api_p
 RANK_KEY = {"output_tokens": lambda c: c["output_tokens"],
             "hero_total_tokens": lambda c: c["input_uncached"] + c["input_cached"] + c["output_tokens"],
             "hero_api_price": lambda c: c["input_uncached"] + Fraction(c["input_cached"]) / 10 + 4 * c["output_tokens"]}
+
+P0A_VERDICTS = ("pass", "fail", "inconclusive")  # gates.json P0a.final_verdict, after the re-test if one ran
+DID_DECISIONS = ("pass", "fail", "inconclusive", "incomplete")  # did.json decision (qtrace/p0d.py did_test)
+# The secondary contrasts by hypothesis, as in configs/p2_analysis.yaml "families" (feat/p2-analysis); keep the two
+# in step. H4 reruns the headline on grammar-constrained rows, so no arm pair maps to it.
+HYPOTHESES = {"H1a": (("fewest_turns", "random"),), "H1b": (("fewest_joules", "random"),),
+              "H2": (("qtrace", "fewest_turns"),),
+              "H3": (("stable", "low_entropy"), ("stable", "clean_format"), ("short_stable", "short_unstable"),
+                     ("long_stable", "long_unstable")),
+              "H5": (("qtrace", "fewest_joules"),)}
 
 
 def need(rec, *keys):
@@ -137,6 +153,59 @@ def score_info(score_choice, override, arms):
                          "stability arms from select.arms")
     return {"file_present": score_choice is not None, "file_chosen": chosen, "file_decided": decided,
             "override": override, "used": override or chosen}
+
+
+def p0a_rule(gates, arms):
+    """docs/04 P0a kill rule, from gates.json P0a.final_verdict (the re-test's verdict when one ran).
+
+    fail drops the robustness half: the stability arms and with them the KL term. pass and a final
+    inconclusive (B continues, Q3_K_M is the stress profile) keep them. A null final_verdict means the
+    required re-test has not run, an error while a stability arm is asked for. Without a P0a entry (or
+    without gates.json) the rule is not checked, and the summary says so.
+    """
+    p0a = (gates or {}).get("P0a")
+    if p0a is None:
+        return {"verdict": None, "note": "not checked: no P0a verdict (gates.json absent or without P0a)"}
+    v = p0a.get("final_verdict", "absent")
+    if v is not None and v not in P0A_VERDICTS:
+        raise ValueError(f"gates.json P0a.final_verdict must be null or one of {P0A_VERDICTS}, got {v!r}; "
+                         "rerun scripts/p0_analyze.py")
+    if v is None and STABILITY_ARMS & set(arms):
+        raise ValueError("gates.json P0a.final_verdict is null: the inconclusive first look needs its re-test "
+                         "(P0a_topup) before P1, or drop the stability arms from select.arms")
+    note = {None: "not applied: P0a's re-test is pending, but no stability arm is asked for",
+            "pass": "passed: the stability arms are kept",
+            "inconclusive": "inconclusive after the re-test: B continues (Q3_K_M is the stress profile), so the "
+                            "stability arms are kept",
+            "fail": "failed: the kill rule drops the stability arms and the KL term"}[v]
+    return {"verdict": v, "note": note}
+
+
+def did_rule(did, score, arms):
+    """docs/04 P0d kill rule, from did.json's decision on the score that score_choice.json chose.
+
+    fail drops KL from selection, so the stability arms are not built; inconclusive builds them as
+    exploratory, out of the headline and the RL default; pass keeps them. incomplete (pairs without
+    continuations) is an error while a stability arm would be built. Without did.json the rule is not
+    checked, and the summary says so.
+    """
+    if did is None:
+        return {"decision": None, "note": "not checked: no did.json"}
+    decision = did.get("decision")
+    if decision not in DID_DECISIONS:
+        raise ValueError(f"did.json decision must be one of {DID_DECISIONS}, got {decision!r}")
+    if did.get("score") != score["file_chosen"]:
+        raise ValueError(f"did.json tests score {did.get('score')!r}, but score_choice.json chose "
+                         f"{score['file_chosen']!r}; rerun the DiD test on this score choice")
+    if decision == "incomplete" and score["used"] is not None and STABILITY_ARMS & set(arms):
+        raise ValueError("did.json decision is incomplete (pair tasks without continuations); finish P0d's "
+                         "continuations before P1, or drop the stability arms from select.arms")
+    note = {"incomplete": "not applied: the DiD test is incomplete, but no stability arm is built",
+            "pass": "passed: the stability arms are kept",
+            "inconclusive": "inconclusive: the stability arms are built as exploratory, out of the headline and "
+                            "the RL default",
+            "fail": "failed: the kill rule drops KL from selection, so the stability arms are not built"}[decision]
+    return {"decision": decision, "note": note}
 
 
 def energy_info(energy_model, est_joules, cost):
@@ -337,6 +406,22 @@ def overlap(picks, threshold=NOT_SEPARABLE):
     return pairs
 
 
+def untestable(by_seed):
+    """Every arm pair flagged not separable in some seed, with the HYPOTHESES contrasts that compare exactly it.
+
+    by_seed: seed -> overlap() pairs. Both arms stay built; which one to skip is an owner rule (PR #14).
+    """
+    hits = defaultdict(list)
+    for s, pairs in by_seed.items():
+        for p in pairs:
+            if p["not_separable"]:
+                hits[tuple(p["arms"])].append((s, p["share_same"]))
+    return [{"arms": list(pair), "seeds": [s for s, _ in h], "max_share_same": max(x for _, x in h),
+             "contrasts": [{"family": f, "arms": list(c)} for f, cs in HYPOTHESES.items() for c in cs
+                           if set(c) == set(pair)]}
+            for pair, h in hits.items()]
+
+
 def rank_pick(cands, name, seed, task_id):
     """One RANKINGS entry's pick among one task's candidates; ties go to random.Random(f"{seed}:{name}:{task_id}")."""
     if name in ("turns", "joules"):
@@ -427,8 +512,9 @@ def h3_note(score):
             "builds the stability arms anyway")
 
 
-def select(attempts, scores=None, score_choice=None, energy_model=None, est_joules=None, *, pool_lists=("pool200",),
-           min_candidates=4, alpha=0.5, cost="turns", score_override=None, seeds=(0, 1, 2), arms=ARMS):
+def select(attempts, scores=None, score_choice=None, energy_model=None, est_joules=None, *, gates=None, did=None,
+           pool_lists=("pool200",), min_candidates=4, alpha=0.5, cost="turns", score_override=None, seeds=(0, 1, 2),
+           arms=ARMS):
     """Build every configured arm for every seed. Returns (picks, summary).
 
     attempts are records with absolute episode paths (read_attempts). scores are the P0d rows (only probe
@@ -443,16 +529,24 @@ def select(attempts, scores=None, score_choice=None, energy_model=None, est_joul
     cost "joules" is an error in both energy cases. Otherwise docs/04 P0b's overlap rule can drop
     fewest_joules for every seed (overlap_rule); summary["arm_overlap_rule"] says why. select.cost must
     match that verdict (check_cost).
+
+    gates and did are the parsed gates.json (P0) and did.json (P0d), None when absent. Their kill rules
+    run first (p0a_rule, did_rule); after a P0a fail P0d's inputs are not needed and did is not read.
     """
     check_config(pool_lists, min_candidates, alpha, cost, score_override, seeds, arms)
-    score = score_info(score_choice, score_override, arms)
+    p0a = p0a_rule(gates, arms)
+    killed = p0a["verdict"] == "fail"
+    score = score_info(score_choice, score_override, [a for a in arms if not (killed and a in STABILITY_ARMS)])
+    p0d = ({"decision": None, "note": "not read: P0a failed, so the stability arms are already dropped"} if killed
+           else did_rule(did, score, arms))
+    killed = killed or p0d["decision"] == "fail"
     energy = energy_info(energy_model, est_joules, cost)
     q3 = by_attempt([r for r in scores or () if need(r, "probe") == PROBE], PROBE)
     joules = {aid: r.get("est_joules_q4") for aid, r in by_attempt(est_joules or (), "est_joules_q4").items()}
     by_task, pool = candidates(attempts, pool_lists, min_candidates, q3, joules, score["used"])
     if not by_task:
         raise ValueError(f"no task has at least {min_candidates} candidates; dropped tasks: {pool['dropped_tasks']}")
-    built = [a for a in ARMS if a in arms and (score["used"] is not None or a not in STABILITY_ARMS)]
+    built = [a for a in ARMS if a in arms and not (a in STABILITY_ARMS and (killed or score["used"] is None))]
     check_joins(by_task, built, cost, energy["fallback"])
     decision = overlap_rule(by_task, seeds, built, energy)
     check_cost(decision, energy, built, cost)
@@ -468,11 +562,16 @@ def select(attempts, scores=None, score_choice=None, energy_model=None, est_joul
                            "score_name": score["used"]} for t in sorted(by_task)] for s in seeds}
 
     sizes = [len(c) for c in by_task.values()]
+    by_seed = {str(s): overlap({a: picks[a][s] for a in built}) for s in seeds}
     summary = {
         "config": {"pool_lists": list(pool_lists), "min_candidates": min_candidates, "alpha": alpha, "cost": cost,
                    "seeds": list(seeds), "arms": list(arms), "probe": PROBE},
         "score": score,
         "h3": h3_note(score),
+        "kill_rules": {"p0a": p0a, "p0d_did": p0d,
+                       "dropped": [a for a in ARMS if a in arms and a in STABILITY_ARMS] if killed else [],
+                       "exploratory": [a for a in built if a in STABILITY_ARMS] if p0d["decision"] == "inconclusive"
+                       else []},
         "fewest_joules": energy,
         "pool": {"n_tasks": len(by_task), "n_candidates": sum(sizes), **pool,
                  "joins_missing": {f: sum(c[f] is None for cs in by_task.values() for c in cs)
@@ -480,7 +579,8 @@ def select(attempts, scores=None, score_choice=None, energy_model=None, est_joul
         "arms_built": built,
         "arms": {a: {str(s): arm_stats(rows) for s, rows in picks[a].items()} for a in built},
         "overlap": {"chance_rate": sum(1 / n for n in sizes) / len(sizes), "threshold": NOT_SEPARABLE,
-                    "by_seed": {str(s): overlap({a: picks[a][s] for a in built}) for s in seeds}},
+                    "by_seed": by_seed},
+        "untestable": untestable(by_seed),
         "arm_overlap_rule": {"rankings": list(RANKINGS), "threshold": NOT_SEPARABLE, "regret_threshold": REGRET_MERGE,
                              **decision},
     }
