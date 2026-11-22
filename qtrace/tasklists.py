@@ -101,3 +101,37 @@ def build_lists(rows, verified_ids, seed, inrepo_size=300, pool_size=200, heldou
                                     "Q4_K_M coefficients first rank pool200 runs for fewest_joules, and their "
                                     "held-out use gets its own estimator check (heldout691 minus heldout100)"),
     }
+
+
+def _whole_set(name, ids, size_note):
+    if len(ids) != len(set(ids)):
+        raise ValueError(f"duplicate task ids in {name}")
+    return {"name": name, "size": len(ids), "size_note": size_note, "ids": sorted(ids)}
+
+
+def external_lists(verified_ids, datacurve_langs, terminal_bench_ids):
+    """Build verified500, datacurve113 and terminal_bench89 (docs/03 Setup, External checks).
+
+    Each is a whole benchmark, so nothing is sampled and there is no seed. datacurve_langs maps a
+    Datacurve task id to the language in its task.toml; 03 reports Datacurve as Python vs
+    non-Python, so every task also carries that tag. Raises ValueError on duplicate ids.
+    """
+    verified = _whole_set("verified500", list(verified_ids), "every SWE-bench Verified task; 03 gives 500")
+    by_repo = {}
+    for task_id in verified["ids"]:
+        repo = task_id.split("__")[0]
+        by_repo[repo] = by_repo.get(repo, 0) + 1
+    verified["by_repo"] = dict(sorted(by_repo.items()))
+    datacurve = _whole_set("datacurve113", list(datacurve_langs),
+                           "every Datacurve DeepSWE task; 03 gives 113, reported as Python vs non-Python")
+    tasks = {t: {"language": datacurve_langs[t], "python": datacurve_langs[t].lower() == "python"}
+             for t in datacurve["ids"]}
+    by_language = {}
+    for task in tasks.values():
+        by_language[task["language"]] = by_language.get(task["language"], 0) + 1
+    n_python = sum(task["python"] for task in tasks.values())
+    datacurve.update(by_language=dict(sorted(by_language.items())), python=n_python,
+                     non_python=len(tasks) - n_python, tasks=tasks)
+    terminal = _whole_set("terminal_bench89", list(terminal_bench_ids),
+                          "every Terminal-Bench 2.1 task; 03 gives 89, run on its own harness")
+    return {"verified500": verified, "datacurve113": datacurve, "terminal_bench89": terminal}

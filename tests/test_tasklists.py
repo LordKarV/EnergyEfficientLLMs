@@ -6,7 +6,14 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from qtrace.tasklists import HELDOUT_REPOS, POOL_REPOS, allocate, build_lists, stratified_sample
+from qtrace.tasklists import (
+    HELDOUT_REPOS,
+    POOL_REPOS,
+    allocate,
+    build_lists,
+    external_lists,
+    stratified_sample,
+)
 
 LISTS = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "task_lists")
 
@@ -104,3 +111,42 @@ def test_frozen_pilot_and_subrun_lists():
         assert set(child["ids"]) <= set(par["ids"])
         assert child["seed"] == par["seed"] and child["sources"] == par["sources"]
     assert not set(load("energy_subrun15")["ids"]) & set(load("pilot20")["ids"])
+
+
+def test_external_lists_are_whole_sets_with_python_tag():
+    lists = external_lists(["b__b-2", "a__a-1"], {"t2": "Python", "t1": "go"}, ["x", "w"])
+    assert lists["verified500"]["ids"] == ["a__a-1", "b__b-2"]
+    assert lists["verified500"]["by_repo"] == {"a": 1, "b": 1}
+    dc = lists["datacurve113"]
+    assert dc["ids"] == ["t1", "t2"]
+    assert dc["tasks"] == {"t1": {"language": "go", "python": False}, "t2": {"language": "Python", "python": True}}
+    assert (dc["python"], dc["non_python"]) == (1, 1)
+    assert lists["terminal_bench89"]["ids"] == ["w", "x"]
+    assert [lists[k]["size"] for k in lists] == [2, 2, 2]
+
+
+def test_external_lists_reject_duplicate_ids():
+    for args in ((["a", "a"], {}, []), ([], {}, ["x", "x"])):
+        try:
+            external_lists(*args)
+        except ValueError as err:
+            assert "duplicate" in str(err)
+        else:
+            raise AssertionError("duplicate ids were accepted")
+
+
+def test_frozen_external_lists():
+    def load(name):
+        with open(os.path.join(LISTS, f"{name}.json")) as f:
+            return json.load(f)
+    for name, size in [("verified500", 500), ("datacurve113", 113), ("terminal_bench89", 89)]:
+        lst = load(name)
+        assert lst["size"] == len(lst["ids"]) == len(set(lst["ids"])) == size
+        assert lst["ids"] == sorted(lst["ids"]) and lst["sources"]
+    assert set(load("verified100")["ids"]) <= set(load("verified500")["ids"])
+    assert load("verified500")["sources"]["swe_bench_verified"] == load("verified100")["sources"]["swe_bench_verified"]
+    dc = load("datacurve113")
+    assert set(dc["tasks"]) == set(dc["ids"])
+    assert dc["python"] + dc["non_python"] == 113
+    assert dc["python"] == sum(t["python"] for t in dc["tasks"].values())
+
