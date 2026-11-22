@@ -20,6 +20,7 @@ from qtrace import energy_model
 from qtrace.energy_model import (
     TERMS,
     attempt_arrays,
+    check_range,
     estimate_attempt_joules,
     estimate_batched_joules,
     fit_attempts,
@@ -66,7 +67,7 @@ def make_attempt(rng, aid, task, coef, noise=0.01, attempt_noise=0.0, profile="Q
             "tokens": {"output": sum(t["output_tokens"] for t in turns),
                        "input_uncached": sum(t["input_uncached"] for t in turns), "input_cached": tot_cached,
                        "server_reported_cached": tot_cached},
-            "per_turn": turns, "tool_seconds": sum(t["tool_s"] for t in turns),
+            "per_turn": turns, "tool_seconds": sum(t["tool_s"] for t in turns), "container_cpu_seconds": 3.0 * len(turns),
             "energy": {"gpu_j": None, "attributable": True, "idle_w_ref": IDLE_W}}
 
 
@@ -446,6 +447,8 @@ def test_malformed_inputs_fail_loudly():
         (lambda r: r.pop("concurrency"), "concurrency"),
         (lambda r: r.pop("end_reason"), "end_reason"),
         (lambda r: r.update(per_turn=[]), "per_turn"),
+        (lambda r: r.pop("container_cpu_seconds"), "container_cpu_seconds"),
+        (lambda r: r.update(container_cpu_seconds=None), "container_cpu_seconds"),
     ]
     for edit, field in cases:
         with pytest.raises(ValueError, match=field):
@@ -502,6 +505,48 @@ def test_a_broken_target_or_profile_is_reported_and_the_rest_still_fit():
     assert small["n_attempts"] == 2 and all("at least 3" in small[t]["error"] for t in ("raw", "idle_subtracted"))
 
 
+def test_calibration_range_has_the_output_share_and_check_range_counts_turns_outside_it():
+    # docs/04 S2: each step, the rollouts' token mix is checked against the energy model's calibration range.
+    recs = subrun(PLANT, n_tasks=3, per_task=1)
+    rep = profile_report(fit_attempts(recs)[0]["Q4_K_M"], n_boot=0)
+    rng = rep["calibration_range"]
+    shares = [t["output_tokens"] / (t["output_tokens"] + t["input_uncached"]) for r in recs for t in r["per_turn"]]
+    assert rng["output_share"] == pytest.approx([min(shares), max(shares)])
+    n = sum(len(r["per_turn"]) for r in recs)
+    none = check_range(recs, rep)
+    assert none["n_turns"] == n and none["n_attempts"] == 3 and none["any_turn"] == 0
+    assert set(none["outside"]) == {"output", "uncached", "context", "output_share", "turns_per_attempt"}
+    assert all(v == {"below": 0.0, "above": 0.0} for v in none["outside"].values())
+
+    roll = copy.deepcopy(recs)
+    roll[0]["per_turn"][0]["input_cached"] = rng["context"][1] + 1  # past the longest calibrated context
+    roll[1]["per_turn"][0]["output_tokens"] = 0  # all prefill: below the output and output-share minimums
+    roll[2]["per_turn"] = [roll[2]["per_turn"][1]] * (rng["turns_per_attempt"][1] + 1)  # in-range turns, too many
+    n = sum(len(r["per_turn"]) for r in roll)
+    out = check_range(roll, rep)
+    assert out["outside"]["context"] == {"below": 0.0, "above": pytest.approx(1 / n)}
+    assert out["outside"]["output"]["below"] == out["outside"]["output_share"]["below"] == pytest.approx(1 / n)
+    assert out["outside"]["uncached"] == {"below": 0.0, "above": 0.0}
+    assert out["outside"]["turns_per_attempt"] == {"below": 0.0, "above": pytest.approx(1 / 3)}
+    assert out["any_turn"] == pytest.approx(2 / n)
+
+    old = {"calibration_range": {k: v for k, v in rng.items() if k != "output_share"}}  # a report from before
+    with pytest.raises(ValueError, match="output_share"):
+        check_range(recs, old)
+
+
+def test_turns_per_attempt_range_counts_unmeasured_turns():
+    # estimate_attempt_joules and check_range count every turn, so the calibration bound must too; an
+    # unmeasured turn mid-attempt keeps the per-turn token ranges (measured turns only) out of it.
+    recs = subrun(PLANT, n_tasks=4, per_task=1)
+    for r in recs:
+        r["per_turn"][1]["gen_energy_j"] = None
+    rep = profile_report(fit_attempts(recs)[0]["Q4_K_M"], n_boot=0)
+    n = [len(r["per_turn"]) for r in recs]
+    assert rep["calibration_range"]["turns_per_attempt"] == [min(n), max(n)]
+    assert all(v == {"below": 0.0, "above": 0.0} for v in check_range(recs, rep)["outside"].values())
+
+
 def test_cache_check_compares_per_request_counts_where_present():
     # docs/04 asks how often per-request cached-prompt counts differ; attempt totals can hide it.
     recs = subrun(PLANT, n_tasks=3)
@@ -551,7 +596,10 @@ def test_cli_writes_model_and_estimates(tmp_path):
     concurrent = copy.deepcopy(q4[1])
     concurrent.update(attempt_id="conc", concurrency=16)
     concurrent["energy"] = {"gpu_j": None, "attributable": False, "idle_w_ref": None}
-    q8 = subrun(PLANT, seed=3, n_tasks=1, profile="Q8_0")  # 2 attempts: too few to fit, reported, not fatal
+    # Q8_0 runs the same 15 tasks, but 28 attempts hit infrastructure errors: 2 left, too few to fit, reported.
+    q8 = subrun(PLANT, seed=3, profile="Q8_0")
+    for r in q8[2:]:
+        r["end_reason"] = "error"
     sub = tmp_path / "sub.jsonl"
     sub.write_text("".join(json.dumps(r) + "\n" for r in q4 + bf16 + q8 + [concurrent]))
 
@@ -582,7 +630,12 @@ def test_cli_writes_model_and_estimates(tmp_path):
     assert em["fewest_joules_fallback"] is False and set(em["profiles"]) == {"Q4_K_M", "BF16", "Q8_0"}
     assert "at least 3" in em["profiles"]["Q8_0"]["raw"]["error"]
     assert "Q8_0" in res.stdout and "at least 3" in res.stdout
-    assert em["excluded_subrun_attempts"] == {"concurrency_not_1": 1}
+    assert em["excluded_subrun_attempts"] == {"concurrency_not_1": 1, "error": 28}
+    assert em["energy_boundary"] == "GPU only" and "GPU only" in res.stdout
+    q4_cpu = sorted(3.0 * len(r["per_turn"]) for r in q4)
+    assert em["profiles"]["Q4_K_M"]["container_cpu_seconds"] == {
+        "n": 30, "median": pytest.approx(float(np.median(q4_cpu))), "min": q4_cpu[0], "max": q4_cpu[-1]}
+    assert em["idle_readings_w"] is None
     assert em["profiles"]["Q4_K_M"]["idle_subtracted"]["coef"]["output"] == pytest.approx(2.0, rel=0.05)
     assert em["profiles"]["BF16"]["idle_subtracted"]["coef"]["output"] == pytest.approx(3.0, rel=0.05)
     cache = em["profiles"]["Q4_K_M"]["server_cache_mismatch"]
@@ -621,3 +674,60 @@ def test_cli_writes_model_and_estimates(tmp_path):
     res = subprocess.run([sys.executable, script, "--subrun", str(bf16_only), "--pool", str(pool_path), "--out",
                           str(tmp_path / "x")], capture_output=True, text=True, check=False)
     assert res.returncode != 0 and "Q4_K_M" in res.stderr
+
+    idle = {"Q4_K_M": idle_profile()}
+    idle_path = tmp_path / "idle.json"
+    idle_path.write_text(json.dumps(idle))
+    res = subprocess.run([sys.executable, script, *args, "--idle", str(idle_path)], capture_output=True, text=True,
+                         check=False)
+    assert res.returncode == 0, res.stderr
+    assert json.loads((out / "energy_model.json").read_text())["idle_readings_w"] == idle
+    idle_path.write_text(json.dumps({"Q4_K_M": {"none_before_w": 30.0}}))
+    res = subprocess.run([sys.executable, script, *args, "--idle", str(idle_path)], capture_output=True, text=True,
+                         check=False)
+    assert res.returncode != 0 and "loaded_before_w" in res.stderr
+
+
+def test_every_profile_must_run_the_same_sub_run_tasks():
+    # docs/04 P0a: the energy sub-run uses the same seeded task IDs for every profile.
+    q4, bf16 = subrun(PLANT, profile="Q4_K_M", n_tasks=3), subrun(PLANT, profile="BF16", n_tasks=3)
+    assert set(fit_attempts(q4 + bf16)[0]) == {"Q4_K_M", "BF16"}
+    q4[-1]["end_reason"] = q4[-2]["end_reason"] = "error"  # an attempt that errored still ran its task
+    fit_attempts(q4 + bf16)
+    with pytest.raises(ValueError, match=r"same task_ids.*BF16 lacks \['t2'\]"):
+        fit_attempts(q4 + bf16[:4])
+    other = copy.deepcopy(bf16[0])
+    other.update(attempt_id="conc", task_id="t9", concurrency=16)  # not a sub-run attempt
+    fit_attempts(q4 + bf16 + [other])
+
+
+def idle_profile(t0=1.7e9):
+    """One profile of outputs/energy/idle_<run_id>.json, the shape the owner's agent set on PR #13."""
+    keys = ("none_before_w", "loaded_before_w", "loaded_after_w", "none_after_w")
+    return {"none_before_w": 30.0, "loaded_before_w": 41.5, "loaded_after_w": 42.0, "none_after_w": 30.5,
+            "window_s": 10.0, "settle_s": 45.0, "t": {k: t0 + 60.0 * i for i, k in enumerate(keys)}}
+
+
+def test_idle_readings_take_the_harness_idle_file_shape():
+    # Owner's agent on PR #13: four readings in W with the _w suffix, window_s, settle_s and an epoch t per reading.
+    ok = {"BF16": idle_profile(), "Q4_K_M": idle_profile(1.8e9)}
+    assert energy_model.idle_readings(ok) == ok
+    with pytest.raises(TypeError, match="object"):
+        energy_model.idle_readings([])
+    base = idle_profile()
+    no_t = {k: v for k, v in base.items() if k != "t"}
+    old = {"none_before": 30.0, "loaded_before": 41.5, "none_after": 30.5, "loaded_after": 42.0}
+    for bad, msg in [({"Q4KM": base}, "unknown profile"),
+                     ({"BF16": old}, "none_before_w"),
+                     ({"BF16": {**base, "extra": 1.0}}, "extra"),
+                     ({"BF16": no_t}, "'t'"),
+                     ({"BF16": {**base, "none_after_w": -1.0}}, "none_after_w"),
+                     ({"BF16": {**base, "loaded_after_w": None}}, "loaded_after_w"),
+                     ({"BF16": {**base, "window_s": 0.0}}, "window_s"),
+                     ({"BF16": {**base, "settle_s": float("nan")}}, "settle_s"),
+                     ({"BF16": {**base, "t": {**base["t"], "extra": 1.0}}}, "t needs exactly"),
+                     ({"BF16": {**base, "t": {**base["t"], "none_before_w": "now"}}}, "t.none_before_w"),
+                     ({"BF16": {**base, "t": {**base["t"], "loaded_after_w": base["t"]["loaded_before_w"] - 1}}},
+                      "in that order")]:
+        with pytest.raises(ValueError, match=msg):
+            energy_model.idle_readings(bad)

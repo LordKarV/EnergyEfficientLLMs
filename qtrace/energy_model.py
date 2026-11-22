@@ -50,6 +50,14 @@ HELDOUT_LISTS = ("heldout100", "verified100", "inrepo_test")
 POOL_LISTS = ("pool200",)  # the default of p0a_energy_model.py --lists, as in p0d_score_pool.py
 HELDOUT_REPOS = ("scrapy", "pyramid", "datalad", "coveragepy")
 CONTEXT_BINS = (16384, 32768, 49152)  # residual summary bins over the 64K context
+# 04 "Energy boundary on EC2": NVML reads GPU joules only, so every energy table says so and reports container
+# CPU-seconds next to it.
+ENERGY_BOUNDARY = "GPU only"
+PROFILES = ("BF16", "Q8_0", "Q4_K_M", "Q3_K_M", "Q4_K_M_gate8")  # the agreed record format (issue #1)
+# 04 P0a: idle W per profile with no process and with llama-server loaded, before and after the sub-run, in the
+# order they are taken. The harness writes them to outputs/energy/idle_<run_id>.json (owner's agent, PR #13).
+IDLE_READINGS = ("none_before_w", "loaded_before_w", "loaded_after_w", "none_after_w")
+IDLE_FIELDS = (*IDLE_READINGS, "window_s", "settle_s", "t")
 
 
 def _get(d, key, where):
@@ -82,7 +90,8 @@ def attempt_arrays(rec):
 
     Returns {attempt_id, task_id, profile, X [n, 6], raw [n], idle_subtracted [n] or None, idle_error,
     n_unmeasured, server_cached_differs (attempt totals; None when the server count is null),
-    turn_cached_differs (one bool per turn with a non-null per-turn server_reported_cached)}. The raw target needs
+    turn_cached_differs (one bool per turn with a non-null per-turn server_reported_cached), n_turns,
+    container_cpu_seconds (required, finite, >= 0)}. The raw target needs
     only gen_energy_j; a missing or invalid energy.idle_w_ref or gen_s sets idle_subtracted to None and
     idle_error to the reason, so only the idle-subtracted fit fails. Idle-subtracted turn joules may be
     negative on tiny turns; only attempt sums must be positive (checked in fit_profile).
@@ -115,16 +124,19 @@ def attempt_arrays(rec):
             "turn_cached_differs": [_num(t["server_reported_cached"], f"{where} turn {i}: server_reported_cached")
                                     != t["input_cached"] for i, t in enumerate(turns)
                                     if t.get("server_reported_cached") is not None],
-            "n_turns": len(turns)}
+            "n_turns": len(turns),
+            "container_cpu_seconds": _num(_get(rec, "container_cpu_seconds", where), f"{where}: container_cpu_seconds")}
 
 
 def fit_attempts(records):
     """Sub-run attempts usable for the fit, as {profile: [attempt_arrays]}, plus exclusion counts.
 
     Kept: concurrency 1, energy.attributable true, end_reason not "error" (an infrastructure fault,
-    rerun as a fresh attempt), and at least one measured turn. Duplicate attempt ids fail.
+    rerun as a fresh attempt), and at least one measured turn. Duplicate attempt ids fail, and so do
+    profiles whose concurrency-1 attempts (every end_reason) ran different task_ids: 04 runs the
+    same seeded IDs for every profile.
     """
-    seen, by_profile, excluded = set(), defaultdict(list), Counter()
+    seen, by_profile, excluded, ran = set(), defaultdict(list), Counter(), defaultdict(set)
     for r in records:
         aid = _get(r, "attempt_id", "sub-run record")
         where = f"attempt {aid!r}"
@@ -133,7 +145,9 @@ def fit_attempts(records):
         seen.add(aid)
         if _get(r, "concurrency", where) != 1:
             excluded["concurrency_not_1"] += 1
-        elif _get(_get(r, "energy", where), "attributable", where) is not True:
+            continue
+        ran[_get(r, "profile", where)].add(_get(r, "task_id", where))
+        if _get(_get(r, "energy", where), "attributable", where) is not True:
             excluded["not_attributable"] += 1
         elif _get(r, "end_reason", where) == "error":
             excluded["error"] += 1
@@ -143,7 +157,42 @@ def fit_attempts(records):
                 by_profile[a["profile"]].append(a)
             else:
                 excluded["no_measured_turns"] += 1
+    every = set().union(*ran.values())
+    lacking = [f"{p} lacks {sorted(every - t)}" for p, t in sorted(ran.items()) if every - t]
+    if lacking:
+        raise ValueError("the energy sub-run must use the same task_ids for every profile (04 P0a): "
+                         + "; ".join(lacking))
     return dict(by_profile), dict(excluded)
+
+
+def idle_readings(d):
+    """Validated --idle readings, the harness's outputs/energy/idle_<run_id>.json.
+
+    {profile: {none_before_w, loaded_before_w, loaded_after_w, none_after_w (W), window_s (the averaging
+    window), settle_s (45 in 04), t: {reading: epoch seconds}}}, every key present and nothing else. The t
+    values must be non-decreasing in IDLE_READINGS order, the order the readings are taken.
+    """
+    if not isinstance(d, dict):
+        raise TypeError(f"idle readings must be an object of profiles, got {type(d).__name__}")
+    for p, r in d.items():
+        if p not in PROFILES:
+            raise ValueError(f"idle readings: unknown profile {p!r}; expected one of {PROFILES}")
+        if not isinstance(r, dict) or set(r) != set(IDLE_FIELDS):
+            got = sorted(r) if isinstance(r, dict) else r
+            raise ValueError(f"idle readings for {p}: need exactly {IDLE_FIELDS}, got {got!r}")
+        for k in IDLE_READINGS:
+            _num(r[k], f"idle readings for {p}: {k}")
+        for k in ("window_s", "settle_s"):
+            if _num(r[k], f"idle readings for {p}: {k}") == 0:
+                raise ValueError(f"idle readings for {p}: {k} must be positive")
+        t = r["t"]
+        if not isinstance(t, dict) or set(t) != set(IDLE_READINGS):
+            got = sorted(t) if isinstance(t, dict) else t
+            raise ValueError(f"idle readings for {p}: t needs exactly {IDLE_READINGS}, got {got!r}")
+        ts = [_num(t[k], f"idle readings for {p}: t.{k}") for k in IDLE_READINGS]
+        if ts != sorted(ts):
+            raise ValueError(f"idle readings for {p}: t must run {IDLE_READINGS} in that order, got {ts}")
+    return d
 
 
 def _scale(X):
@@ -311,6 +360,18 @@ def _fit_or_error(attempts, target, n_boot, seed):
         return {"error": str(err)}
 
 
+def _range_values(X):
+    """Per-turn values of the calibration-range keys for feature rows X.
+
+    output_share is output / (output + uncached), the decoded share of the tokens a turn processes; the
+    cached context has its own range. A turn with neither counts as share 0. The denominator is our
+    choice (docs/04 S2 says "output share" only), flagged for the owner.
+    """
+    o, u = X[:, TERMS.index("output")], X[:, TERMS.index("uncached")]
+    return {"output": o, "uncached": u, "context": X[:, TERMS.index("context")],
+            "output_share": o / np.maximum(o + u, 1.0)}
+
+
 def profile_report(attempts, n_boot=2000, seed=0):
     """One profile's entry in energy_model.json: both targets, the calibration range and the cache-count check.
 
@@ -320,11 +381,12 @@ def profile_report(attempts, n_boot=2000, seed=0):
     X = np.vstack([a["X"] for a in attempts])
     flags = [a["server_cached_differs"] for a in attempts]
     known = [f for f in flags if f is not None]
-    rng_of = {t: [float(X[:, TERMS.index(t)].min()), float(X[:, TERMS.index(t)].max())]
-              for t in ("output", "uncached", "context")}
-    n_turns = [len(a["raw"]) for a in attempts]
+    rng_of = {t: [float(v.min()), float(v.max())] for t, v in _range_values(X).items()}
+    # Every turn, measured or not: check_range and estimate_attempt_joules count them all.
+    n_turns = [a["n_turns"] for a in attempts]
     per_turn = [f for a in attempts for f in a["turn_cached_differs"]]
     idle_refs = [a["idle_w_ref"] for a in attempts if a["idle_w_ref"] is not None]
+    cpu = [a["container_cpu_seconds"] for a in attempts]
     return {"n_attempts": len(attempts), "n_turns": len(X),
             "n_turns_unmeasured": sum(a["n_unmeasured"] for a in attempts),
             "calibration_range": {**rng_of, "turns_per_attempt": [min(n_turns), max(n_turns)]},
@@ -332,6 +394,8 @@ def profile_report(attempts, n_boot=2000, seed=0):
             "idle_w": float(np.median(idle_refs)) if idle_refs else None,
             "idle_w_ref": {"n": len(idle_refs), "min": min(idle_refs, default=None),
                            "max": max(idle_refs, default=None)},
+            # Next to the GPU-only joules (ENERGY_BOUNDARY), per fitted sub-run attempt.
+            "container_cpu_seconds": {"n": len(cpu), "median": float(np.median(cpu)), "min": min(cpu), "max": max(cpu)},
             # 04: how often llama.cpp's per-request cached-prompt counts differ from the ideal split. The
             # attempt-total comparison stays for records without per-turn server counts.
             "server_cache_mismatch": {"n_attempts": len(flags), "n_differ": sum(known),
@@ -343,6 +407,28 @@ def profile_report(attempts, n_boot=2000, seed=0):
                                                       "n_missing": sum(a["n_turns"] for a in attempts)
                                                       - len(per_turn)}},
             **{t: _fit_or_error(attempts, t, n_boot, seed) for t in TARGETS}}
+
+
+def check_range(records, report):
+    """Share of `records`' turns outside each bound of a profile_report's calibration_range (docs/04 S2).
+
+    records: attempt records with per_turn (S2 rollouts); every turn counts, measured or not. Returns
+    {n_turns, n_attempts, outside: {key: {below, above}}, any_turn}: per-turn keys give shares of turns,
+    turns_per_attempt a share of attempts, and any_turn the share of turns outside at least one per-turn
+    bound. What share calls for a re-measurement on llama.cpp Q4_K_M and a refit is the owner's.
+    """
+    if not records:
+        raise ValueError("check_range needs at least one record")
+    rng = _get(report, "calibration_range", "report")
+    X = np.array([turn_features(t, f"attempt {r.get('attempt_id')!r} turn {i}")
+                  for r in records for i, t in enumerate(_turns(r))])
+    per_turn = _range_values(X)
+    values = {**per_turn, "turns_per_attempt": np.array([len(_turns(r)) for r in records])}
+    bounds = {k: _get(rng, k, "calibration_range") for k in values}
+    beyond = {k: (v < bounds[k][0], v > bounds[k][1]) for k, v in values.items()}
+    return {"n_turns": len(X), "n_attempts": len(records),
+            "outside": {k: {"below": float(lo.mean()), "above": float(hi.mean())} for k, (lo, hi) in beyond.items()},
+            "any_turn": float(np.any([lo | hi for k, (lo, hi) in beyond.items() if k in per_turn], axis=0).mean())}
 
 
 def estimate_attempt_joules(rec, model, idle_w=None):
