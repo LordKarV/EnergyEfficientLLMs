@@ -23,7 +23,7 @@ train:
 # random_fq baseline (docs/04; qtrace/fake_quant.py): on only for that run, with --arm random (writes random_fq_seed<s>)
 fake_quant:
   enabled: false
-  table: null                    # the stock Q4_K_M GGUF of the base model, or JSON {gguf_tensor_name: ggml_type_name}
+  table: null                    # the stock Q4_K_M GGUF of the base model, or the pinned data/quant_tables JSON
 
 paths:
   arms_dir: outputs/arms

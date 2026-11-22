@@ -33,6 +33,7 @@ FOUR_BIT_TYPES = frozenset({"Q4_0", "Q4_1", "Q4_K", "IQ4_NL", "IQ4_XS", "MXFP4",
 FUSED = {"attn_qkv": "attn_qkv_gate", "attn_gate": "attn_qkv_gate",
          "ssm_beta": "ssm_beta_alpha", "ssm_alpha": "ssm_beta_alpha"}
 BLOCK = re.compile(r"^blk\.(\d+)\.")
+PROFILE = "Q4_K_M"  # the stock profile whose skip list random_fq uses (docs/04), not Q4_K_M_gate8
 
 
 def fake_quant(w):
@@ -54,7 +55,12 @@ def fake_quant(w):
 
 
 def load_table(path):
-    """{gguf_tensor_name: ggml_type_name} from a GGUF file (its tensor types) or a JSON object of that shape."""
+    """({gguf_tensor_name: ggml_type_name}, {gguf_tensor_name: ggml shape}) from the stock Q4_K_M GGUF or the pinned JSON.
+
+    The JSON is the data/quant_tables format (top-level llama_cpp_commit, model, note, argv, profiles), read
+    at profiles["Q4_K_M"], each entry {type, shape, bytes}. Shapes are in ggml order, torch dims reversed.
+    A flat {name: type} JSON is refused: without shapes, a table from another model could not be caught.
+    """
     import gguf
 
     if path.endswith(".gguf"):
@@ -65,15 +71,36 @@ def load_table(path):
         if ftype != gguf.LlamaFileType.MOSTLY_Q4_K_M:
             raise ValueError(f"{path}: general.file_type is {ftype}, not {int(gguf.LlamaFileType.MOSTLY_Q4_K_M)} "
                              "(MOSTLY_Q4_K_M); the skip list must come from the stock Q4_K_M file")
-        return {t.name: t.tensor_type.name for t in reader.tensors}
+        return ({t.name: t.tensor_type.name for t in reader.tensors},
+                {t.name: [int(d) for d in t.shape] for t in reader.tensors})
     with open(path) as f:
-        table = json.load(f)
-    if not isinstance(table, dict) or not table:
-        raise ValueError(f"{path}: expected a non-empty JSON object {{gguf_tensor_name: ggml_type_name}}")
-    bad = {k: v for k, v in table.items() if v not in gguf.GGMLQuantizationType.__members__}
+        doc = json.load(f)
+    profile = doc.get("profiles", {}).get(PROFILE) if isinstance(doc, dict) else None
+    if not isinstance(profile, dict) or not profile:
+        raise ValueError(f"{path}: expected the pinned table format with a non-empty profiles.{PROFILE} "
+                         "{gguf_tensor_name: {type, shape, bytes}} (data/quant_tables)")
+
+    def shaped(v):
+        dims = v.get("shape") if isinstance(v, dict) else None
+        return isinstance(dims, list) and dims and all(type(d) is int and d > 0 for d in dims)
+
+    unshaped = sorted(k for k, v in profile.items() if not shaped(v))
+    if unshaped:
+        raise ValueError(f"{path}: entries without a ggml shape (positive ints): {unshaped[:5]}")
+    bad = {k: v.get("type") for k, v in profile.items() if v.get("type") not in gguf.GGMLQuantizationType.__members__}
     if bad:
         raise ValueError(f"{path}: unknown ggml types {dict(list(bad.items())[:5])}")
-    return table
+    return {k: v["type"] for k, v in profile.items()}, {k: v["shape"] for k, v in profile.items()}
+
+
+def ggml_shapes(found):
+    """{table name: ggml shape} the modules in `found` (tensor_types) imply: torch dims reversed, and a fused
+    tensor's rows the sum of its parts' rows (the converter concatenates rows). A tied head counts once."""
+    weights = {}
+    for mod, hit in found.values():
+        weights.setdefault(hit, {})[id(mod.weight)] = tuple(mod.weight.shape)
+    return {hit: [*reversed(next(iter(ws.values()))[1:]), sum(s[0] for s in ws.values())]
+            for hit, ws in weights.items()}
 
 
 def _resolve(table, gguf_name):
@@ -91,13 +118,14 @@ def _hf_name(name):
     return name.replace(".base_layer", "").replace(".dt_bias", ".dt_proj.bias")
 
 
-def tensor_types(base, table):
+def tensor_types(base, table, shapes=None):
     """Table entry for each Linear / Embedding of the HF model `base` (a LoRA layer stands for its base layer).
 
     Returns {module_name: (module, gguf_name)} and the ignored MTP table names. Raises ValueError when a
-    Linear or Embedding has no table entry, when a table tensor (outside the MTP block) maps to no
-    parameter (output.weight for a tied head among them), or when a 4-bit table tensor is not a Linear /
-    Embedding weight.
+    Linear or Embedding has no table entry, when its table shape (`shapes`, ggml order, as load_table
+    returns it; None skips the check) differs from its weight's, when a table tensor (outside the MTP
+    block) maps to no parameter (output.weight for a tied head among them), or when a 4-bit table tensor
+    is not a Linear / Embedding weight.
     """
     import gguf
     from peft.tuners.lora import LoraLayer
@@ -123,6 +151,11 @@ def tensor_types(base, table):
             found[name] = (mod, hit)
     if missing:
         raise ValueError(f"no table entry for Linear/Embedding modules {missing[:8]} ({len(missing)} in all)")
+    if shapes is not None:
+        wrong = {h: (list(shapes[h]), s) for h, s in ggml_shapes(found).items() if list(shapes[h]) != s}
+        if wrong:
+            raise ValueError(f"table shapes (ggml order) differ from the model's weights, so the table is for "
+                             f"another model: {dict(list(wrong.items())[:5])} as (table, model), {len(wrong)} in all")
 
     claimed = {hit for _, hit in found.values()}
     for name, _ in base.named_parameters():
@@ -182,8 +215,10 @@ def _frozen_forward(mod, wq):
     return lambda x: F.linear(x, wq, mod.bias)
 
 
-def apply(model, table):
+def apply(model, table, shapes=None):
     """Make the forward of `model` (peft LoRA model or plain HF model) fake-quantize the table's 4-bit tensors.
+
+    `table` and `shapes` are what load_table returns; shapes are checked against the weights (tensor_types).
 
     Frozen 4-bit layers use fq(W) computed once (W never changes; with the default targets that is
     only in_proj_a/in_proj_b, a few MB, and a tied 4-bit head shares the embedding's copy). Returns a
@@ -194,7 +229,7 @@ def apply(model, table):
     from peft.tuners.lora import LoraLayer
 
     base = model.get_base_model() if hasattr(model, "get_base_model") else model
-    found, ignored = tensor_types(base, table)
+    found, ignored = tensor_types(base, table, shapes)
     cache, quantized, skipped = {}, [], []
     for name, (mod, hit) in found.items():
         if table[hit] not in FOUR_BIT_TYPES:

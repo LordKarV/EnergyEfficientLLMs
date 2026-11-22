@@ -87,11 +87,11 @@ def main(argv=None):
     cfg = load_config(args.config)
     tr, model_path = cfg["train"], cfg["model"]["path"]
     fq_cfg = cfg.get("fake_quant") or {}
-    table = None
+    table = shapes = None
     if fq_cfg.get("enabled"):  # random_fq baseline (docs/04): read the table before the model, to fail fast
         if not fq_cfg.get("table"):
-            raise ValueError("fake_quant.enabled needs fake_quant.table (the Q4_K_M GGUF or a JSON type table)")
-        table = fake_quant.load_table(fq_cfg["table"])
+            raise ValueError("fake_quant.enabled needs fake_quant.table (the Q4_K_M GGUF or the pinned JSON table)")
+        table, shapes = fake_quant.load_table(fq_cfg["table"])
     kernels = check_kernels(args.allow_slow_kernels)
 
     from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -121,7 +121,7 @@ def main(argv=None):
         raise ValueError(f"token id {top} is outside the model's vocabulary ({model.config.vocab_size})")
     model = sft.attach(model, tr, args.seed)
     model.print_trainable_parameters()
-    fq_summary = None if table is None else {"table": fq_cfg["table"], **fake_quant.apply(model, table)}
+    fq_summary = None if table is None else {"table": fq_cfg["table"], **fake_quant.apply(model, table, shapes)}
 
     loaded_w = idle_reading()  # weights, adapter and CUDA context resident, before step 1: the train_loop baseline
     os.makedirs(run_dir, exist_ok=True)

@@ -40,6 +40,18 @@ def tiny_table(quant="Q4_K", keep="F32", overrides=None):
     return {**t, **(overrides or {})}
 
 
+def pinned_table(model, types):
+    """types in the pinned data/quant_tables format, as its Q4_K_M profile, with the shapes model implies.
+
+    Only Linear/Embedding shapes are checked, so the other entries carry a placeholder.
+    """
+    base = model.get_base_model() if hasattr(model, "get_base_model") else model
+    found, _ = fq.tensor_types(base, types)
+    shapes = fq.ggml_shapes(found)
+    profile = {k: {"type": v, "shape": shapes.get(k, [1]), "bytes": 0} for k, v in types.items()}
+    return {"llama_cpp_commit": "0" * 40, "model": "tiny", "note": "", "argv": {}, "profiles": {"Q4_K_M": profile}}
+
+
 def layer(model, path):
     return model.get_base_model().get_submodule(path)
 
@@ -221,21 +233,51 @@ def write_gguf(path, table, file_type=gguf.LlamaFileType.MOSTLY_Q4_K_M):
     w.close()
 
 
-def test_table_parses_from_a_gguf_file_and_from_json(tmp_path):
+def test_table_parses_from_a_gguf_file_and_from_the_pinned_json(tmp_path):
     table = {k: {"Q4_K": "Q4_0", "Q6_K": "Q8_0"}.get(v, v) for k, v in tiny_table().items()}
     write_gguf(tmp_path / "t.gguf", table)
-    assert fq.load_table(str(tmp_path / "t.gguf")) == table
-    (tmp_path / "t.json").write_text(json.dumps(tiny_table()))
-    assert fq.load_table(str(tmp_path / "t.json")) == tiny_table()
+    types, shapes = fq.load_table(str(tmp_path / "t.gguf"))
+    assert types == table
+    assert shapes["blk.0.ffn_up.weight"] == [64, 2] and shapes["output_norm.weight"] == [4]  # ggml order
+    pinned = pinned_table(perturbed_lora_model(), tiny_table())
+    (tmp_path / "t.json").write_text(json.dumps(pinned))
+    types, shapes = fq.load_table(str(tmp_path / "t.json"))
+    assert types == tiny_table()
+    assert shapes == {k: v["shape"] for k, v in pinned["profiles"]["Q4_K_M"].items()}
     a, b = perturbed_lora_model(), perturbed_lora_model()
-    assert fq.apply(a, fq.load_table(str(tmp_path / "t.gguf"))) == fq.apply(b, tiny_table())  # Q4_0 is 4-bit too
-    (tmp_path / "bad.json").write_text(json.dumps({"blk.0.ffn_up.weight": "Q4_KM"}))
+    assert fq.apply(a, fq.load_table(str(tmp_path / "t.gguf"))[0]) == fq.apply(b, tiny_table())  # Q4_0 is 4-bit
+    bad = copy.deepcopy(pinned)
+    bad["profiles"]["Q4_K_M"]["blk.0.ffn_up.weight"]["type"] = "Q4_KM"
+    (tmp_path / "bad.json").write_text(json.dumps(bad))
     with pytest.raises(ValueError, match="unknown ggml types"):
         fq.load_table(str(tmp_path / "bad.json"))
+    bad["profiles"]["Q4_K_M"]["blk.0.ffn_up.weight"] = {"type": "Q4_K"}
+    (tmp_path / "bad.json").write_text(json.dumps(bad))
+    with pytest.raises(ValueError, match="without a ggml shape.*blk.0.ffn_up.weight"):
+        fq.load_table(str(tmp_path / "bad.json"))
+    for name, doc in (("flat", tiny_table()), ("q3", {**pinned, "profiles": {"Q3_K_M": {}}})):
+        (tmp_path / f"{name}.json").write_text(json.dumps(doc))  # a flat table has no shapes to check
+        with pytest.raises(ValueError, match="profiles.Q4_K_M"):
+            fq.load_table(str(tmp_path / f"{name}.json"))
     for name, ftype in (("q3_k_m", gguf.LlamaFileType.MOSTLY_Q3_K_M), ("none", None)):
         write_gguf(tmp_path / f"{name}.gguf", table, ftype)
         with pytest.raises(ValueError, match="file_type is .*MOSTLY_Q4_K_M"):
             fq.load_table(str(tmp_path / f"{name}.gguf"))
+
+
+def test_table_shapes_must_match_the_model():
+    model = perturbed_lora_model()
+    pinned = pinned_table(model, tiny_table())["profiles"]["Q4_K_M"]
+    shapes = {k: v["shape"] for k, v in pinned.items()}
+    # torch dims reversed; fused rows summed (qkv 2*2*16 + 2*16 = 96 plus z 32; b 2 plus a 2); tied head counted once
+    assert shapes["blk.0.attn_qkv_gate.weight"] == [64, 128] and shapes["blk.0.ssm_beta_alpha.weight"] == [64, 4]
+    assert shapes["token_embd.weight"] == [64, 300] and shapes["blk.3.ffn_down.weight"] == [128, 64]
+    assert fq.apply(model, tiny_table(), shapes)["quantized"]
+    for name, wrong in (("blk.0.attn_qkv_gate.weight", [64, 96]),  # the table of a converter that kept parts apart
+                        ("blk.3.ffn_down.weight", [64, 128]),  # torch order instead of ggml order
+                        ("token_embd.weight", [64, 301])):  # another vocabulary
+        with pytest.raises(ValueError, match=f"shapes .*another model.*{name}"):
+            fq.apply(perturbed_lora_model(), tiny_table(), {**shapes, name: wrong})
 
 
 def test_unfused_names_and_the_mtp_block_are_handled():
@@ -276,7 +318,7 @@ def test_script_trains_random_fq_and_saves_plain_merged_weights(tmp_path, monkey
 
     cfg_path, ckpt = write_setup(tmp_path)
     write_arm(tmp_path, "random", 0, [[6, 9], [12], [5, 5, 5], [20]])
-    (tmp_path / "table.json").write_text(json.dumps(tiny_table()))
+    (tmp_path / "table.json").write_text(json.dumps(pinned_table(tiny_qwen35(), tiny_table())))
     cfg = yaml.safe_load(cfg_path.read_text())
     cfg["fake_quant"] = {"enabled": True, "table": str(tmp_path / "table.json")}
     cfg_path.write_text(yaml.safe_dump(cfg))
@@ -333,8 +375,8 @@ def test_real_q4_k_m_table_covers_qwen35_4b():
     config = AutoConfig.from_pretrained(os.environ["QTRACE_MODEL_DIR"]).text_config
     with torch.device("meta"):
         model = Qwen3_5ForCausalLM(config)
-    found, ignored = fq.tensor_types(model, fq.load_table(os.environ["QTRACE_Q4KM_GGUF"]))
+    found, ignored = fq.tensor_types(model, *fq.load_table(os.environ["QTRACE_Q4KM_GGUF"]))  # GGUF or pinned JSON
     n = config.num_hidden_layers
-    assert ignored and all(t.startswith(f"blk.{n}.") for t in ignored)
+    assert all(t.startswith(f"blk.{n}.") for t in ignored)  # empty for the pinned table (--no-mtp)
     assert found["lm_head"][1] == "token_embd.weight"
     assert found["model.layers.0.linear_attn.in_proj_z"][1] == "blk.0.attn_qkv_gate.weight"
