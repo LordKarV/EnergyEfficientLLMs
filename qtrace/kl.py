@@ -124,11 +124,11 @@ def summarize(stats, decision, command=None, halves=None):
 
     kl_command is the mean over the command-value tokens, the second candidate in docs/04's ordered
     score rule; it is None without command spans. kl_sum_command (kl_command x n_command, 0.0 without
-    command spans) is the Stage 2 KL(y) if P0d chose kl_command. Whole tool-call blocks would be diluted by about a
-    dozen near-deterministic wrapper tokens per call, so many short commands would score low. halves
-    maps a name to a mask of scored tokens (turn parity in P0b) and gets the three candidate scores
-    per half for split-half reliability. The decision mask is computed over the whole run first, so
-    each half scores the same positions the full-run score uses.
+    command spans) is the Stage 2 KL(y) if P0d chose kl_command. Whole tool-call blocks would be diluted
+    by about a dozen near-deterministic wrapper tokens per call, so many short commands would score low.
+    halves maps a name to a mask of scored tokens (turn parity in P0b) and gets the three candidate
+    scores per half for split-half reliability. The decision mask is computed over the whole run first,
+    so each half scores the same positions the full-run score uses.
 
     entropy_decision is the mean BF16 entropy over the decision positions, the P0d DiD covariate
     (docs/04: "differences in BF16 entropy at decision positions"); entropy_mean is the whole-run mean.
