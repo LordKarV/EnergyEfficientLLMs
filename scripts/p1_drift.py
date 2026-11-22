@@ -10,8 +10,15 @@ over episodes (token-weighted). Secondary: the same KL between the two GGUF file
 reported only when its mean is above GGUF_REPORT_KL, because HF and llama.cpp already disagree by about 0.04
 nats per position on the base alone. It is not computed here: pass --gguf-kl, a JSON list with one row per
 held-out episode ({"attempt_id", "n_scored", "kl_mean"}, optionally "runtime"), for example
-qtrace.kl_gguf.score_trajectories_gguf(kl_score, base_gguf, arm_gguf, episodes, cpu=True) with each row's
-attempt_id added. The BF16 resolve-rate change vs base is P2's (pick_headline), not this script's.
+qtrace.kl_gguf.score_trajectories_gguf(kl_score, base_gguf, arm_gguf, eps, cpu=True) with each row's
+attempt_id added, where eps = [{"input_ids": e["input_ids"], "model_mask": e["model_mask"]} for e in
+heldout_episodes(attempts)]. Do not pass the episodes whole: their turn_spans is a numpy [m, 2] array, and
+kl.score_stats tests it with `if turn_spans:`, which raises on any real episode.
+
+Not done here, still open: the other half of docs/04's drift item, each arm's BF16 resolve rate minus base's.
+It needs the P2 eval runs, and P2's pick_headline and b_metrics do not report it yet (they give each arm's
+resolve_rate_bf16 and the arm minus random; their only "_vs_base" pair is the estimator check's log energy
+ratio). It belongs in pick_headline's output, in a follow-up to the P2 analysis PR.
 
 Held-out text, an owner decision (docs/04 does not name the set): the heldout100 BF16 P0b episodes, the first
 attempt per task by attempt_id, resolved or not. Held-out repos never enter a pool, so no arm trained on them;
