@@ -870,3 +870,18 @@ def test_within_repo_split_from_p1_records():
         analyze(recs, manifest, EM, "fewest_turns", CFG, p1_records=recs, p1_manifest=manifest)
     with pytest.raises(ValueError, match="p1_records and p1_manifest"):
         analyze(recs, manifest, EM, "fewest_turns", CFG, p1_records=p1recs)
+
+
+def test_pick_reports_bf16_resolve_rate_minus_base():
+    recs, manifest = p1(joules={**P1_JOULES, "base": 2000.0})
+    recs = [{**r, "resolved": False, "end_reason": "turn_limit"} if r["model"] == "base" and r["profile"] == BF
+            and r["task_id"].endswith("t0") else r for r in recs]
+    passed = {"score": "kl_decision", "decision": "pass"}
+    out = pick_headline(recs, manifest, EM, CHOSEN, passed, CFG, "pass")
+    rows = {r["arm"]: r for r in out["arms"]}
+    assert out["headline"] == "stable" and out["drift_base"] == "base BF16 rows of P1 (inrepo_test), same tasks"
+    assert rows["fewest_turns"]["bf16_rr_diff_vs_base"] == pytest.approx(0.25)  # 1 against base's 3 of 4
+    assert rows["qtrace"]["bf16_rr_diff_vs_base"] == pytest.approx(-0.75)
+    recs, manifest = p1()
+    out = pick_headline(recs, manifest, EM, CHOSEN, passed, CFG, "pass")
+    assert out["drift_base"] is None and all(r["bf16_rr_diff_vs_base"] is None for r in out["arms"])

@@ -568,6 +568,14 @@ def token_match(headline, train_meta):
             "rerun_required": seen[headline] > seen["random"], "match_supervised_tokens": seen["random"]}
 
 
+def _rr_diff_vs_base(data, arm, cfg):
+    """docs/04 Training drift, its resolve-rate half: the arm's BF16 resolve rate minus base's, on the tasks the two
+    share. Its own arrays() call, so base's infrastructure drops never change the tasks the pick is made on."""
+    arr = arrays(data, [(arm, REFERENCE), ("base", REFERENCE)], cfg["infra_error_cap"])
+    return float((arr["groups"][arm, REFERENCE]["R"].sum() - arr["groups"]["base", REFERENCE]["R"].sum())
+                 / len(arr["tasks"]))
+
+
 def pick_headline(records, manifest, energy_model, score_choice, did, cfg, p0a_verdict, not_separable=(),
                   train_meta=None):
     """docs/03 P1 rule: among HEADLINE_ARMS minus those P0a or P0d dropped, the lowest estimated Q4_K_M JPR whose
@@ -582,7 +590,10 @@ def pick_headline(records, manifest, energy_model, score_choice, did, cfg, p0a_v
     P0b's arm-overlap rule flagged as not separable and P1 did not train (docs/04 P0b); they are dropped, and
     they must have no P1 rows. Any other eligible arm without rows is an error. With train_meta (the P1 runs'
     train_meta.json contents), token_match says whether the headline needs the token-matched rerun (token_match());
-    without it, or with no headline, token_match is None.
+    without it, or with no headline, token_match is None. When base ran at BF16 in P1, each arm row carries
+    bf16_rr_diff_vs_base (docs/04 Training: drift from the base model, BF16 resolve-rate change); it is reported,
+    not used by the rule. Base is P1's own inrepo_test rows: P0b's BF16 runs are on pool200 and heldout100, which
+    share no task with inrepo_test.
 
     The tripwire numbers cover every (arm, profile) with rows, controls and dropped arms included, each on its
     own tasks (docs/04 Test-file tripwire: every P1 resolve rate)."""
@@ -604,7 +615,7 @@ def pick_headline(records, manifest, energy_model, score_choice, did, cfg, p0a_v
     arr = arrays(data, groups, cfg["infra_error_cap"])
     W = strat_weights(arr["repos"], cfg["n_boot"], np.random.default_rng(cfg["seed"]))
     n, Rn = len(arr["tasks"]), arr["groups"]["random", REFERENCE]["R"]
-    rows = []
+    has_base, rows = ("base", REFERENCE) in present(data), []
     for a in arms:
         Q, F = arr["groups"][a, PRIMARY], arr["groups"][a, REFERENCE]
         jpr = float(_jpr(Q["E"].sum(), Q["R"].sum()))
@@ -614,7 +625,8 @@ def pick_headline(records, manifest, energy_model, score_choice, did, cfg, p0a_v
                      "resolve_rate_bf16": F["R"].sum() / n,
                      "bf16_rr_diff_vs_random": (F["R"].sum() - Rn.sum()) / n, "bf16_rr_diff_ci95": [lo, hi],
                      "clearly_below_random": hi < 0, "eligible": hi >= 0 and math.isfinite(jpr),
-                     "jpr_q4_generation_window": js(_jpr(Q["G"].sum(), Q["R"].sum()))})
+                     "jpr_q4_generation_window": js(_jpr(Q["G"].sum(), Q["R"].sum())),
+                     "bf16_rr_diff_vs_base": _rr_diff_vs_base(data, a, cfg) if has_base else None})
     # Eligible JPRs are finite, so jpr_q4 holds the exact float and ties compare exactly.
     ok = [r for r in rows if r["eligible"]]
     best = min(ok, key=lambda r: (r["jpr_q4"], HEADLINE_ARMS.index(r["arm"]))) if ok else None
@@ -626,6 +638,7 @@ def pick_headline(records, manifest, energy_model, score_choice, did, cfg, p0a_v
             "tripwire": {f"{a}/{p}": _tripwire(arrays(data, [(a, p)], cfg["infra_error_cap"])["groups"][a, p])
                          for a, p in sorted(present(data))},
             "reason": None if best else "no eligible arm",
+            "drift_base": "base BF16 rows of P1 (inrepo_test), same tasks" if has_base else None,
             "token_match": None if train_meta is None or not best else token_match(best["arm"], train_meta)}
 
 

@@ -68,7 +68,8 @@ def main(argv=None):
     for r in out["arms"]:
         lo, hi = r["bf16_rr_diff_ci95"]
         print(f"{r['arm']:14} JPR_Q4 {r['jpr_q4']}  BF16 RR diff vs random {r['bf16_rr_diff_vs_random']:+.3f} "
-              f"[{lo:+.3f}, {hi:+.3f}]  {'eligible' if r['eligible'] else 'not eligible'}")
+              f"[{lo:+.3f}, {hi:+.3f}]  {'eligible' if r['eligible'] else 'not eligible'}"
+              + ("" if r["bf16_rr_diff_vs_base"] is None else f"  BF16 RR diff vs base {r['bf16_rr_diff_vs_base']:+.3f}"))
     for arm, why in out["dropped"].items():
         print(f"{arm:14} dropped: {why}")
     print(f"headline: {out['headline'] or 'none (' + out['reason'] + ')'}"
