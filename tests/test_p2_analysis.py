@@ -833,6 +833,24 @@ def test_measured_subset_claim_needs_the_upper_bound():
     assert out["claim_A"]["measured_subset_wins"] is False
 
 
+def test_report_shows_the_measured_subset(tmp_path):
+    main, manifest = build(["fewest_turns", "random", "base"], scaled({"fewest_turns": 0.8}), seeds=(0, 1))
+    erows, _ = est_rows({"fewest_turns": 1.2, "random": 1.0, "base": 1.0})
+    write_jsonl(tmp_path / "p2.jsonl", main)
+    write_jsonl(tmp_path / "est.jsonl", [{**r, "attempt_id": "e-" + r["attempt_id"]} for r in erows])
+    (tmp_path / "m.json").write_text(json.dumps(manifest))
+    (tmp_path / "em.json").write_text(json.dumps(EM))
+    (tmp_path / "head.json").write_text(json.dumps({"headline": "fewest_turns"}))
+    (tmp_path / "cfg.yaml").write_text(yaml.safe_dump(CFG))
+    res = run("p2_analyze.py", tmp_path / "p2.jsonl", "--models", tmp_path / "m.json", "--energy-model",
+              tmp_path / "em.json", "--headline", tmp_path / "head.json", "--estimator-check", tmp_path / "est.jsonl",
+              "--config", tmp_path / "cfg.yaml", "--out-dir", tmp_path / "out")
+    assert res.returncode == 0, res.stderr
+    md = (tmp_path / "out" / "analysis.md").read_text()
+    assert "| primary, measured subset (generation_window) | fewest_turns vs random | Q4_K_M | 32 |" in md
+    assert "| 1.200 |" in md
+
+
 def meta(arm, tokens, match=None):
     return {"arm": arm, "seed": 0, "supervised_tokens_seen": tokens, "match_supervised_tokens": match}
 

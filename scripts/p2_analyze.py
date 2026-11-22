@@ -72,6 +72,9 @@ def markdown(out):
              "|" + "---|" * 14, contrast_row("primary", p)]
     if out["token_matched"]:
         lines.append(contrast_row("primary, token-matched", out["token_matched"]))
+    m = out["measured_subset"]
+    if m:  # docs/04: when the estimate does not stand, only this row is claimed
+        lines.append(contrast_row(f"primary, measured subset ({m['scope']})", m))
     for fam, f in out["families"].items():
         lines += [contrast_row(fam, c) for c in f["contrasts"]]
     h4 = out["h4"]
