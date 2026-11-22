@@ -164,4 +164,7 @@ def test_frozen_deepswe_overlap_covers_heldout691():
         every = json.load(f)
     assert out["heldout_size"] == every["size"] == 691
     assert out["overlap_size"] == 691 - len(out["heldout_not_in_train"])
+    # docs/03 Kill rules says the train split holds all 691 held-out tasks; pin it.
+    assert (out["train_size"], out["overlap_size"], out["heldout_not_in_train"]) == (4578, 691, [])
+    assert set(out["heldout_not_in_train"]) <= set(every["ids"])
     assert out["sources"]["heldout"] == every["sources"]["r2e_gym"]
