@@ -770,3 +770,37 @@ def test_h4_holm_and_required_contrast():
     g = grammar_copy([r for r in recs if r["model"] != "random_seed0"], {})
     with pytest.raises(ValueError, match="H4 needs grammar rows of fewest_turns and random at Q4_K_M"):
         analyze(recs + g, manifest, EM, "fewest_turns", cfg)
+
+
+def test_frozen_config_has_the_random_fq_and_cost_arm_contrasts():
+    with open(os.path.join(ROOT, "configs", "p2_analysis.yaml")) as f:
+        fams = yaml.safe_load(f)["families"]
+    pairs = [p for ps in fams.values() for p in ps]
+    assert ["headline", "random_fq"] in pairs and ["fewest_joules", "fewest_turns"] in pairs
+
+
+def test_family_contrast_names_the_headline():
+    recs, manifest = build(["fewest_turns", "random_fq", "random"], scaled({"fewest_turns": 0.8, "random_fq": 0.9}))
+    cfg = {**CFG, "families": {"random_fq": [["headline", "random_fq"]]}, "upper_bound_required": []}
+    cs = analyze(recs, manifest, EM, "fewest_turns", cfg)["families"]["random_fq"]["contrasts"]
+    assert [(c["arm"], c["comparator"], c["profile"]) for c in cs] == [("fewest_turns", "random_fq", p) for p in (BF, Q4)]
+    assert all(c["T"] == pytest.approx(math.log(0.8 / 0.9)) for c in cs)
+    with pytest.raises(ValueError, match="two known arms"):
+        check_config({**CFG, "families": {"x": [["headline", "nope"]]}}, upper_bound=False)
+
+
+def test_measured_subset_contrast_when_the_estimate_fails():
+    main, manifest = build(["fewest_turns", "random", "base"], scaled({"fewest_turns": 0.8}), seeds=(0, 1))
+    def est(factors):
+        erows, _ = est_rows(factors)
+        return [{**r, "attempt_id": "e-" + r["attempt_id"]} for r in erows]
+    # Estimates say the arms cost the same per attempt; the counter says fewest_turns draws 1.2x random's joules.
+    out = analyze(main, manifest, EM, "fewest_turns", CFG, estimator_rows=est({"fewest_turns": 1.2, "random": 1.0,
+                                                                              "base": 1.0}))
+    m = out["measured_subset"]
+    assert not out["estimator_check"]["stands"] and m["scope"] == "generation_window" and m["n_tasks"] == 32
+    assert m["T"] == pytest.approx(math.log(1.2)) and not m["wins"] and out["claim_A"]["measured_subset_wins"] is False
+    assert not out["claim_A"]["claimed_on_estimates"]
+    out = analyze(main, manifest, EM, "fewest_turns", CFG, estimator_rows=est({"fewest_turns": 1.0, "random": 1.0,
+                                                                              "base": 1.0}))
+    assert out["measured_subset"] is None and out["claim_A"]["measured_subset_wins"] is None

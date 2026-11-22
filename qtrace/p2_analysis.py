@@ -193,24 +193,26 @@ def holm(pvals):
     return adj
 
 
-def families(data, cfg, cpu_w):
+def families(data, cfg, cpu_w, headline):
     """Secondary contrasts by hypothesis family (cfg families), each at every profile where both arms and random ran.
 
-    Holm runs within a family over its tested contrasts, once on the GPU p-values and once on the upper-bound
-    ones. A contrast wins when its Holm p < alpha and it passes the guard (against random, see contrast()); a
-    family in upper_bound_required is supported only where the win also holds under the upper bound. A contrast
-    whose arm, comparator or random did not run at a profile is listed as untested. Each contrast is on the tasks
-    its arm, comparator and random share, so a secondary-tier contrast is on its held-out subset.
+    "headline" in a pair is the P1 pick. Holm runs within a family over its tested contrasts, once on the GPU
+    p-values and once on the upper-bound ones. A contrast wins when its Holm p < alpha and it passes the guard
+    (against random, see contrast()); a family in upper_bound_required is supported only where the win also holds
+    under the upper bound. A contrast whose arm, comparator or random did not run at a profile, or whose arm is
+    its comparator once headline is filled in, is listed as untested. Each contrast is on the tasks its arm,
+    comparator and random share, so a secondary-tier contrast is on its held-out subset.
     """
     have, profiles = present(data), sorted({p for _, p in present(data)})
     out = {}
     for fam, pairs in cfg["families"].items():
         tested, untested = [], []
-        for a, b in pairs:
+        for pair in pairs:
+            a, b = (headline if x == "headline" else x for x in pair)
             for prof in profiles:
                 arms = list(dict.fromkeys((a, b, "random")))
                 missing = [arm for arm in arms if (arm, prof) not in have]
-                if missing:
+                if a == b or missing:
                     untested.append({"arm": a, "comparator": b, "profile": prof, "missing_arms": missing})
                     continue
                 arr = arrays(data, [(arm, prof) for arm in arms], cfg["infra_error_cap"], cpu_w)
@@ -376,6 +378,30 @@ def arm_table(data, cfg, cpu_w):
     return rows
 
 
+def _usable(data, arm):
+    """estimator_check's attempts of one arm: {task: summarize() output} of the usable ones and the excluded
+    counts by reason."""
+    reps = reps_of(data, arm, PRIMARY)
+    if len(reps) != 1:
+        raise ValueError(f"estimator check: {arm} needs exactly one seed model at {PRIMARY}, got {reps}")
+    used, excluded = {}, {"infra_error": 0, "concurrency": 0, "not_attributable": 0, "unmeasured_turn": 0}
+    for task, s in data["cells"][arm, reps[0], PRIMARY].items():
+        reason = ("infra_error" if s is None else "concurrency" if s["rec"]["concurrency"] != 1
+                  else "not_attributable" if not s["rec"]["energy"]["attributable"]
+                  else "unmeasured_turn" if any(t["gen_energy_j"] is None for t in s["rec"]["per_turn"]) else None)
+        if reason:
+            excluded[reason] += 1
+            continue
+        used[task] = s
+    return used, excluded
+
+
+def _measured(s, scope):
+    """An attempt's measured joules in estimator_check's scope: generation windows, plus tool windows when
+    scope is "whole_attempt"."""
+    return sum(t["gen_energy_j"] + (t["tool_energy_j"] if scope == "whole_attempt" else 0) for t in s["rec"]["per_turn"])
+
+
 def estimator_check(data, headline, cfg):
     """docs/04 Estimator check on load()-ed estimator-check rows (Q4_K_M, concurrency 1, one seed model per arm).
 
@@ -393,19 +419,7 @@ def estimator_check(data, headline, cfg):
     """
     used, excluded = {}, {}
     for arm in (headline, "random", "base"):
-        reps = reps_of(data, arm, PRIMARY)
-        if len(reps) != 1:
-            raise ValueError(f"estimator check: {arm} needs exactly one seed model at {PRIMARY}, got {reps}")
-        used[arm], excluded[arm] = {}, {"infra_error": 0, "concurrency": 0, "not_attributable": 0,
-                                        "unmeasured_turn": 0}
-        for task, s in data["cells"][arm, reps[0], PRIMARY].items():
-            reason = ("infra_error" if s is None else "concurrency" if s["rec"]["concurrency"] != 1
-                      else "not_attributable" if not s["rec"]["energy"]["attributable"]
-                      else "unmeasured_turn" if any(t["gen_energy_j"] is None for t in s["rec"]["per_turn"]) else None)
-            if reason:
-                excluded[arm][reason] += 1
-                continue
-            used[arm][task] = s
+        used[arm], excluded[arm] = _usable(data, arm)
     no_tool = sum(any(t["tool_energy_j"] is None for t in s["rec"]["per_turn"])
                   for by_task in used.values() for s in by_task.values())
     scope = "generation_window" if no_tool else "whole_attempt"
@@ -413,8 +427,7 @@ def estimator_check(data, headline, cfg):
     for arm, by_task in used.items():
         r[arm] = {}
         for task, s in by_task.items():
-            turns = s["rec"]["per_turn"]
-            measured = sum(t["gen_energy_j"] + (t["tool_energy_j"] if scope == "whole_attempt" else 0) for t in turns)
+            measured = _measured(s, scope)
             est = s["e"] if scope == "whole_attempt" else s["e_gen"]
             if measured <= 0 or est <= 0:
                 raise ValueError(f"estimator check: attempt {s['attempt_id']!r} has measured {measured} J, "
@@ -438,6 +451,24 @@ def estimator_check(data, headline, cfg):
             "mean_log_measured_over_estimated": {a: float(np.mean(list(v.values()))) if v else None
                                                  for a, v in r.items()},
             "excluded": excluded}
+
+
+def measured_subset(edata, headline, scope, cfg, cpu_w):
+    """docs/04 Estimator check, "otherwise only the measured subset is claimed": the primary contrast (headline vs
+    random at Q4_K_M, contrast() with its guard) with measured joules in place of the estimate, on the
+    estimator-check tasks where both arms have a usable attempt, in the scope estimator_check chose. The upper
+    bound adds the same container CPU share to the measured joules. One seed model per arm, so no detail."""
+    used = {arm: _usable(edata, arm)[0] for arm in (headline, "random")}
+    groups = [(headline, PRIMARY), ("random", PRIMARY)]
+    arr = arrays(edata, groups, cfg["infra_error_cap"], cpu_w, only=set(used[headline]) & set(used["random"]))
+    meas = {g: np.array([[_measured(used[g[0]][t], scope) for t in arr["tasks"]]]) for g in groups}
+    arr = {**arr, "groups": {g: {**X, "E": meas[g], "U": X["U"] - X["E"] + meas[g], "G": meas[g], "I": None}
+                             for g, X in arr["groups"].items()}}
+    c = contrast(arr, *groups, cfg)
+    return {"scope": scope, **{k: c[k] for k in ("arm", "comparator", "profile", "n_tasks", "jpr", "resolve_rate",
+                                                 "T", "ratio", "gpu", "guard", "upper_bound")},
+            "wins": c["gpu"]["p_one_sided"] < cfg["alpha"] and c["guard"]["pass"],
+            "holds_under_upper_bound": c["upper_bound"]["p_one_sided"] < cfg["alpha"] and c["guard"]["pass"]}
 
 
 def _curve(data, arm, tasks, entry):
@@ -575,8 +606,9 @@ def pick_headline(records, manifest, energy_model, score_choice, did, cfg, p0a_v
 def analyze(records, manifest, energy_model, headline, cfg, estimator_rows=None):
     """The P2 analysis: the primary test (headline vs random at Q4_K_M, detail and the infra_timeout sensitivity),
     the hypothesis families with Holm, the arm table, B metrics per arm at Q4_K_M and BF16, the H1a/H2 tokens-ratio
-    contrasts, the estimator check (when its rows are given), the turn-cap frontier (when base ran), the claim-A
-    summary, all on grammar false rows, and H4 on the grammar true rows (None when there are none). Claim A on
+    contrasts, the estimator check (when its rows are given) and, when the estimate does not stand, the primary on
+    the measured subset (measured_subset), the turn-cap frontier (when base ran), the claim-A summary, all on
+    grammar false rows, and H4 on the grammar true rows (None when there are none). Claim A on
     estimates also needs the primary's sign in at least 3 of the 4 held-out repos (docs/04)."""
     cfg = check_config(cfg, upper_bound=True)
     if headline is None:
@@ -606,22 +638,25 @@ def analyze(records, manifest, energy_model, headline, cfg, estimator_rows=None)
     have = present(data)
     b = {arm: b_metrics(data, arm, cfg) for arm in sorted({a for a, _ in have})
          if (arm, PRIMARY) in have and (arm, REFERENCE) in have and ("random", REFERENCE) in have}
-    est = None
+    est = measured = None
     if estimator_rows is not None:
-        est = estimator_check(load(estimator_rows, manifest, energy_model, "estimator", every_model=False),
-                              headline, cfg)
+        edata = load(estimator_rows, manifest, energy_model, "estimator", every_model=False)
+        est = estimator_check(edata, headline, cfg)
+        if not est["stands"]:
+            measured = measured_subset(edata, headline, est["scope"], cfg, cpu_w)
     frontier = turn_cap_frontier(data, headline, energy_model, cfg) if ("base", PRIMARY) in have else None
     claim = {"primary_wins": primary["wins"], "holds_under_upper_bound": primary["holds_under_upper_bound"],
              "sign_holds": primary["sign_holds"]["holds"],
              "frontier_pass": None if frontier is None else frontier["pass"],
              "estimator_stands": None if est is None else est["stands"]}
     claim["claimed_on_estimates"] = all(v is True for v in claim.values())
+    claim["measured_subset_wins"] = None if measured is None else measured["wins"]
     return {"headline": headline, "energy": energy, "n_rows": data["n_rows"], "n_rows_grammar": gdata["n_rows"],
             "n_reruns_used": data["n_reruns_used"],
             "n_resolved_after_budget_hit": data["n_resolved_after_budget_hit"],
-            "primary": primary, "families": families(data, cfg, cpu_w), "arms": arm_table(data, cfg, cpu_w),
+            "primary": primary, "families": families(data, cfg, cpu_w, headline), "arms": arm_table(data, cfg, cpu_w),
             "b_metrics": b, "tokens_ratio_contrasts": tokens_ratio_contrasts(data, cfg), "estimator_check": est,
-            "turn_cap_frontier": frontier, "claim_A": claim,
+            "measured_subset": measured, "turn_cap_frontier": frontier, "claim_A": claim,
             "h4": h4(data, gdata, headline, cfg, cpu_w) if gdata["n_rows"] else None,
             "settings": {k: cfg[k] for k in ("guard_margin", "infra_error_cap", "n_boot", "seed", "alpha",
                                              "host_cpu_tdp_w", "host_vcpus")}}

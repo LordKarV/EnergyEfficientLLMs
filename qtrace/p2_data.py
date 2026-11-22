@@ -69,8 +69,8 @@ def js(x):
 def check_config(cfg, upper_bound):
     """The analysis settings, checked, as a new dict with infra_error_cap (0.05), families ({}),
     h4_contrasts ([[headline, random]]) and upper_bound_required ([]) filled in. guard_margin has no default:
-    docs/04 sets it from P0b's measured SE. h4_contrasts may name "headline" (the P1 pick) and must include
-    [headline, random], the H4 contrast docs/03 Cost option b runs."""
+    docs/04 sets it from P0b's measured SE. families and h4_contrasts may name "headline" (the P1 pick);
+    h4_contrasts must include [headline, random], the H4 contrast docs/03 Cost option b runs."""
     if cfg.get("guard_margin") is None:
         raise ValueError("guard_margin is required (docs/04: set from P0b's measured standard error, frozen before P1)")
     margin = number(cfg["guard_margin"], "guard_margin", positive=True)
@@ -92,9 +92,10 @@ def check_config(cfg, upper_bound):
     families = cfg.get("families") or {}
     for fam, pairs in families.items():
         for pair in pairs:
-            if (not isinstance(pair, (list, tuple)) or len(pair) != 2 or not set(pair) <= ARM_NAMES
+            if (not isinstance(pair, (list, tuple)) or len(pair) != 2 or not set(pair) <= ARM_NAMES | {"headline"}
                     or pair[0] == pair[1]):
-                raise ValueError(f"family {fam}: each contrast is [arm, comparator] of two known arms, got {pair!r}")
+                raise ValueError(f"family {fam}: each contrast is [arm, comparator] of two known arms or headline, "
+                                 f"got {pair!r}")
     h4 = [list(p) for p in cfg.get("h4_contrasts") or [["headline", "random"]]]
     for pair in h4:
         if len(pair) != 2 or not set(pair) <= ARM_NAMES | {"headline"} or pair[0] == pair[1]:
