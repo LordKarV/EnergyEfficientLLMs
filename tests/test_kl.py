@@ -4,12 +4,22 @@ import copy
 import os
 import sys
 
+import numpy as np
 import pytest
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from qtrace.kl import compare, decision_mask, hidden_at, logit_index, score_trajectory, span_mask, summarize
+from qtrace.kl import (
+    compare,
+    decision_mask,
+    hidden_at,
+    logit_index,
+    pool_entropy_threshold,
+    score_trajectory,
+    span_mask,
+    summarize,
+)
 from qtrace.quantize import quantize_model_rtn
 
 
@@ -130,6 +140,25 @@ def test_fixed_entropy_threshold_replaces_top_k():
     assert set((idx[dm] + 1).tolist()) == {16, 17, 18, 19, 20}
 
 
+def test_pool_entropy_threshold_is_the_pooled_token_quantile():
+    runs = [np.arange(10) * 0.1, torch.arange(10, 20) * 0.1]  # npz arrays or tensors, pooled 0.0 .. 1.9
+    t = pool_entropy_threshold(runs)
+    assert abs(t - 1.71) < 1e-6  # default 0.90, linear interpolation at 0.9 * 19 = 17.1
+    assert abs(pool_entropy_threshold(runs, quantile=0.5) - 0.95) < 1e-6
+    idx = torch.arange(20)
+    dm = decision_mask(idx, torch.arange(20) * 0.1, [], [], entropy_threshold=t)
+    assert dm.nonzero().squeeze(1).tolist() == [18, 19]  # the pool's top 10%
+
+
+def test_pool_entropy_threshold_rejects_bad_input():
+    with pytest.raises(ValueError, match="quantile"):
+        pool_entropy_threshold([np.ones(3)], quantile=1.0)
+    with pytest.raises(ValueError, match="no entropies"):
+        pool_entropy_threshold([np.zeros(0)])
+    with pytest.raises(ValueError, match="finite"):
+        pool_entropy_threshold([np.array([0.1, np.nan])])
+
+
 def test_empty_run_is_not_scored_as_stable():
     empty = {k: torch.zeros(0) for k in ("kl", "flip", "entropy_p", "nll_p", "nll_q")}
     s = summarize(empty, torch.zeros(0, dtype=torch.bool))
@@ -163,6 +192,7 @@ def test_summarize_reports_command_kl_and_turn_halves():
     even = torch.tensor([True, True, True, False, False, False])
     s = summarize(stats, decision, command=command, halves={"even": even, "odd": ~even})
     assert abs(s["kl_command"] - 11.0 / 3) < 1e-6 and s["n_command"] == 3  # float32 mean
+    assert s["kl_sum_command"] == 11.0  # positions 1, 2 and 5
     assert s["halves"]["even"] == {"n_scored": 3, "kl_mean": 2.0, "kl_decision": 1.0, "kl_command": 2.5}
     assert s["halves"]["odd"] == {"n_scored": 3, "kl_mean": 5.0, "kl_decision": 5.0, "kl_command": 6.0}
 
@@ -171,6 +201,7 @@ def test_no_command_spans_means_no_command_score():
     stats = {k: torch.ones(3) for k in ("kl", "flip", "entropy_p", "nll_p", "nll_q")}
     s = summarize(stats, torch.zeros(3, dtype=torch.bool))
     assert s["kl_command"] is None and s["n_command"] == 0 and "halves" not in s
+    assert s["kl_sum_command"] == 0.0
 
 
 def test_score_trajectory_command_and_halves_match_reference():

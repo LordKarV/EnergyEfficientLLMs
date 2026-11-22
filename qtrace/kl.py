@@ -11,6 +11,7 @@ are applied in chunks. Each model uses its own head, because a quantizer may cha
 
 import math
 
+import numpy as np
 import torch
 
 
@@ -83,6 +84,28 @@ def decision_mask(idx, entropy, tool_call_positions, command_spans, command_toke
     return mask
 
 
+def pool_entropy_threshold(entropies, quantile=0.90):
+    """The fixed Stage 2 BF16-entropy threshold for decision_mask, set from the P0b pool (docs/04).
+
+    entropies holds one 1-D array per run: the entropy_p of each <attempt_id>.<probe>.npz written by
+    scripts/p0d_score_pool.py --positions-dir (numpy arrays or tensors). Pass one probe per run:
+    entropy_p is the BF16 model's, so both probes' files hold the same values. Every scored token of
+    the pool counts once, so longer runs weigh more. Returns the given quantile of the pooled values
+    (numpy's linear interpolation).
+
+    docs/04 does not state the quantile. The default 0.90 matches P0d's top 10% of each run's scored
+    tokens; it is a provisional choice to be fixed in the S2 draft.
+    """
+    if not 0 < quantile < 1:
+        raise ValueError(f"quantile must be in (0, 1), not {quantile}")
+    pooled = np.concatenate([np.asarray(e, dtype=np.float64).ravel() for e in entropies] or [np.zeros(0)])
+    if not pooled.size:
+        raise ValueError("no entropies to pool")
+    if not np.isfinite(pooled).all():
+        raise ValueError("entropies must be finite")
+    return float(np.quantile(pooled, quantile))
+
+
 def span_mask(idx, spans):
     """Scored tokens (positions idx + 1) inside any (start, end) span, end exclusive."""
     pos = idx + 1
@@ -100,7 +123,8 @@ def summarize(stats, decision, command=None, halves=None):
     Means are None when nothing is scored, so an empty run can never rank as most stable.
 
     kl_command is the mean over the command-value tokens, the second candidate in docs/04's ordered
-    score rule; it is None without command spans. Whole tool-call blocks would be diluted by about a
+    score rule; it is None without command spans. kl_sum_command (kl_command x n_command, 0.0 without
+    command spans) is the Stage 2 KL(y) if P0d chose kl_command. Whole tool-call blocks would be diluted by about a
     dozen near-deterministic wrapper tokens per call, so many short commands would score low. halves
     maps a name to a mask of scored tokens (turn parity in P0b) and gets the three candidate scores
     per half for split-half reliability. The decision mask is computed over the whole run first, so
@@ -124,6 +148,7 @@ def summarize(stats, decision, command=None, halves=None):
         "kl_decision": mean(kl[decision]),
         "kl_command": mean(kl[command]),
         "kl_sum_decision": float(kl[decision].sum()),
+        "kl_sum_command": float(kl[command].sum()),
         "kl_sum_all": float(kl.sum()),
         "flip_rate": mean(stats["flip"]),
         "entropy_mean": mean(stats["entropy_p"]),
