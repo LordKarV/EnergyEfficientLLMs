@@ -95,7 +95,8 @@ def test_heldout_set_is_the_first_bf16_heldout100_attempt_per_task(tmp_path):
 
 
 def test_drift_json_is_token_weighted_hf_f32_kl_of_arm_against_base(tmp_path):
-    attempts, arm = write_attempts(tmp_path), perturbed()
+    # scale 3: the tiny model's top-1 survives smaller noise, and a zero flip rate pins nothing.
+    attempts, arm = write_attempts(tmp_path), perturbed(scale=3.0)
     run = write_run(tmp_path, arm)
     script = load_script()
     script.main(["--run-dir", str(run), "--attempts", str(attempts), "--device", "cpu"])
@@ -125,7 +126,16 @@ def test_drift_json_is_token_weighted_hf_f32_kl_of_arm_against_base(tmp_path):
     assert hf["kl_mean"] == pytest.approx(
         sum(r["kl_mean"] * r["n_scored"] for r in ref) / n, rel=1e-5
     )
-    assert hf["kl_mean"] > 0 and 0 <= hf["flip_rate"] <= 1
+    for key, ref_key in [
+        ("flip_rate", "flip_rate"),
+        ("nll_base_mean", "nll_p_mean"),
+        ("nll_arm_mean", "nll_q_mean"),
+    ]:
+        assert hf[key] == pytest.approx(
+            sum(r[ref_key] * r["n_scored"] for r in ref) / n, rel=1e-5
+        )
+    assert hf["kl_mean"] > 0 and 0 < hf["flip_rate"] <= 1
+    assert hf["nll_base_mean"] != pytest.approx(hf["nll_arm_mean"])
     assert drift["secondary_gguf"] is None
 
 
@@ -161,12 +171,24 @@ def test_gguf_drift_is_reported_only_above_1e_3_mean_kl(tmp_path):
     high = script.gguf_drift(gguf_file(tmp_path, [1e-3, 3e-3]), ids)
     assert high["kl_mean"] == pytest.approx(2e-3) and high["reported"] is True
     assert high["runtime"] == {"devices": ["CPU"]} and high["n_scored"] == 20
+    at = script.gguf_drift(gguf_file(tmp_path, [1e-3, 1e-3]), ids)
+    assert at["kl_mean"] == 1e-3 and at["reported"] is False
 
 
 def test_gguf_drift_must_cover_the_same_episodes(tmp_path):
     with pytest.raises(ValueError, match="same held-out episodes"):
         load_script().gguf_drift(
             gguf_file(tmp_path, [1e-2], ids=("p0b-h1-a",)), ["p0b-h1-a", "p0b-h2-a"]
+        )
+
+
+@pytest.mark.parametrize(
+    "ids", [("p0b-h1-a", "p0b-h1-b"), ("p0b-h1-a", "p0b-h1-a")], ids=["wrong", "dup"]
+)
+def test_gguf_drift_rejects_same_count_with_wrong_or_duplicate_ids(tmp_path, ids):
+    with pytest.raises(ValueError, match="same held-out episodes"):
+        load_script().gguf_drift(
+            gguf_file(tmp_path, [1e-2, 1e-2], ids=ids), ["p0b-h1-a", "p0b-h2-a"]
         )
 
 
