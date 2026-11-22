@@ -798,6 +798,13 @@ def test_family_contrast_names_the_headline():
     assert all(c["T"] == pytest.approx(math.log(0.8 / 0.9)) for c in cs)
     with pytest.raises(ValueError, match="two known arms"):
         check_config({**CFG, "families": {"x": [["headline", "nope"]]}}, upper_bound=False)
+    # A pair that names the pick twice once headline is filled in is untested and stays out of Holm.
+    cfg = {**cfg, "families": {"random_fq": [["headline", "random_fq"], ["headline", "fewest_turns"]]}}
+    fam = analyze(recs, manifest, EM, "fewest_turns", cfg)["families"]["random_fq"]
+    assert fam["n_tested"] == 2 and [c["holm_p"] for c in fam["contrasts"]] == pytest.approx(holm(
+        [c["gpu"]["p_one_sided"] for c in fam["contrasts"]]))
+    assert [(u["arm"], u["comparator"], u["missing_arms"]) for u in fam["untested"]] == [
+        ("fewest_turns", "fewest_turns", [])] * 2
 
 
 def test_measured_subset_contrast_when_the_estimate_fails():
@@ -890,6 +897,11 @@ def test_token_matched_rerun_contrast():
     assert (c["arm"], c["comparator"], c["profile"], c["n_tasks"]) == ("fewest_turns_tokmatch", "random", Q4, 20)
     assert c["T"] == pytest.approx(math.log(0.9)) and c["wins"]
     assert out["primary"]["T"] == pytest.approx(math.log(0.8))  # the rerun stays out of the headline arm's cells
+    assert c["holds_under_upper_bound"]
+    # 2000 container CPU-seconds (4375 J) per rerun attempt against random's 10 erase the GPU win.
+    hot = [{**r, "container_cpu_seconds": 2000.0} for r in tm]
+    c = analyze(recs + hot, manifest, EM, "fewest_turns", CFG)["token_matched"]
+    assert c["wins"] and not c["holds_under_upper_bound"]
     assert analyze(recs, {m: v for m, v in manifest.items() if m != "ft_tokmatch"}, EM, "fewest_turns",
                    CFG)["token_matched"] is None
     for bad, match in (({"arm": "fewest_turns", "seed": 0, "token_matched": 1}, "token_matched must be"),
