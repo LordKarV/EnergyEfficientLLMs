@@ -150,6 +150,9 @@ def test_frozen_external_lists():
     assert set(dc["tasks"]) == set(dc["ids"])
     assert dc["python"] + dc["non_python"] == 113
     assert dc["python"] == sum(t["python"] for t in dc["tasks"].values())
+    # task.toml languages are lowercase; tie each flag to its language and pin the split.
+    assert all(t["python"] == (t["language"] == "python") for t in dc["tasks"].values())
+    assert (dc["python"], dc["non_python"]) == (34, 79)
 
 
 def test_overlap_check_counts_shared_and_missing():
