@@ -12,6 +12,7 @@ from qtrace.tasklists import (
     allocate,
     build_lists,
     external_lists,
+    overlap_check,
     stratified_sample,
 )
 
@@ -150,3 +151,17 @@ def test_frozen_external_lists():
     assert dc["python"] + dc["non_python"] == 113
     assert dc["python"] == sum(t["python"] for t in dc["tasks"].values())
 
+
+def test_overlap_check_counts_shared_and_missing():
+    out = overlap_check(["a", "b", "c"], ["b", "c", "d"])
+    assert out == {"train_size": 3, "heldout_size": 3, "overlap_size": 2, "heldout_not_in_train": ["d"]}
+
+
+def test_frozen_deepswe_overlap_covers_heldout691():
+    with open(os.path.join(LISTS, "deepswe_heldout_overlap.json")) as f:
+        out = json.load(f)
+    with open(os.path.join(LISTS, "heldout691.json")) as f:
+        every = json.load(f)
+    assert out["heldout_size"] == every["size"] == 691
+    assert out["overlap_size"] == 691 - len(out["heldout_not_in_train"])
+    assert out["sources"]["heldout"] == every["sources"]["r2e_gym"]

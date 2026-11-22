@@ -135,3 +135,13 @@ def external_lists(verified_ids, datacurve_langs, terminal_bench_ids):
     terminal = _whole_set("terminal_bench89", list(terminal_bench_ids),
                           "every Terminal-Bench 2.1 task; 03 gives 89, run on its own harness")
     return {"verified500": verified, "datacurve113": datacurve, "terminal_bench89": terminal}
+
+
+def overlap_check(train_ids, heldout_ids):
+    """Join a teacher's training task ids with held-out ids (docs/04, Fallbacks: DeepSWE-Preview).
+
+    Returns both set sizes, the overlap size and the held-out ids the teacher never trained on.
+    """
+    train, heldout = set(train_ids), set(heldout_ids)
+    return {"train_size": len(train), "heldout_size": len(heldout), "overlap_size": len(train & heldout),
+            "heldout_not_in_train": sorted(heldout - train)}
