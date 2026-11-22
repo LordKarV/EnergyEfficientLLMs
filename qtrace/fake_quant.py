@@ -75,7 +75,8 @@ def load_table(path):
                 {t.name: [int(d) for d in t.shape] for t in reader.tensors})
     with open(path) as f:
         doc = json.load(f)
-    profile = doc.get("profiles", {}).get(PROFILE) if isinstance(doc, dict) else None
+    profiles = doc.get("profiles") if isinstance(doc, dict) else None
+    profile = profiles.get(PROFILE) if isinstance(profiles, dict) else None
     if not isinstance(profile, dict) or not profile:
         raise ValueError(f"{path}: expected the pinned table format with a non-empty profiles.{PROFILE} "
                          "{gguf_tensor_name: {type, shape, bytes}} (data/quant_tables)")
@@ -87,7 +88,8 @@ def load_table(path):
     unshaped = sorted(k for k, v in profile.items() if not shaped(v))
     if unshaped:
         raise ValueError(f"{path}: entries without a ggml shape (positive ints): {unshaped[:5]}")
-    bad = {k: v.get("type") for k, v in profile.items() if v.get("type") not in gguf.GGMLQuantizationType.__members__}
+    bad = {k: v.get("type") for k, v in profile.items()
+           if not isinstance(v.get("type"), str) or v["type"] not in gguf.GGMLQuantizationType.__members__}
     if bad:
         raise ValueError(f"{path}: unknown ggml types {dict(list(bad.items())[:5])}")
     return {k: v["type"] for k, v in profile.items()}, {k: v["shape"] for k, v in profile.items()}

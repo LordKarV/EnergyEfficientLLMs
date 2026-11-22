@@ -251,11 +251,16 @@ def test_table_parses_from_a_gguf_file_and_from_the_pinned_json(tmp_path):
     (tmp_path / "bad.json").write_text(json.dumps(bad))
     with pytest.raises(ValueError, match="unknown ggml types"):
         fq.load_table(str(tmp_path / "bad.json"))
+    bad["profiles"]["Q4_K_M"]["blk.0.ffn_up.weight"]["type"] = [1]  # unhashable: no raw TypeError
+    (tmp_path / "bad.json").write_text(json.dumps(bad))
+    with pytest.raises(ValueError, match="unknown ggml types"):
+        fq.load_table(str(tmp_path / "bad.json"))
     bad["profiles"]["Q4_K_M"]["blk.0.ffn_up.weight"] = {"type": "Q4_K"}
     (tmp_path / "bad.json").write_text(json.dumps(bad))
     with pytest.raises(ValueError, match="without a ggml shape.*blk.0.ffn_up.weight"):
         fq.load_table(str(tmp_path / "bad.json"))
-    for name, doc in (("flat", tiny_table()), ("q3", {**pinned, "profiles": {"Q3_K_M": {}}})):
+    for name, doc in (("flat", tiny_table()), ("q3", {**pinned, "profiles": {"Q3_K_M": {}}}),
+                      ("list", {**pinned, "profiles": []})):
         (tmp_path / f"{name}.json").write_text(json.dumps(doc))  # a flat table has no shapes to check
         with pytest.raises(ValueError, match="profiles.Q4_K_M"):
             fq.load_table(str(tmp_path / f"{name}.json"))
