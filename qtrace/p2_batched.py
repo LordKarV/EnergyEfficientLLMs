@@ -63,13 +63,12 @@ def run_level_totals(records, manifest, data):
     ended in an infrastructure error count too: they drew power. Blocks must not overlap in time (energy.t_start to
     t_end), since energy cannot be split between concurrent attempts of different blocks. jpr is joules over the
     resolves of the arm's analyzed attempts (the cells, reruns used), so it charges every attempt as the primary
-    does. Not paired by task and not tested: no per-task value exists. records: the rows load() accepted; grammar
-    true rows are left out like everywhere but H4.
+    does. Not paired by task and not tested: no per-task value exists. records: the rows load() accepted. Grammar
+    true rows form blocks of their own, which join the overlap check (an H4 attempt running beside a main block
+    would put its joules in that block's span) but are left out of the totals, like everywhere but H4.
     """
     blocks = defaultdict(list)
     for rec in records:
-        if rec["grammar"]:
-            continue
         aid = rec["attempt_id"]
         c0, c1, t0, t1 = (
             number(need(rec, "energy", k), f"attempt {aid!r} energy.{k}")
@@ -80,7 +79,12 @@ def run_level_totals(records, manifest, data):
                 f"attempt {aid!r}: energy.counter_end below its counter_start or t_end below its t_start"
             )
         blocks[
-            (*arm_rep(manifest[rec["model"]], rec), rec["profile"], need(rec, "run_id"))
+            (
+                *arm_rep(manifest[rec["model"]], rec),
+                rec["profile"],
+                need(rec, "run_id"),
+                rec["grammar"],
+            )
         ].append((c0, c1, t0, t1))
     spans = sorted(
         (min(v[2] for v in vs), max(v[3] for v in vs), key)
@@ -92,7 +96,9 @@ def run_level_totals(records, manifest, data):
                 f"run blocks {a} and {b} overlap in time, so their measured energy cannot be split"
             )
     tot = defaultdict(lambda: {"n_blocks": 0, "n_attempts": 0, "joules": 0.0})
-    for (arm, _, prof, _), vs in blocks.items():
+    for (arm, _, prof, _, grammar), vs in blocks.items():
+        if grammar:
+            continue
         t = tot[arm, prof]
         t["n_blocks"] += 1
         t["n_attempts"] += len(vs)

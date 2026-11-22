@@ -109,6 +109,41 @@ def test_run_level_totals_need_separate_blocks_and_counter_fields():
         analyze(recs, manifest, no_coef, "fewest_turns", CFG)
 
 
+def test_grammar_attempts_join_the_overlap_check_not_the_totals():
+    recs, manifest = data()
+    plain = analyze(recs, manifest, BATCHED, "fewest_turns", CFG)["batched_regime"]
+    # H4's grammar reruns of the Q4_K_M rows, as their own blocks 1e5 s after the main ones.
+    g = [
+        {
+            **r,
+            "attempt_id": "g-" + r["attempt_id"],
+            "grammar": True,
+            "energy": {
+                **r["energy"],
+                "t_start": r["energy"]["t_start"] + 1e5,
+                "t_end": r["energy"]["t_end"] + 1e5,
+            },
+        }
+        for r in recs
+        if r["profile"] == Q4
+    ]
+    mixed = analyze(recs + g, manifest, BATCHED, "fewest_turns", CFG)
+    assert mixed["batched_regime"]["run_level"] == plain["run_level"]
+    # One grammar attempt of random that ran during fewest_turns_seed0's main block.
+    t0 = min(
+        r["energy"]["t_start"]
+        for r in recs
+        if r["model"] == "fewest_turns_seed0" and r["profile"] == Q4
+    )
+    hit = next(i for i, r in enumerate(g) if r["model"] == "random_seed0")
+    g[hit] = {
+        **g[hit],
+        "energy": {**g[hit]["energy"], "t_start": t0 + 0.2, "t_end": t0 + 0.4},
+    }
+    with pytest.raises(ValueError, match="overlap in time"):
+        analyze(recs + g, manifest, BATCHED, "fewest_turns", CFG)
+
+
 def test_error_attempts_count_in_block_joules_not_in_resolves():
     recs, manifest = data()
     err = next(
